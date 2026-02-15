@@ -1,0 +1,33 @@
+# === Backend .gitignore ===
+
+# Local environment secrets (AWS keys, DB passwords)
+.env
+.env.*
+
+# Compiled binaries
+/bin/
+/api-server
+go-drive-clone
+go-drive-clone.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries & coverage
+*.test
+*.out
+coverage.txt
+*.coverprofile
+
+# Local simulation storage directories
+/tmp/
+/data/
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
