@@ -1,5 +1,7 @@
 # TrulyLied ☁️
 
+**Live Demo:** [https://trulylied.vercel.app](https://trulylied.vercel.app)
+
 A modern, high-performance file storage and sharing application. TrulyLied provides a seamless, secure, and fast way to upload, manage, and share your files across devices.
 
 ## Features ✨
