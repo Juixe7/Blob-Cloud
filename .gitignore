@@ -1,0 +1,30 @@
+# === Monorepo root .gitignore ===
+
+# IDE settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+*.coverprofile
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Project planning docs (internal notes, not part of the shipped codebase)
+/backend/docs/
+*.txt
+
+# Scratch / test files at repo root
+TEST.png
+*.local
