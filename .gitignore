@@ -5,6 +5,7 @@
 .vscode/
 *.swp
 *.swo
+.zcode/
 
 # OS files
 .DS_Store
@@ -23,8 +24,27 @@ go.work.sum
 
 # Project planning docs (internal notes, not part of the shipped codebase)
 /backend/docs/
+/frontend/docs/
 *.txt
 
 # Scratch / test files at repo root
 TEST.png
 *.local
+
+# Frontend — Node / Vite
+node_modules/
+dist/
+dist-ssr/
+
+# Frontend — environment & secrets
+.env
+.env.*
+!.env.example
+
+# Frontend — scaffolded boilerplate we don't track
+frontend/.oxlintrc.json
+frontend/README.md
+
+# Frontend — misc
+*.log
+npm-debug.log*
