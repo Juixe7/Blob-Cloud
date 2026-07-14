@@ -55,6 +55,14 @@ type Config struct {
 	// (default 20) minimises empty ReceiveMessage calls, which matters on the
 	// AWS Free Tier (1M requests/month).
 	SQSPollTimeoutSec int
+
+	// --- Auth / realtime (Phase 6) ---
+	// JWTSecret signs and validates the JWTs used to authenticate WebSocket
+	// connections. Must be >=32 bytes. Leave empty to disable WS auth (dev only).
+	JWTSecret string
+	// WSCORSOrigins is a comma-separated list of origins allowed to open WS
+	// connections (CORS check for the WebSocket handshake). "*" allows all.
+	WSCORSOrigins []string
 }
 
 // Load reads configuration from environment variables, applying defaults for
@@ -109,6 +117,10 @@ func Load() (Config, error) {
 		SQSQueueURL:      envStr("SQS_QUEUE_URL", ""),
 		SQSNumWorkers:    sqsWorkers,
 		SQSPollTimeoutSec: sqsPollTimeout,
+
+		// --- Auth / realtime (Phase 6) ---
+		JWTSecret:     envStr("JWT_SECRET", ""),
+		WSCORSOrigins: envList("WS_CORS_ORIGINS", []string{"*"}),
 	}, nil
 }
 
@@ -151,4 +163,24 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 		return 0, err
 	}
 	return time.Duration(n) * time.Second, nil
+}
+
+// envList reads a comma-separated environment variable into a trimmed slice.
+// An empty/unset variable returns the fallback.
+func envList(key string, fallback []string) []string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
 }

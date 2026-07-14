@@ -11,10 +11,12 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/gorilla/websocket"
 
 	"go-drive-clone/internal/domain"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 	"go-drive-clone/internal/service"
+	"go-drive-clone/internal/sync"
 )
 
 // Server bundles handler dependencies. It is passed to route registration so
@@ -27,6 +29,12 @@ type Server struct {
 	// return 503 Service Unavailable.
 	uploads *service.UploadService
 	perms   *postgresrepo.PermissionRepository
+	users   *postgresrepo.UserRepository
+	// Phase 6: real-time layer. hub is nil when WS notifications aren't
+	// configured; the WS handler then returns 503.
+	hub        *sync.Hub
+	jwtSecret  string
+	wsUpgrader websocket.Upgrader
 }
 
 // NewServer constructs a Server with its dependencies injected.
@@ -43,6 +51,22 @@ func (s *Server) WithUploads(uploads *service.UploadService, perms *postgresrepo
 		uploads: uploads,
 		perms:   perms,
 	}
+}
+
+// WithRealtime wires the WebSocket hub and JWT secret used to authenticate WS
+// connections. wsCORSOrigins controls the Upgrader's CheckOrigin.
+func (s *Server) WithRealtime(hub *sync.Hub, jwtSecret string, wsCORSOrigins []string) *Server {
+	s.hub = hub
+	s.jwtSecret = jwtSecret
+	s.wsUpgrader = newUpgrader(wsCORSOrigins)
+	return s
+}
+
+// WithUsers wires the user repository, needed by the share handler to resolve
+// grantee emails to user ids for real-time FILE_SHARED notifications.
+func (s *Server) WithUsers(users *postgresrepo.UserRepository) *Server {
+	s.users = users
+	return s
 }
 
 // HandleHealth responds with a simple JSON readiness check.

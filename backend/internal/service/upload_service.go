@@ -15,6 +15,7 @@ import (
 	"go-drive-clone/internal/domain"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 	"go-drive-clone/internal/queue"
+	wsSync "go-drive-clone/internal/sync"
 )
 
 // UploadService orchestrates resumable uploads: initiating a session with
@@ -30,13 +31,14 @@ type UploadService struct {
 	perms     *postgresrepo.PermissionRepository
 	storage   domain.StorageProvider
 	publisher queue.Publisher
+	notifier  wsSync.Notifier // optional; nil-safe (NoopNotifier)
 	log       *slog.Logger
 }
 
 // NewUploadService wires the service with all the repositories it needs. The
 // *sql.DB is retained so the service can open the cross-repository transaction
 // for CompleteSession. publisher may be queue.NoopPublisher if SQS is not
-// configured.
+// configured. notifier may be nil.
 func NewUploadService(
 	db *sql.DB,
 	users *postgresrepo.UserRepository,
@@ -46,12 +48,16 @@ func NewUploadService(
 	perms *postgresrepo.PermissionRepository,
 	storage domain.StorageProvider,
 	publisher queue.Publisher,
+	notifier wsSync.Notifier,
 	log *slog.Logger,
 ) *UploadService {
+	if notifier == nil {
+		notifier = wsSync.NoopNotifier()
+	}
 	return &UploadService{
 		db: db, users: users, files: files, blocks: blocks,
 		sessions: sessions, perms: perms, storage: storage,
-		publisher: publisher, log: log,
+		publisher: publisher, notifier: notifier, log: log,
 	}
 }
 
@@ -341,6 +347,16 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest) (*Com
 	}); err != nil {
 		s.log.Error("failed to publish thumbnail job", "file_id", result.FileID, "err", err)
 	}
+
+	// Notify the uploader's open tabs so their file explorer refreshes.
+	s.notifier.NotifyUser(uploaderID, wsSync.NotificationEvent{
+		Type: wsSync.EventUploadComplete,
+		Payload: map[string]string{
+			"file_id":   result.FileID,
+			"session_id": result.SessionID,
+		},
+	})
+
 	return &result, nil
 }
 

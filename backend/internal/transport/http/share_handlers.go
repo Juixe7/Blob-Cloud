@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"go-drive-clone/internal/domain"
+	wsSync "go-drive-clone/internal/sync"
 )
 
 // shareRequest is the body of POST /api/files/{id}/share.
@@ -60,16 +61,31 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 		Role:         req.Role,
 	}
 	if err := s.perms.GrantPermission(r.Context(), perm); err != nil {
-		// Unique violation (duplicate grant) -> 409 Conflict.
-		if isUniqueViolation(err) {
-			writeJSON(w, http.StatusConflict, map[string]string{
-				"error": "permission already granted to " + req.GranteeEmail,
-			})
+			// Unique violation (duplicate grant) -> 409 Conflict.
+			if isUniqueViolation(err) {
+				writeJSON(w, http.StatusConflict, map[string]string{
+					"error": "permission already granted to " + req.GranteeEmail,
+				})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
+
+		// Notify the grantee in real-time so their UI refreshes without polling.
+		if s.hub != nil && s.users != nil {
+			if grantee, err := s.users.GetByEmail(r.Context(), req.GranteeEmail); err == nil {
+				s.hub.NotifyUser(grantee.ID, wsSync.NotificationEvent{
+					Type: wsSync.EventFileShared,
+					Payload: map[string]string{
+						"file_id":   fileID,
+						"filename":  perm.GranteeEmail, // resolved on client via GET /files
+						"shared_by": "a collaborator",
+					},
+				})
+			}
+		}
+
 	writeJSON(w, http.StatusCreated, perm)
 }
 

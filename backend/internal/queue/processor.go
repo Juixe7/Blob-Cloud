@@ -18,6 +18,7 @@ import (
 	"golang.org/x/image/draw"
 
 	"go-drive-clone/internal/domain"
+	wsSync "go-drive-clone/internal/sync"
 )
 
 // fileGetter is the subset of domain.FileRepository the processor needs.
@@ -44,20 +45,26 @@ var supportedImageExts = map[string]bool{
 // metadata, assemble the image from its blocks, resize, and upload a
 // thumbnail.
 type ThumbnailProcessor struct {
-	files   fileGetter
-	blocks  blockHashLister
-	storage domain.StorageProvider
-	log     *slog.Logger
+	files    fileGetter
+	blocks   blockHashLister
+	storage  domain.StorageProvider
+	notifier wsSync.Notifier // optional; nil-safe via NoopNotifier
+	log      *slog.Logger
 }
 
 // NewThumbnailProcessor constructs a processor wired with its dependencies.
+// notifier may be wsSync.NoopNotifier() if real-time push isn't configured.
 func NewThumbnailProcessor(
 	files fileGetter,
 	blocks blockHashLister,
 	storage domain.StorageProvider,
+	notifier wsSync.Notifier,
 	log *slog.Logger,
 ) *ThumbnailProcessor {
-	return &ThumbnailProcessor{files: files, blocks: blocks, storage: storage, log: log}
+	if notifier == nil {
+		notifier = wsSync.NoopNotifier()
+	}
+	return &ThumbnailProcessor{files: files, blocks: blocks, storage: storage, notifier: notifier, log: log}
 }
 
 // ProcessMessage handles one ThumbnailMessage end to end. It returns nil on
@@ -94,6 +101,19 @@ func (p *ThumbnailProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMe
 	thumbKey := fmt.Sprintf("thumbnails/%s.png", msg.FileID)
 	if err := p.storage.PutObject(ctx, thumbKey, bytes.NewReader(thumbBytes), int64(len(thumbBytes)), "image/png"); err != nil {
 		return fmt.Errorf("upload thumbnail: %w", err)
+	}
+
+	// 6. Notify the file owner's open tabs so the UI can refresh the thumbnail.
+	// A push failure is non-fatal — the thumbnail exists in storage; the client
+	// will eventually see it on its next list/refresh. (notifier is nil-safe.)
+	if p.notifier != nil {
+		p.notifier.NotifyUser(msg.UserID, wsSync.NotificationEvent{
+			Type: wsSync.EventThumbnailReady,
+			Payload: map[string]string{
+				"file_id":       msg.FileID,
+				"thumbnail_url": thumbKey,
+			},
+		})
 	}
 
 	p.log.Info("thumbnail generated and uploaded",

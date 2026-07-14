@@ -1,5 +1,5 @@
 // Package main is the API server entry point. It wires dependencies (config ->
-// logger -> storage -> router -> HTTP server) and orchestrates a graceful
+// logger -> storage -> hub -> router -> HTTP server) and orchestrates a graceful
 // shutdown on SIGINT/SIGTERM.
 package main
 
@@ -21,6 +21,7 @@ import (
 	"go-drive-clone/internal/domain"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 	"go-drive-clone/internal/queue"
+	wsSync "go-drive-clone/internal/sync"
 	"go-drive-clone/internal/service"
 	httpx "go-drive-clone/internal/transport/http"
 	"go-drive-clone/internal/storage"
@@ -55,10 +56,6 @@ func main() {
 	)
 
 	// Storage provider ------------------------------------------------------
-	// STORAGE_PROVIDER selects the backend: "local" (Phase 1 filesystem) or
-	// "s3" (Phase 4: AWS S3 / Cloudflare R2). The rest of the application
-	// depends only on domain.StorageProvider, so swapping the implementation
-	// requires zero handler/service changes.
 	ctx := context.Background()
 	var storageProvider domain.StorageProvider
 
@@ -79,7 +76,6 @@ func main() {
 	}
 
 	if storageProvider == nil {
-		// Default / fallback: local disk storage.
 		local, err := storage.NewLocalStore(cfg.LocalStorageDir, cfg.BaseURL, log)
 		if err != nil {
 			log.Error("failed to initialise local storage", "err", err)
@@ -91,8 +87,17 @@ func main() {
 	log.Info("storage provider active", "provider", cfg.StorageProvider)
 	srv := httpx.NewServer(storageProvider, log)
 
-	// workerWg tracks SQS worker goroutines for graceful shutdown. It is
-	// populated inside the DB init block if SQS is configured.
+	// Phase 6: WebSocket Hub — started unconditionally so WS connections
+	// can be accepted even if the DB is unavailable (auth only requires JWT).
+	var hub *wsSync.Hub
+	if cfg.JWTSecret != "" {
+		hub = wsSync.NewHub(log)
+		go hub.Run()
+		srv = srv.WithRealtime(hub, cfg.JWTSecret, cfg.WSCORSOrigins)
+		log.Info("websocket hub started")
+	}
+
+	// workerWg tracks SQS worker goroutines for graceful shutdown.
 	var workerWg sync.WaitGroup
 
 	db, dbErr := database.New(ctx, cfg, log)
@@ -115,43 +120,48 @@ func main() {
 			}
 			log.Warn("migrations failed, continuing without DB", "err", err)
 		} else {
-			// Repositories + upload service. The upload service owns the cross-
-				// repository transaction for the complete flow, so it gets every
-				// repo plus the storage provider and the pool.
-				users := postgresrepo.NewUserRepository(db)
-				files := postgresrepo.NewFileRepository(db)
-				blocks := postgresrepo.NewBlockRepository(db)
-				sessions := postgresrepo.NewUploadSessionRepository(db)
-				perms := postgresrepo.NewPermissionRepository(db)
+			// Repositories + upload service.
+			users := postgresrepo.NewUserRepository(db)
+			files := postgresrepo.NewFileRepository(db)
+			blocks := postgresrepo.NewBlockRepository(db)
+			sessions := postgresrepo.NewUploadSessionRepository(db)
+			perms := postgresrepo.NewPermissionRepository(db)
 
-				// SQS publisher: publishes thumbnail jobs after upload completes.
-				// Falls back to NoopPublisher if no queue URL is configured.
-				var publisher queue.Publisher = queue.NoopPublisher{}
-				if cfg.SQSQueueURL != "" {
-					sqsClient := queue.NewSQSClient(cfg)
-					publisher = queue.NewSQSPublisher(sqsClient, cfg.SQSQueueURL, log)
-					log.Info("SQS publisher configured", "queue_url", cfg.SQSQueueURL)
-				}
+			// Build the notifier that integration points will use.
+			// Falls back to a no-op if the Hub isn't configured.
+			var notifier wsSync.Notifier = wsSync.NoopNotifier()
+			if hub != nil {
+				notifier = hub
+			}
 
-				uploadSvc := service.NewUploadService(db, users, files, blocks, sessions, perms, storageProvider, publisher, log)
-				srv = srv.WithUploads(uploadSvc, perms)
+			// SQS publisher: publishes thumbnail jobs after upload completes.
+			var publisher queue.Publisher = queue.NoopPublisher{}
+			if cfg.SQSQueueURL != "" {
+				sqsClient := queue.NewSQSClient(cfg)
+				publisher = queue.NewSQSPublisher(sqsClient, cfg.SQSQueueURL, log)
+				log.Info("SQS publisher configured", "queue_url", cfg.SQSQueueURL)
+			}
 
-				// Worker pool: background thumbnail generation.
-				if cfg.SQSQueueURL != "" {
-					processor := queue.NewThumbnailProcessor(files, blocks, storageProvider, log)
-					wp := queue.NewWorkerPool(
-						queue.NewSQSClient(cfg),
-						cfg.SQSQueueURL,
-						processor,
-						cfg.SQSNumWorkers,
-						int32(cfg.SQSPollTimeoutSec),
-						log,
-					)
-					wp.Start(ctx, &workerWg)
-					log.Info("SQS worker pool started", "workers", cfg.SQSNumWorkers)
-				}
+			uploadSvc := service.NewUploadService(db, users, files, blocks, sessions, perms, storageProvider, publisher, notifier, log)
+			srv = srv.WithUploads(uploadSvc, perms)
+			srv = srv.WithUsers(users)
 
-				log.Info("repositories and upload service initialised")
+			// Worker pool: background thumbnail generation.
+			if cfg.SQSQueueURL != "" {
+				processor := queue.NewThumbnailProcessor(files, blocks, storageProvider, notifier, log)
+				wp := queue.NewWorkerPool(
+					queue.NewSQSClient(cfg),
+					cfg.SQSQueueURL,
+					processor,
+					cfg.SQSNumWorkers,
+					int32(cfg.SQSPollTimeoutSec),
+					log,
+				)
+				wp.Start(ctx, &workerWg)
+				log.Info("SQS worker pool started", "workers", cfg.SQSNumWorkers)
+			}
+
+			log.Info("repositories and upload service initialised")
 		}
 	}
 
@@ -161,14 +171,12 @@ func main() {
 		Addr:              ":" + strconv.Itoa(cfg.Port),
 		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       0, // uploads may be large/streamed; rely on client.
+		ReadTimeout:       0,
 		WriteTimeout:      0,
 		IdleTimeout:       120 * time.Second,
 	}
 
 	// Graceful shutdown ----------------------------------------------------
-	// Run ListenAndServe in its own goroutine so the main goroutine can block
-	// on the OS signal channel.
 	serverErr := make(chan error, 1)
 	go func() {
 		log.Info("http server listening", "addr", httpServer.Addr)
@@ -179,7 +187,6 @@ func main() {
 	}()
 
 	stop := make(chan os.Signal, 1)
-	// SIGINT = Ctrl+C; SIGTERM = the signal deploy systems send to stop a process.
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	select {
@@ -190,14 +197,21 @@ func main() {
 		log.Info("shutdown signal received", "signal", sig.String())
 	}
 
-	// Graceful shutdown: stop workers first (they may be mid-processing a
-	// message), then drain the HTTP server.
+	// 1. Stop SQS workers (they may be mid-processing a message).
 	if cfg.SQSQueueURL != "" {
 		log.Info("waiting for SQS workers to finish...")
 		workerWg.Wait()
 		log.Info("all workers stopped")
 	}
 
+	// 2. Close WebSocket hub: send CloseGoingAway to all connected clients.
+	if hub != nil {
+		log.Info("shutting down websocket hub...")
+		hub.Shutdown()
+		log.Info("websocket hub stopped")
+	}
+
+	// 3. Drain the HTTP server.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
@@ -209,8 +223,7 @@ func main() {
 }
 
 // newLogger returns an slog.Logger configured for the environment: JSON for
-// production (machine-parseable, ideal for log aggregation) and human-readable
-// text for development.
+// production (machine-parseable) and human-readable text for development.
 func newLogger(env string) *slog.Logger {
 	var handler slog.Handler
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}

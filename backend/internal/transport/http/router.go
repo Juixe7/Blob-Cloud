@@ -52,5 +52,10 @@ func NewRouter(s *Server) http.Handler {
 		r.Get("/{id}/permissions", s.HandleListPermissions)
 	})
 
+	// --- Phase 6: real-time notifications (WebSocket) ---
+	if s.hub != nil {
+		r.Get("/api/ws", s.HandleWSConnection)
+	}
+
 	return r
 }
