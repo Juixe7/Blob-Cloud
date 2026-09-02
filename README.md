@@ -62,35 +62,6 @@ sequenceDiagram
 
 ---
 
-## Engineering Upgrade Log
-
-> Each row is a separate commit, verified by automated tests. Commits build on each other in sequence.
-
-### Tier 1 — Observability, Correctness, and Reliability
-
-| Commit | Feature | What it does |
-|--------|---------|-------------|
-| [`504249f`](https://github.com/Hrushikesh-ramilla/Blob-Cloud/commit/504249f) | **Prometheus Observability (1A)** | Private Prometheus registry at `GET /metrics`. Instruments: HTTP latency histogram (by route pattern, bounded cardinality), block dedup hit/miss counters, upload initiated/completed counters, SQS worker job duration + error counters, WebSocket active-connections gauge. Zero external service required. |
-| [`b82d643`](https://github.com/Hrushikesh-ramilla/Blob-Cloud/commit/b82d643) | **E2E Upload Integration Test (1B)** | Two-phase in-process test: cold upload (0 dedup hits, 2 misses, SQS job captured, Prometheus counters verified via `testutil.ToFloat64`) → warm upload of same file (2 hits, 0 misses, zero block bytes uploaded). Uses real Prometheus counters and a fake SQS publisher spy. Skips cleanly without Postgres. |
-| [`aad248b`](https://github.com/Hrushikesh-ramilla/Blob-Cloud/commit/aad248b) | **Orphaned Block GC (1C)** | Standalone `cmd/gc` binary with `--dry-run`/`--no-dry-run`/`--min-age` flags. DB-authoritative algorithm: enumerate S3 keys → subtract live Postgres hashes → delete orphans. 5 pure unit tests (NoOrphans, DryRun, LiveDelete, DeleteError, EmptyStorage). Closes the storage cost leak mentioned in the original README's trade-offs section. |
-| [`de6ad16`](https://github.com/Hrushikesh-ramilla/Blob-Cloud/commit/de6ad16) | **GC Interface Wiring (fix)** | Wired the three concrete method bodies needed by the GC interfaces: `LocalStore.ListBlockKeys()`, `S3Storage.ListBlockKeys()` (paginated `ListObjectsV2`), `BlockRepository.AllBlockHashes()`. |
-
-### Tier 2 — Scalability, Security, and Accountability
-
-| Commit | Feature | What it does |
-|--------|---------|-------------|
-| [`ea0f3bc`](https://github.com/Hrushikesh-ramilla/Blob-Cloud/commit/ea0f3bc) | **Redis Pub/Sub WebSocket Backplane (2D)** | `RedisBackplane` wraps the Hub and implements the `Notifier` interface. `NotifyUser()` delivers instantly to local clients AND publishes to Redis channel `blobcloud:ws:events` so peer pods get it. `Run(ctx)` subscribes and fans in remote events. Falls back gracefully to Hub-only mode when `REDIS_URL` is absent. Backplane goroutine is tracked under `workerWg` for graceful shutdown. 4 unit tests (local delivery, envelope round-trip, context cancel, unknown-user no-panic). |
-| [`80b6ef8`](https://github.com/Hrushikesh-ramilla/Blob-Cloud/commit/80b6ef8) | **Per-IP Per-Zone HTTP Rate Limiting (2E)** | Three independent rate-limit zones applied inside the chi router: `auth` (10 req/min — brute-force/credential-stuffing protection), `upload` (30 req/min — S3 presign ops are expensive), `api` (120 req/min — general endpoints). In-memory token-bucket (`golang.org/x/time/rate`) by default; drop-in `RedisLimiter` (fixed-window INCR+EXPIRE Lua script) for multi-node. All limits emit `X-RateLimit-Limit/Remaining/Reset` + `Retry-After` headers and return `{"error":"rate limit exceeded","retry_after":N}` JSON on 429. Configurable via `RL_AUTH_RPM`, `RL_UPLOAD_RPM`, `RL_API_RPM` env vars. 7 unit tests covering exhaustion, IP isolation, zone independence, and 429 response shape. |
-| [`c488414`](https://github.com/Hrushikesh-ramilla/Blob-Cloud/commit/c488414) | **Structured Audit Log (2F)** | Migration `000009_audit_log.up.sql` — append-only `audit_logs` table with JSONB metadata. `audit.Logger` interface + `NoopLogger` (safe for no-DB mode). Postgres implementation fires in a background goroutine with its own 5-second context so audit writes never delay HTTP responses. Events fired for: `FILE_UPLOADED` (upload complete), `FILE_SHARED` (share grant), `FILE_DELETED` (soft delete). New endpoint `GET /api/files/{id}/history` returns paged audit trail. 5 unit tests (noop safety, JSON round-trip, unmarshalable fallback, action constant values). |
-
-### Tier 3 — Planet-Scale File Support
-
-| Commit | Feature | What it does |
-|--------|---------|-------------|
-| [`3e461ff`](https://github.com/Hrushikesh-ramilla/Blob-Cloud/commit/3e461ff) | **S3 Multipart Upload + Cloudflare Edge Validator (3G)** | Removes the 5 GiB single-file ceiling. `MultipartUploadProvider` interface added to `domain/storage.go` with 4 methods. `S3Storage` implements it: `CreateMultipartUpload`, `PresignUploadPart` (1-indexed, CDN-rewritten), `CompleteMultipartUpload` (ETag normalisation), `AbortMultipartUpload` (always called on error paths to prevent orphaned S3 parts). `Initiate()` branches on `SizeBytes > 5 GiB`: small blocks get a single presigned PUT URL (unchanged path); large blocks get `upload_id + part_urls` in the response. `LocalStore` unchanged — opt-in interface. Cloudflare Worker `workers/edge_validator.js` streams PUT bodies into Web Crypto SHA-256 and rejects hash mismatches at the network edge before bytes reach durable storage. 6 unit tests (threshold constants, ceiling-division formula, interface assertions, 6 GiB → 62 parts path). |
-
----
-
 ## Key Engineering Features
 
 ### 1. Direct-to-Cloud Uploads via CDN Presigned URLs
