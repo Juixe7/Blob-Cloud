@@ -13,6 +13,7 @@ import (
 	stdsync "sync"
 
 	"github.com/gorilla/websocket"
+	"go-drive-clone/internal/metrics"
 )
 
 // Event types broadcast over WebSocket. These are the string the browser client
@@ -132,6 +133,7 @@ func (h *Hub) handleRegister(c *Client) {
 		h.clie[c.UserID] = map[*Client]struct{}{}
 	}
 	h.clie[c.UserID][c] = struct{}{}
+	metrics.WSActiveConnections.Inc()
 	h.log.Info("ws client registered", "user_id", c.UserID, "open_conns", len(h.clie[c.UserID]))
 }
 
@@ -142,6 +144,7 @@ func (h *Hub) handleUnregister(c *Client) {
 		if _, exists := conns[c]; exists {
 			delete(conns, c)
 			close(c.Send)
+			metrics.WSActiveConnections.Dec()
 			if len(conns) == 0 {
 				delete(h.clie, c.UserID)
 			}

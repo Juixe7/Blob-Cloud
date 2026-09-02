@@ -10,6 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"go-drive-clone/internal/metrics"
 )
 
 // Backoff defaults for the worker error path. When ReceiveMessage fails the
@@ -167,6 +168,7 @@ func (wp *WorkerPool) handleMessage(ctx context.Context, workerID int, msg types
 
 	wp.log.Info("worker received job", "worker_id", workerID, "file_id", tm.FileID)
 
+	start := time.Now()
 	if err := wp.processor.ProcessMessage(ctx, tm); err != nil {
 		// Processing failed — do NOT delete the message. SQS will make it visible
 		// again after the visibility timeout for retry.
@@ -175,8 +177,11 @@ func (wp *WorkerPool) handleMessage(ctx context.Context, workerID int, msg types
 			"file_id", tm.FileID,
 			"err", err,
 		)
+		metrics.WorkerJobErrors.WithLabelValues("thumbnail").Inc()
 		return
 	}
+	metrics.WorkerJobDuration.WithLabelValues("thumbnail").Observe(time.Since(start).Seconds())
+	metrics.WorkerJobsProcessed.WithLabelValues("thumbnail").Inc()
 
 	// Success — delete the message so it's not retried.
 	wp.deleteMessage(ctx, msg)

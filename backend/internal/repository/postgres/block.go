@@ -193,3 +193,26 @@ func (r *BlockRepository) LinkBlocksToFile(ctx context.Context, fileID string, b
 		return nil
 	})
 }
+
+// AllBlockHashes returns the sha256 of every row in the blocks table, ordered
+// for stable iteration. Used exclusively by the GC collector to build the
+// authoritative set of known blocks and identify orphans in storage.
+func (r *BlockRepository) AllBlockHashes(ctx context.Context) ([]string, error) {
+	const q = `SELECT sha256 FROM blocks ORDER BY sha256`
+	rows, err := r.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("query all block hashes: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, fmt.Errorf("scan block hash: %w", err)
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+

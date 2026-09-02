@@ -175,9 +175,30 @@ func (s *LocalStore) DeleteObject(_ context.Context, key string) error {
 // keyToPath resolves a storage key (e.g. "blocks/<hash>") to an absolute
 // filesystem path under baseDir. Keys are cleaned to prevent path traversal.
 func (s *LocalStore) keyToPath(key string) string {
-	// filepath.Clean collapses ".." / "." segments so callers cannot escape
+	// filepath.Clean collapses "../" / "./" segments so callers cannot escape
 	// baseDir via a crafted key.
 	cleaned := filepath.Clean(string(os.PathSeparator) + key)
 	// Trim the leading separator that Clean prepended so Join stays in baseDir.
 	return filepath.Join(s.baseDir, cleaned[len(string(os.PathSeparator)):])
+}
+
+// ListBlockKeys walks the blocks/ subdirectory and returns every stored block
+// key in "blocks/<sha256>" form. Satisfies the gc.BlockLister interface used
+// by the orphaned-block garbage collector.
+func (s *LocalStore) ListBlockKeys(_ context.Context) ([]string, error) {
+	dir := filepath.Join(s.baseDir, BlockPrefix)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list local block keys: %w", err)
+	}
+	keys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			keys = append(keys, BlockPrefix+"/"+e.Name())
+		}
+	}
+	return keys, nil
 }

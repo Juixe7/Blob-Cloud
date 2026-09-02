@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"go-drive-clone/internal/audit"
 	"go-drive-clone/internal/domain"
 	wsSync "go-drive-clone/internal/sync"
 )
@@ -37,7 +38,7 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, code, msg := s.userFromBearer(r)
+	userID, code, msg := s.userFromBearer(r)
 	if code != 0 {
 		writeJSON(w, code, map[string]string{"error": msg})
 		return
@@ -100,6 +101,16 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
+
+	// Audit: FILE_SHARED — non-blocking.
+	s.auditLog.Log(r.Context(), audit.Entry{
+		UserID:       userID,
+		Action:       audit.ActionFileShared,
+		ResourceType: audit.ResourceFile,
+		ResourceID:   fileID,
+		Metadata:     audit.MarshalMeta(map[string]string{"grantee": req.GranteeEmail, "role": req.Role}),
+		ClientIP:     r.RemoteAddr,
+	})
 
 	writeJSON(w, http.StatusCreated, perm)
 }

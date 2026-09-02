@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"go-drive-clone/internal/audit"
 	"go-drive-clone/internal/auth"
 	"go-drive-clone/internal/domain"
 	"go-drive-clone/internal/service"
@@ -187,6 +188,16 @@ func (s *Server) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, code, map[string]string{"error": err.Error()})
 		return
 	}
+
+	// Audit: FILE_DELETED — non-blocking.
+	s.auditLog.Log(r.Context(), audit.Entry{
+		UserID:       userID,
+		Action:       audit.ActionFileDeleted,
+		ResourceType: audit.ResourceFile,
+		ResourceID:   fileID,
+		Metadata:     audit.MarshalMeta(map[string]string{"type": "soft_delete"}),
+		ClientIP:     r.RemoteAddr,
+	})
 
 	writeJSON(w, http.StatusOK, result)
 }

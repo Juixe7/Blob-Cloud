@@ -20,6 +20,8 @@ import (
 	"go-drive-clone/internal/database"
 	"go-drive-clone/internal/domain"
 	"go-drive-clone/internal/email"
+	"go-drive-clone/internal/metrics"
+	"go-drive-clone/internal/ratelimit"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 	"go-drive-clone/internal/queue"
 	wsSync "go-drive-clone/internal/sync"
@@ -49,6 +51,10 @@ func main() {
 	}
 
 	log := newLogger(cfg.ENV)
+
+	// Register all Prometheus metrics with the private registry before the
+	// HTTP server starts accepting requests.
+	metrics.Init()
 
 	log.Info("starting go-drive-clone",
 		"env", cfg.ENV,
@@ -96,18 +102,50 @@ func main() {
 
 	// Phase 6: WebSocket Hub — started unconditionally so WS connections
 	// can be accepted even if the DB is unavailable (auth only requires JWT).
-	var hub *wsSync.Hub
-	if cfg.JWTSecret != "" {
-		hub = wsSync.NewHub(log)
-		go hub.Run()
-		srv = srv.WithRealtime(hub, cfg.JWTSecret, cfg.WSCORSOrigins)
-		log.Info("websocket hub started")
-	}
-
-	// workerWg tracks SQS worker goroutines for graceful shutdown.
+	//
+	// workerWg / workerCtx are declared here (before the hub block) so the
+	// backplane goroutine can be tracked alongside SQS workers for graceful
+	// shutdown.
 	var workerWg sync.WaitGroup
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
+
+	var hub *wsSync.Hub
+	var notifier wsSync.Notifier = wsSync.NoopNotifier()
+	if cfg.JWTSecret != "" {
+		hub = wsSync.NewHub(log)
+		go hub.Run()
+		notifier = hub // single-node default: hub IS the notifier
+
+		// Tier 2D: Redis backplane for horizontal scale.
+		// When REDIS_URL is set, the backplane replaces the direct hub as the
+		// Notifier — it still delivers locally via hub AND publishes to Redis so
+		// peer nodes can deliver to their local connections.
+		if cfg.RedisURL != "" {
+			redisClient, err := wsSync.NewRedisClient(cfg.RedisURL)
+			if err != nil {
+				log.Error("redis client init failed, falling back to single-node hub",
+					"redis_url", cfg.RedisURL, "err", err)
+			} else if pingErr := wsSync.Ping(context.Background(), redisClient); pingErr != nil {
+				log.Error("redis ping failed, falling back to single-node hub",
+					"redis_url", cfg.RedisURL, "err", pingErr)
+			} else {
+				bp := wsSync.NewRedisBackplane(redisClient, hub, log)
+				workerWg.Add(1)
+				go func() {
+					defer workerWg.Done()
+					if err := bp.Run(workerCtx); err != nil {
+						log.Error("backplane subscriber exited", "err", err)
+					}
+				}()
+				notifier = bp
+				log.Info("redis backplane started", "channel", "blobcloud:ws:events")
+			}
+		}
+
+		srv = srv.WithRealtime(hub, cfg.JWTSecret, cfg.WSCORSOrigins)
+		log.Info("websocket hub started")
+	}
 
 	db, dbErr := database.New(ctx, cfg, log)
 	if dbErr != nil {
@@ -136,13 +174,15 @@ func main() {
 			sessions := postgresrepo.NewUploadSessionRepository(db)
 			perms := postgresrepo.NewPermissionRepository(db)
 			userSessions := postgresrepo.NewSessionRepository(db)
+			auditRepo := postgresrepo.NewAuditRepository(db, log)
+			srv = srv.WithAudit(auditRepo)
 
-			// Build the notifier that integration points will use.
-			// Falls back to a no-op if the Hub isn't configured.
-			var notifier wsSync.Notifier = wsSync.NoopNotifier()
-			if hub != nil {
-				notifier = hub
-			}
+
+			// notifier is set in the hub/backplane block above:
+			//   - backplane (Redis pub/sub) when REDIS_URL is configured
+			//   - hub directly when single-node
+			//   - noopNotifier when JWT_SECRET is not set
+			// The outer variable is used here so all callers get cross-node delivery.
 
 			// SQS publisher: publishes thumbnail jobs after upload completes.
 			var publisher queue.Publisher = queue.NoopPublisher{}
@@ -183,7 +223,23 @@ func main() {
 		}
 	}
 
-	router := httpx.NewRouter(srv)
+	// Build rate limiters from config. In-memory by default; for multi-node
+	// deployments swap to ratelimit.NewRedisLimiter using the same Redis client
+	// wired for the backplane.
+	rl := httpx.RateLimiters{}
+	if cfg.RateLimitAuthPerMin > 0 {
+		rl.Auth = ratelimit.NewInMemoryLimiter(cfg.RateLimitAuthPerMin, time.Minute)
+		rl.AuthCfg = ratelimit.NewZoneConfig(cfg.RateLimitAuthPerMin, time.Minute)
+	}
+	if cfg.RateLimitUploadPerMin > 0 {
+		rl.Upload = ratelimit.NewInMemoryLimiter(cfg.RateLimitUploadPerMin, time.Minute)
+		rl.UploadCfg = ratelimit.NewZoneConfig(cfg.RateLimitUploadPerMin, time.Minute)
+	}
+	if cfg.RateLimitAPIPerMin > 0 {
+		rl.API = ratelimit.NewInMemoryLimiter(cfg.RateLimitAPIPerMin, time.Minute)
+		rl.APICfg = ratelimit.NewZoneConfig(cfg.RateLimitAPIPerMin, time.Minute)
+	}
+	router := httpx.NewRouter(srv, rl)
 
 	httpServer := &http.Server{
 		Addr:              ":" + strconv.Itoa(cfg.Port),

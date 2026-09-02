@@ -63,6 +63,21 @@ type Config struct {
 	// WSCORSOrigins is a comma-separated list of origins allowed to open WS
 	// connections (CORS check for the WebSocket handshake). "*" allows all.
 	WSCORSOrigins []string
+
+	// --- Realtime backplane (Tier 2D) ---
+	// RedisURL is the connection URL for the Redis Pub/Sub backplane that allows
+	// WebSocket events to be routed across multiple API server instances behind a
+	// load balancer. Format: redis://[:password@]host:port[/db]
+	// Leave empty (default) to run in single-node mode (Hub only, no Redis).
+	RedisURL string
+
+	// --- Rate limiting (Tier 2E) ---
+	// Per-IP request limits per zone. "Auth" is tight (brute-force protection).
+	// "Upload" is moderate (S3 presign ops are expensive). "API" is generous.
+	// Set to 0 to disable rate limiting for that zone.
+	RateLimitAuthPerMin   int // default 10
+	RateLimitUploadPerMin int // default 30
+	RateLimitAPIPerMin    int // default 120
 }
 
 // Load reads configuration from environment variables, applying defaults for
@@ -121,6 +136,14 @@ func Load() (Config, error) {
 		// --- Auth / realtime (Phase 6) ---
 		JWTSecret:     envStr("JWT_SECRET", ""),
 		WSCORSOrigins: envList("WS_CORS_ORIGINS", []string{"*"}),
+
+		// --- Realtime backplane (Tier 2D) ---
+		RedisURL: envStr("REDIS_URL", ""),
+
+		// --- Rate limiting (Tier 2E) ---
+		RateLimitAuthPerMin:   mustEnvInt("RL_AUTH_RPM", 10),
+		RateLimitUploadPerMin: mustEnvInt("RL_UPLOAD_RPM", 30),
+		RateLimitAPIPerMin:    mustEnvInt("RL_API_RPM", 120),
 	}, nil
 }
 
@@ -184,3 +207,15 @@ func envList(key string, fallback []string) []string {
 	}
 	return out
 }
+
+// mustEnvInt reads an integer env var, returning fallback on missing or invalid
+// value. Unlike envInt it never surfaces an error — used for optional numeric
+// tuning knobs where an invalid value should degrade gracefully to the default.
+func mustEnvInt(key string, fallback int) int {
+	n, err := envInt(key, fallback)
+	if err != nil {
+		return fallback
+	}
+	return n
+}
+

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"go-drive-clone/internal/domain"
+	"go-drive-clone/internal/metrics"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 	"go-drive-clone/internal/queue"
 	wsSync "go-drive-clone/internal/sync"
@@ -87,13 +88,21 @@ type InitiateResponse struct {
 }
 
 // InitiateRespChunk is the per-chunk reply: its sequence, hash, whether it is
-// already stored, and the upload URL when the client must PUT it.
+// already stored, and the upload URL(s) when the client must PUT it.
+//
+// Small blocks (≤ 5 GiB): UploadURL is a single presigned PUT URL.
+// Large blocks (> 5 GiB): UploadURL is empty; instead UploadID + PartURLs
+// carry the S3 Multipart Upload session. The client must PUT each part to its
+// PartURL and collect the ETag response header, then call POST /upload/complete
+// with the ETags so the server can call CompleteMultipartUpload.
 type InitiateRespChunk struct {
-	SequenceNumber int    `json:"sequence_number"`
-	SHA256         string `json:"sha256"`
-	SizeBytes      int32  `json:"size_bytes"`
-	AlreadyExists  bool   `json:"already_exists"`
-	UploadURL      string `json:"upload_url,omitempty"`
+	SequenceNumber int      `json:"sequence_number"`
+	SHA256         string   `json:"sha256"`
+	SizeBytes      int32    `json:"size_bytes"`
+	AlreadyExists  bool     `json:"already_exists"`
+	UploadURL      string   `json:"upload_url,omitempty"`   // single PUT path (≤ 5 GiB)
+	UploadID       string   `json:"upload_id,omitempty"`    // MPU upload ID (> 5 GiB)
+	PartURLs       []string `json:"part_urls,omitempty"`    // one presigned URL per part
 }
 
 // Initiate performs deduplication-aware session creation. It returns the new
@@ -126,6 +135,14 @@ func (s *UploadService) Initiate(ctx context.Context, req InitiateRequest) (*Ini
 		existingSet[b.SHA256] = true
 	}
 
+	// Record deduplication metrics: hits = blocks already stored (client skips
+	// uploading them), misses = blocks that need a fresh upload URL.
+	dedupHits := float64(len(existing))
+	dedupMisses := float64(len(hashes) - len(existing))
+	metrics.BlockDedupHits.Add(dedupHits)
+	metrics.BlockDedupMisses.Add(dedupMisses)
+	metrics.UploadsInitiated.Inc()
+
 	// 2. Build the session + its blocks. Pre-existing chunks are marked
 	//    is_uploaded=true so completion won't expect a fresh upload.
 	session := &domain.UploadSession{
@@ -154,14 +171,43 @@ func (s *UploadService) Initiate(ctx context.Context, req InitiateRequest) (*Ini
 			SizeBytes:      c.SizeBytes,
 			AlreadyExists:  alreadyExists,
 		}
-		// 3. For chunks the client must still upload, generate a URL. We use a
-		//    generous lifetime; the local driver ignores it, S3 would honour it.
+		// 3. Generate upload URL(s) for chunks the client still must upload.
 		if !alreadyExists {
-			url, err := s.storage.GenerateUploadURL(ctx, c.SHA256, 30*time.Minute)
-			if err != nil {
-				return nil, fmt.Errorf("generate upload url for %s: %w", c.SHA256, err)
+			blockKey := "blocks/" + c.SHA256
+			blockSize := int64(c.SizeBytes)
+
+			if blockSize > domain.MPUBlockThreshold {
+				// Large block path (> 5 GiB): S3 Multipart Upload.
+				// Try to cast storage to MultipartUploadProvider.
+				mpu, ok := s.storage.(domain.MultipartUploadProvider)
+				if !ok {
+					return nil, fmt.Errorf("block %s exceeds 5 GiB but storage driver does not support multipart upload", c.SHA256)
+				}
+				uploadID, err := mpu.CreateMultipartUpload(ctx, blockKey)
+				if err != nil {
+					return nil, fmt.Errorf("create multipart upload for %s: %w", c.SHA256, err)
+				}
+				partCount := int32((blockSize + domain.MPUPartSize - 1) / domain.MPUPartSize)
+				partURLs := make([]string, 0, partCount)
+				for p := int32(1); p <= partCount; p++ {
+					pURL, err := mpu.PresignUploadPart(ctx, blockKey, uploadID, p, 30*time.Minute)
+					if err != nil {
+						// Best-effort abort so we don't leave orphaned MPUs in S3.
+						_ = mpu.AbortMultipartUpload(ctx, blockKey, uploadID)
+						return nil, fmt.Errorf("presign part %d for %s: %w", p, c.SHA256, err)
+					}
+					partURLs = append(partURLs, pURL)
+				}
+				rc.UploadID = uploadID
+				rc.PartURLs = partURLs
+			} else {
+				// Standard path (≤ 5 GiB): single presigned PUT URL.
+				url, err := s.storage.GenerateUploadURL(ctx, c.SHA256, 30*time.Minute)
+				if err != nil {
+					return nil, fmt.Errorf("generate upload url for %s: %w", c.SHA256, err)
+				}
+				rc.UploadURL = url
 			}
-			rc.UploadURL = url
 		}
 		respChunks = append(respChunks, rc)
 	}
@@ -369,6 +415,7 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 	}
 
 	s.log.Info("upload completed", "session_id", req.SessionID, "file_id", result.FileID)
+	metrics.UploadsCompleted.Inc()
 
 	// Publish a thumbnail job to the event queue. Failure to publish is
 	// non-fatal — the upload succeeded, the thumbnail will just be missed.
