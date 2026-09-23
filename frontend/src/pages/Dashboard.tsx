@@ -7,12 +7,15 @@ import { useAuth } from '../hooks/useAuth'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useUpload, UPLOAD_COMPLETE_EVENT } from '../context/UploadContext'
 import { useToast } from '../components/Toast'
-import type { FileItem, BreadcrumbNode } from '../types/file'
+import type { FileItem, BreadcrumbNode, FileStatus, ShareInvitation } from '../types/file'
 import type {
   WSMessage,
   ThumbnailReadyPayload,
   UploadCompletedPayload,
   FileSharedPayload,
+  ShareInvitationPayload,
+  DeltaSyncResponse,
+  WebSocketStatus,
 } from '../types/sync'
 import { Sidebar } from '../components/Sidebar'
 import { Navbar } from '../components/Navbar'
@@ -38,6 +41,8 @@ import { downloadEncryptedFile } from '../lib/download'
 import { VersionHistoryModal } from '../components/VersionHistoryModal'
 import { GetInfoModal } from '../components/GetInfoModal'
 import { DetailPanel } from '../components/DetailPanel'
+import { PendingInvitationsBanner } from '../components/PendingInvitationsBanner'
+import { SandboxedPreviewModal } from '../components/SandboxedPreviewModal'
 
 /** Mocked storage limit for the gauge (15 GB in bytes). */
 const STORAGE_LIMIT = 15 * 1_073_741_824
@@ -54,6 +59,7 @@ const STORAGE_USED = 2.4 * 1_073_741_824
  */
 export function Dashboard() {
   const { logout, user } = useAuth()
+  const { push: pushToast } = useToast()
   const [searchParams, setSearchParams] = useSearchParams()
 
   // ---- Navigation state (driven by URL search params for Chrome Back/Forward support) ----
@@ -72,6 +78,22 @@ export function Dashboard() {
   const [isLoading, setIsLoading] = useState(true)
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [lastFetchedKey, setLastFetchedKey] = useState<string>('')
+
+  // Phase 2: Dropbox-grade delta sync tracking
+  const syncCursorRef = useRef<number>(0)
+  const isSyncingRef = useRef<boolean>(false)
+  const currentFolderIdRef = useRef<string | null>(currentFolderId)
+  const activeNavRef = useRef<string>(activeNav)
+  const searchQueryRef = useRef<string>(searchQuery)
+  useEffect(() => {
+    currentFolderIdRef.current = currentFolderId
+  }, [currentFolderId])
+  useEffect(() => {
+    activeNavRef.current = activeNav
+  }, [activeNav])
+  useEffect(() => {
+    searchQueryRef.current = searchQuery
+  }, [searchQuery])
 
   const isInTrash = activeNav === 'trash' || isTrashContext
 
@@ -154,6 +176,11 @@ export function Dashboard() {
   const [infoTarget, setInfoTarget] = useState<FileItem | null>(null)
   const [isDetailsOpen, setIsDetailsOpen] = useState(false)
 
+  // Share Invitations & Safety Gate state (Option A)
+  const [invitations, setInvitations] = useState<ShareInvitation[]>([])
+  const [loadingInvitationId, setLoadingInvitationId] = useState<string | null>(null)
+  const [previewInvitation, setPreviewInvitation] = useState<ShareInvitation | null>(null)
+
   // Phase 11 E2EE state
   const [downloadDecryptTarget, setDownloadDecryptTarget] = useState<FileItem | null>(null)
   const [isDecrypting, setIsDecrypting] = useState(false)
@@ -178,7 +205,11 @@ export function Dashboard() {
   const abortRef = useRef<AbortController | null>(null)
 
   // ---- Fetch directory contents ----
-  const fetchDirectory = useCallback(async (folderId: string | null = currentFolderId, navMode: string = activeNav, query: string = searchQuery) => {
+  const fetchDirectory = useCallback(async (
+    folderId: string | null = currentFolderIdRef.current,
+    navMode: string = activeNavRef.current,
+    query: string = searchQueryRef.current
+  ) => {
     // Abort any in-flight request
     abortRef.current?.abort()
     const controller = new AbortController()
@@ -240,6 +271,24 @@ export function Dashboard() {
       setItems(sorted)
       setLastFetchedKey(navMode + ':' + (folderId || ''))
 
+      // Extract X-Delta-Cursor header if provided, eliminating any race window
+      const deltaCursorHeader = res.headers['x-delta-cursor']
+      if (deltaCursorHeader) {
+        const parsed = parseInt(deltaCursorHeader, 10)
+        if (!isNaN(parsed) && parsed >= 0) {
+          syncCursorRef.current = parsed
+        }
+      } else {
+        // Fallback: sync latest cursor baseline for delta sync
+        apiClient.get<{ cursor: number }>('/sync/cursor')
+          .then(cRes => {
+            if (cRes.data && typeof cRes.data.cursor === 'number') {
+              syncCursorRef.current = cRes.data.cursor
+            }
+          })
+          .catch(cErr => console.error('Failed to sync initial cursor', cErr))
+      }
+
       // Track folder view if we successfully loaded a specific folder
       if (folderId && navMode === 'files') {
         apiClient.post(`/files/${folderId}/view`).catch(e => console.error("failed to track folder view", e))
@@ -290,6 +339,84 @@ export function Dashboard() {
   // Cleanup abort on unmount
   useEffect(() => {
     return () => { abortRef.current?.abort() }
+  }, [])
+
+  // ---- Share Invitations (Collaborative Safety Gate - Option A) ----
+  const fetchInvitations = useCallback(async () => {
+    try {
+      const res = await apiClient.get<ShareInvitation[]>('/shares/invitations')
+      setInvitations(res.data ?? [])
+    } catch {
+      // Ignored if permissions are unavailable or during temporary network disruption
+    }
+  }, [])
+
+  useEffect(() => {
+    void fetchInvitations()
+  }, [fetchInvitations, activeNav])
+
+  const handleAcceptInvitation = useCallback(async (inv: ShareInvitation) => {
+    setLoadingInvitationId(inv.id)
+    try {
+      await apiClient.post(`/shares/invitations/${inv.id}/accept`)
+      pushToast({
+        variant: 'success',
+        message: `Accepted "${inv.file_name}" and added to your Drive!`,
+      })
+      setInvitations((prev) => prev.filter((i) => i.id !== inv.id))
+      if (activeNav === 'shared') {
+        void fetchDirectory(null, 'shared')
+      }
+    } catch {
+      pushToast({
+        variant: 'error',
+        message: 'Failed to accept share invitation.',
+      })
+    } finally {
+      setLoadingInvitationId(null)
+    }
+  }, [activeNav, fetchDirectory, pushToast])
+
+  const handleDeclineInvitation = useCallback(async (inv: ShareInvitation) => {
+    setLoadingInvitationId(inv.id)
+    try {
+      await apiClient.post(`/shares/invitations/${inv.id}/decline`)
+      pushToast({
+        variant: 'info',
+        message: `Declined share for "${inv.file_name}".`,
+      })
+      setInvitations((prev) => prev.filter((i) => i.id !== inv.id))
+    } catch {
+      pushToast({
+        variant: 'error',
+        message: 'Failed to decline share invitation.',
+      })
+    } finally {
+      setLoadingInvitationId(null)
+    }
+  }, [pushToast])
+
+  const handleBlockSender = useCallback(async (inv: ShareInvitation) => {
+    setLoadingInvitationId(inv.id)
+    try {
+      await apiClient.post(`/shares/invitations/${inv.id}/block`)
+      pushToast({
+        variant: 'info',
+        message: `Blocked ${inv.sender_email} and dismissed invitation.`,
+      })
+      setInvitations((prev) => prev.filter((i) => i.id !== inv.id))
+    } catch {
+      pushToast({
+        variant: 'error',
+        message: 'Failed to block sender.',
+      })
+    } finally {
+      setLoadingInvitationId(null)
+    }
+  }, [pushToast])
+
+  const handlePreviewInvitation = useCallback((inv: ShareInvitation) => {
+    setPreviewInvitation(inv)
   }, [])
 
   // ---- Navigation handlers ----
@@ -362,18 +489,15 @@ export function Dashboard() {
 
   /* ----------------------- Phase 7.5: real-time sync ----------------------- */
   const { token } = useAuth()
-  const { push: pushToast } = useToast()
 
   /**
-   * Build the WS URL from the configured API base, upgrading http(s) → ws(s)
-   * and appending the JWT as a query param (the Go server authenticates the
-   * handshake from ?token=, since browsers can't set headers on WS).
+   * Build the clean WS URL from the configured API base, upgrading http(s) → ws(s).
+   * Authentication is performed via the secure in-band first-message handshake,
+   * keeping JWTs completely off URL query logs.
    */
   const wsUrl = useMemo(() => {
     if (!token) return null
     const apiBase = (import.meta.env.VITE_API_BASE as string | undefined) ?? '/api'
-    // Absolute backend host (e.g. http://localhost:8090/api) → ws://...
-    // Relative path (/api) in Vite dev → talk to the dev server origin.
     let base: string
     if (/^https?:\/\//i.test(apiBase)) {
       base = apiBase
@@ -383,7 +507,7 @@ export function Dashboard() {
       return null
     }
     const wsBase = base.replace(/^http/i, 'ws')
-    return `${wsBase}/ws?token=${encodeURIComponent(token)}`
+    return `${wsBase}/ws`
   }, [token])
 
   /** Merge a thumbnail URL into the matching item, causing an instant icon→image swap. */
@@ -443,16 +567,212 @@ export function Dashboard() {
   }, [pushToast])
 
   /**
+   * Phase 2: Dropbox-grade delta sync engine.
+   * Incrementally polls changes since `syncCursorRef.current` and patches `items`
+   * in-memory with O(1) state mutations instead of full directory reloads.
+   */
+  const applyDeltaSync = useCallback(async () => {
+    if (isSyncingRef.current) return
+    isSyncingRef.current = true
+
+    try {
+      let hasMore = true
+      while (hasMore) {
+        const since = syncCursorRef.current
+        const res = await apiClient.get<DeltaSyncResponse>(`/sync/delta?since=${since}&limit=100`)
+        const { entries, next_cursor, has_more } = res.data
+
+        if (entries && entries.length > 0) {
+          setItems((prevItems) => {
+            let updated = [...prevItems]
+            const token = getAccessToken() || ''
+            const curFolder = currentFolderIdRef.current ?? null
+            const isDriveHierarchy = activeNavRef.current === 'drive' && searchQueryRef.current.trim() === ''
+
+            for (const entry of entries) {
+              const isImage = /\.(jpg|jpeg|png|webp|gif)$/i.test(entry.name)
+              const fallbackThumb = isImage
+                ? `${apiClient.defaults.baseURL}/files/${entry.file_id}/thumbnail?token=${token}`
+                : undefined
+              const entryParent = entry.parent_id ?? null
+
+              switch (entry.action) {
+                case 'FILE_CREATED': {
+                  if (isDriveHierarchy && entryParent === curFolder) {
+                    const existingIdx = updated.findIndex((i) => i.id === entry.file_id)
+                    const item: FileItem = {
+                      id: entry.file_id,
+                      user_id: entry.user_id,
+                      name: entry.name,
+                      status: (entry.status as FileStatus) || 'ACTIVE',
+                      parent_id: entry.parent_id,
+                      is_directory: entry.is_directory,
+                      size_bytes: entry.size_bytes,
+                      mime_type: entry.mime_type,
+                      thumbnail_url: entry.thumbnail_url || fallbackThumb,
+                      created_at: entry.created_at,
+                      updated_at: entry.created_at,
+                    }
+                    if (existingIdx >= 0) {
+                      updated[existingIdx] = { ...updated[existingIdx], ...item }
+                    } else {
+                      updated.push(item)
+                    }
+                  }
+                  break
+                }
+
+                case 'FILE_UPDATED': {
+                  const existingIdx = updated.findIndex((i) => i.id === entry.file_id)
+                  if (existingIdx >= 0) {
+                    updated[existingIdx] = {
+                      ...updated[existingIdx],
+                      name: entry.name,
+                      size_bytes: entry.size_bytes,
+                      mime_type: entry.mime_type || updated[existingIdx].mime_type,
+                      status: (entry.status as FileStatus) || updated[existingIdx].status,
+                      thumbnail_url: entry.thumbnail_url || updated[existingIdx].thumbnail_url || fallbackThumb,
+                      updated_at: entry.created_at,
+                    }
+                  }
+                  // Refresh full item asynchronously to catch updated tags/summary
+                  apiClient.get<FileItem>(`/files/${entry.file_id}`).then((res) => {
+                    if (res.data) {
+                      setItems((prev) => prev.map((it) => (it.id === entry.file_id ? { ...it, ...res.data } : it)))
+                      setInfoTarget((prev) => (prev && prev.id === entry.file_id ? { ...prev, ...res.data } : prev))
+                    }
+                  }).catch(() => {})
+                  break
+                }
+
+                case 'FILE_MOVED': {
+                  const existingIdx = updated.findIndex((i) => i.id === entry.file_id)
+                  if (isDriveHierarchy && entryParent === curFolder) {
+                    if (existingIdx >= 0) {
+                      updated[existingIdx] = {
+                        ...updated[existingIdx],
+                        parent_id: entry.parent_id,
+                        name: entry.name,
+                      }
+                    } else {
+                      updated.push({
+                        id: entry.file_id,
+                        user_id: entry.user_id,
+                        name: entry.name,
+                        status: (entry.status as FileStatus) || 'ACTIVE',
+                        parent_id: entry.parent_id,
+                        is_directory: entry.is_directory,
+                        size_bytes: entry.size_bytes,
+                        mime_type: entry.mime_type,
+                        thumbnail_url: entry.thumbnail_url || fallbackThumb,
+                        created_at: entry.created_at,
+                        updated_at: entry.created_at,
+                      })
+                    }
+                  } else {
+                    if (existingIdx >= 0) {
+                      updated.splice(existingIdx, 1)
+                    }
+                  }
+                  break
+                }
+
+                case 'FILE_DELETED': {
+                  updated = updated.filter((i) => i.id !== entry.file_id)
+                  break
+                }
+
+                case 'FILE_RESTORED': {
+                  if (isDriveHierarchy && entry.parent_id === curFolder) {
+                    const existingIdx = updated.findIndex((i) => i.id === entry.file_id)
+                    if (existingIdx >= 0) {
+                      updated[existingIdx] = {
+                        ...updated[existingIdx],
+                        deleted_at: null,
+                      }
+                    } else {
+                      updated.push({
+                        id: entry.file_id,
+                        user_id: entry.user_id,
+                        name: entry.name,
+                        status: (entry.status as FileStatus) || 'ACTIVE',
+                        parent_id: entry.parent_id,
+                        is_directory: entry.is_directory,
+                        size_bytes: entry.size_bytes,
+                        mime_type: entry.mime_type,
+                        thumbnail_url: entry.thumbnail_url || fallbackThumb,
+                        created_at: entry.created_at,
+                        updated_at: entry.created_at,
+                      })
+                    }
+                  } else if (activeNavRef.current === 'trash') {
+                    // Item restored out of Trash: remove from Trash view immediately
+                    updated = updated.filter((i) => i.id !== entry.file_id)
+                  }
+                  break
+                }
+              }
+            }
+
+            return updated.sort((a, b) => {
+              if (a.is_directory !== b.is_directory) return a.is_directory ? -1 : 1
+              return a.name.localeCompare(b.name)
+            })
+          })
+        }
+
+        syncCursorRef.current = next_cursor
+        hasMore = has_more
+      }
+    } catch (err) {
+      console.error('Failed to apply delta sync, falling back to full refresh', err)
+      void fetchDirectory(currentFolderIdRef.current)
+    } finally {
+      isSyncingRef.current = false
+    }
+  }, [fetchDirectory])
+
+  /**
    * Central dispatcher for incoming WS messages. Kept stable via refs so the
    * socket never resubscribes when items change.
    */
   const handleWsMessage = useCallback(
     (msg: WSMessage) => {
       switch (msg.type) {
+        case 'SYNC_DELTA': {
+          void applyDeltaSync()
+          break
+        }
+        case 'AI_METADATA_READY': {
+          const payload = msg.payload as { file_id?: string; tags?: string | null; summary?: string | null }
+          if (payload?.file_id) {
+            setItems((prev) =>
+              prev.map((it) =>
+                it.id === payload.file_id
+                  ? {
+                      ...it,
+                      tags: payload.tags !== undefined ? payload.tags : it.tags,
+                      summary: payload.summary !== undefined ? payload.summary : it.summary,
+                    }
+                  : it
+              )
+            )
+            setInfoTarget((prev) =>
+              prev && prev.id === payload.file_id
+                ? {
+                    ...prev,
+                    tags: payload.tags !== undefined ? payload.tags : prev.tags,
+                    summary: payload.summary !== undefined ? payload.summary : prev.summary,
+                  }
+                : prev
+            )
+          }
+          break
+        }
         case 'UPLOAD_COMPLETED': {
           const payload = msg.payload as UploadCompletedPayload
-          // Silent refresh so the new file appears in the active listing.
-          void fetchDirectory(currentFolderId)
+          // Incrementally sync newly created/uploaded file deltas
+          void applyDeltaSync()
           const name = filenameForId(payload.file_id)
           triggerBatchUploadToast(name)
           break
@@ -472,17 +792,32 @@ export function Dashboard() {
             action: {
               label: 'View',
               onClick: () => {
-                // "Shared with me" tab isn't built yet; log + leave a hook.
-                // eslint-disable-next-line no-console
-                console.info('[ws] navigate to shared file:', payload.file_id)
+                setSearchParams({ nav: 'shared' })
               },
             },
           })
+          if (activeNav === 'shared') {
+            void fetchDirectory(null, 'shared')
+          }
+          break
+        }
+        case 'SHARE_INVITATION': {
+          const payload = msg.payload as ShareInvitationPayload
+          pushToast({
+            variant: 'info',
+            message: `${payload.shared_by || 'Someone'} sent you a share invitation for: ${payload.filename || 'Untitled'}`,
+            action: {
+              label: 'Review',
+              onClick: () => {
+                setSearchParams({ nav: 'shared' })
+              },
+            },
+          })
+          void fetchInvitations()
           break
         }
         case 'VIRUS_DETECTED': {
-          const payload = msg.payload as any // we'll use 'any' or 'VirusDetectedPayload' if we import it, wait, we can just import it. Let's cast it directly or inline.
-          // Better yet, I'll just use any to avoid import issues.
+          const payload = msg.payload as any
           pushToast({
             variant: 'error',
             message: `Malware blocked: file ${payload.filename || 'Untitled'} was flagged as infected by ClamAV and placed in quarantine.`,
@@ -496,17 +831,26 @@ export function Dashboard() {
           break
       }
     },
-    // fetchDirectory is stable (useCallback, []); currentFolderId + items are
-    // read via closures intentionally.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [currentFolderId, filenameForId, applyThumbnail, pushToast, triggerBatchUploadToast],
+    [currentFolderId, filenameForId, applyThumbnail, pushToast, triggerBatchUploadToast, applyDeltaSync, fetchDirectory, activeNav, setSearchParams, fetchInvitations],
   )
 
-  const { status: wsStatus } = useWebSocket({
+  const { status: wsStatus, isCircuitBroken, retry: retryWs } = useWebSocket({
     url: wsUrl,
+    token,
     enabled: token !== null,
     onMessage: handleWsMessage,
   })
+
+  // Reconnect catchup: when socket reconnects, catch up on missed deltas
+  const prevWsStatusRef = useRef<WebSocketStatus>(wsStatus)
+  useEffect(() => {
+    if (prevWsStatusRef.current !== 'CONNECTED' && wsStatus === 'CONNECTED') {
+      if (syncCursorRef.current > 0) {
+        void applyDeltaSync()
+      }
+    }
+    prevWsStatusRef.current = wsStatus
+  }, [wsStatus, applyDeltaSync])
 
   /* ----------------------- Phase 7.4: file actions ----------------------- */
 
@@ -568,6 +912,7 @@ export function Dashboard() {
   // The action bundle handed to the context menu. Each just opens a modal.
   const menuActions: ContextMenuActions = useMemo(
     () => ({
+      onOpenFolder: (item) => navigateToFolder(item),
       onPreview: (item) => handleOpenFile(item),
       onShare: (item) => setShareTarget(item),
       onRename: (item) => setRenameTarget(item),
@@ -581,7 +926,7 @@ export function Dashboard() {
       onVersionHistory: (item) => setVersionHistoryTarget(item),
       onGetInfo: (item) => setInfoTarget(item),
     }),
-    [handleDownload, handleRestore],
+    [handleDownload, handleRestore, navigateToFolder],
   )
 
   /** Patch an item's name in local state after a successful rename. */
@@ -860,12 +1205,12 @@ export function Dashboard() {
     [uploadFile, currentFolderId, isInTrash, pushToast],
   )
 
-  // Refresh the listing when any upload completes.
+  // Refresh the listing incrementally when any upload completes.
   useEffect(() => {
-    const handler = () => void fetchDirectory(currentFolderId, activeNav)
+    const handler = () => void applyDeltaSync()
     window.addEventListener(UPLOAD_COMPLETE_EVENT, handler)
     return () => window.removeEventListener(UPLOAD_COMPLETE_EVENT, handler)
-  }, [UPLOAD_COMPLETE_EVENT, currentFolderId, activeNav, fetchDirectory])
+  }, [UPLOAD_COMPLETE_EVENT, applyDeltaSync])
 
 
 
@@ -914,6 +1259,9 @@ export function Dashboard() {
           storageUsed={STORAGE_USED}
           storageLimit={STORAGE_LIMIT}
           syncStatus={wsStatus}
+          isCircuitBroken={isCircuitBroken}
+          onRetrySync={retryWs}
+          pendingInvitationsCount={invitations.length}
         />
       </div>
 
@@ -978,6 +1326,18 @@ export function Dashboard() {
           </div>
         )}
 
+        {/* Share Invitations Banner (Collaborative Safety Gate - Option A) */}
+        {activeNav === 'shared' && !currentFolderId && (
+          <PendingInvitationsBanner
+            invitations={invitations}
+            onAccept={handleAcceptInvitation}
+            onDecline={handleDeclineInvitation}
+            onBlockSender={handleBlockSender}
+            onPreview={handlePreviewInvitation}
+            loadingId={loadingInvitationId}
+          />
+        )}
+
         {/* File list / grid / skeleton */}
         {isLoading || !isCurrentStateLoaded ? (
           <DirectorySkeleton />
@@ -1012,6 +1372,9 @@ export function Dashboard() {
             item={selectedIds.size === 1 ? filteredItems.find(it => selectedIds.has(it.id)) || null : null}
             isOpen={isDetailsOpen}
             onClose={() => setIsDetailsOpen(false)}
+            onItemUpdated={(updated) => {
+              setItems((prev) => prev.map((it) => (it.id === updated.id ? updated : it)))
+            }}
           />
         </div>
 
@@ -1207,8 +1570,21 @@ export function Dashboard() {
         <GetInfoModal
           item={infoTarget}
           onClose={() => setInfoTarget(null)}
+          onItemUpdated={(updated) => {
+            setItems((prev) => prev.map((it) => (it.id === updated.id ? updated : it)))
+            setInfoTarget(updated)
+          }}
         />
       )}
+
+      {/* Sandboxed Read-Only Preview Modal for Unaccepted Shares */}
+      <SandboxedPreviewModal
+        open={previewInvitation !== null}
+        onClose={() => setPreviewInvitation(null)}
+        invitation={previewInvitation}
+        onAccept={handleAcceptInvitation}
+        onDecline={handleDeclineInvitation}
+      />
 
       <MobileNav
         activeNav={isInTrash ? 'trash' : activeNav}

@@ -8,9 +8,28 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/lib/pq"
 	"go-drive-clone/internal/domain"
 )
+
+// EscapeSQLLike escapes special wildcard characters ('\', '%', '_') for SQL LIKE patterns.
+func EscapeSQLLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
+const fileSelectColumns = `id, user_id, name, parent_id, path, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status`
+
+func scanFileRow(scanner interface{ Scan(dest ...any) error }, f *domain.File) error {
+	return scanner.Scan(
+		&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.Path, &f.IsDirectory, &f.SizeBytes,
+		&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.TargetID, &f.MimeType,
+		&f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary, &f.Status,
+	)
+}
 
 // FileRepository is the Postgres implementation of domain.FileRepository.
 type FileRepository struct {
@@ -27,16 +46,33 @@ func (r *FileRepository) WithTx(tx DBTX) *FileRepository {
 	return &FileRepository{db: tx}
 }
 
-// Create inserts file and reads back the DB-generated id/timestamps.
+// Create inserts file, ensuring an authoritative materialized path is set, and reads back timestamps.
 func (r *FileRepository) Create(ctx context.Context, file *domain.File) error {
+	if file.ID == "" {
+		file.ID = uuid.New().String()
+	}
+
+	if file.Path == "" {
+		if file.ParentID == nil || *file.ParentID == "" {
+			file.Path = "/" + file.ID + "/"
+		} else {
+			var parentPath string
+			err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1", *file.ParentID).Scan(&parentPath)
+			if err != nil {
+				return fmt.Errorf("lookup parent path for %s: %w", *file.ParentID, err)
+			}
+			file.Path = parentPath + file.ID + "/"
+		}
+	}
+
 	const q = `
-		INSERT INTO files (user_id, name, parent_id, is_directory, size_bytes, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		RETURNING id, created_at, updated_at
+		INSERT INTO files (id, user_id, name, parent_id, path, is_directory, size_bytes, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		RETURNING created_at, updated_at
 	`
 	row := r.db.QueryRowContext(ctx, q,
-		file.UserID, file.Name, file.ParentID, file.IsDirectory, file.SizeBytes, file.TargetID, file.MimeType, file.ShortcutTargetID, file.IsEncrypted, file.EncryptionSalt, file.Status)
-	if err := row.Scan(&file.ID, &file.CreatedAt, &file.UpdatedAt); err != nil {
+		file.ID, file.UserID, file.Name, file.ParentID, file.Path, file.IsDirectory, file.SizeBytes, file.TargetID, file.MimeType, file.ShortcutTargetID, file.IsEncrypted, file.EncryptionSalt, file.Status)
+	if err := row.Scan(&file.CreatedAt, &file.UpdatedAt); err != nil {
 		return fmt.Errorf("insert file: %w", err)
 	}
 	return nil
@@ -44,15 +80,9 @@ func (r *FileRepository) Create(ctx context.Context, file *domain.File) error {
 
 // GetByID returns the file with the given id.
 func (r *FileRepository) GetByID(ctx context.Context, id string) (*domain.File, error) {
-	const q = `
-		SELECT id, user_id, name, parent_id, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status
-		FROM files
-		WHERE id = $1
-	`
+	q := fmt.Sprintf(`SELECT %s FROM files WHERE id = $1`, fileSelectColumns)
 	var f domain.File
-	err := r.db.QueryRowContext(ctx, q, id).Scan(
-		&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.IsDirectory, &f.SizeBytes,
-		&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.TargetID, &f.MimeType, &f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary, &f.Status)
+	err := scanFileRow(r.db.QueryRowContext(ctx, q, id), &f)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, fmt.Errorf("file by id %q: %w", id, sql.ErrNoRows)
@@ -62,33 +92,31 @@ func (r *FileRepository) GetByID(ctx context.Context, id string) (*domain.File, 
 	return &f, nil
 }
 
-// GetFolderByNameAndParent checks if a active (non-deleted) folder with exact name and parentID exists for userID.
+// GetFolderByNameAndParent checks if an active (non-deleted) folder with exact name and parentID exists for userID.
 func (r *FileRepository) GetFolderByNameAndParent(ctx context.Context, userID, name string, parentID *string) (*domain.File, error) {
 	var (
 		row *sql.Row
 		f   domain.File
 	)
 	if parentID == nil {
-		const q = `
-			SELECT id, user_id, name, parent_id, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status
+		q := fmt.Sprintf(`
+			SELECT %s
 			FROM files
 			WHERE user_id = $1 AND name = $2 AND parent_id IS NULL AND is_directory = TRUE AND deleted_at IS NULL
 			LIMIT 1
-		`
+		`, fileSelectColumns)
 		row = r.db.QueryRowContext(ctx, q, userID, name)
 	} else {
-		const q = `
-			SELECT id, user_id, name, parent_id, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status
+		q := fmt.Sprintf(`
+			SELECT %s
 			FROM files
 			WHERE user_id = $1 AND name = $2 AND parent_id = $3 AND is_directory = TRUE AND deleted_at IS NULL
 			LIMIT 1
-		`
+		`, fileSelectColumns)
 		row = r.db.QueryRowContext(ctx, q, userID, name, *parentID)
 	}
 
-	err := row.Scan(
-		&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.IsDirectory, &f.SizeBytes,
-		&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.TargetID, &f.MimeType, &f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary, &f.Status)
+	err := scanFileRow(row, &f)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, sql.ErrNoRows
@@ -107,16 +135,16 @@ func (r *FileRepository) ListDirectory(ctx context.Context, userID string, paren
 		err  error
 	)
 	if parentID == nil {
-		const q = `
-			SELECT id, user_id, name, parent_id, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status
+		q := fmt.Sprintf(`
+			SELECT %s
 			FROM files
 			WHERE user_id = $1 AND parent_id IS NULL AND deleted_at IS NULL
 			ORDER BY is_directory DESC, name ASC
-		`
+		`, fileSelectColumns)
 		rows, err = r.db.QueryContext(ctx, q, userID)
 	} else {
-		const q = `
-			SELECT f.id, f.user_id, f.name, f.parent_id, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
+		q := fmt.Sprintf(`
+			SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
 			FROM files f
 			WHERE f.parent_id = $1
 			  AND (
@@ -124,7 +152,7 @@ func (r *FileRepository) ListDirectory(ctx context.Context, userID string, paren
 			    OR f.deleted_at IS NULL
 			  )
 			ORDER BY f.is_directory DESC, f.name ASC
-		`
+		`)
 		rows, err = r.db.QueryContext(ctx, q, *parentID)
 	}
 	if err != nil {
@@ -135,9 +163,7 @@ func (r *FileRepository) ListDirectory(ctx context.Context, userID string, paren
 	var out []*domain.File
 	for rows.Next() {
 		var f domain.File
-		if err := rows.Scan(
-			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.IsDirectory, &f.SizeBytes,
-			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.TargetID, &f.MimeType, &f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary, &f.Status); err != nil {
+		if err := scanFileRow(rows, &f); err != nil {
 			return nil, fmt.Errorf("scan file row: %w", err)
 		}
 		out = append(out, &f)
@@ -176,7 +202,7 @@ func (r *FileRepository) ListTrash(ctx context.Context, userID string) ([]*domai
 		    FROM subtree_stats
 		    GROUP BY root_id
 		)
-		SELECT dr.id, dr.user_id, dr.name, dr.parent_id, dr.is_directory, dr.size_bytes, dr.created_at, dr.updated_at, dr.deleted_at,
+		SELECT dr.id, dr.user_id, dr.name, dr.parent_id, dr.path, dr.is_directory, dr.size_bytes, dr.created_at, dr.updated_at, dr.deleted_at,
 		       COALESCE(ast.total_size, 0) AS aggregate_size,
 		       COALESCE(ast.nested_item_count, 0) AS item_count,
 		       COALESCE((SELECT name FROM files WHERE id = dr.parent_id), 'My Drive') AS original_location,
@@ -200,7 +226,7 @@ func (r *FileRepository) ListTrash(ctx context.Context, userID string) ([]*domai
 			originalLocation string
 		)
 		if err := rows.Scan(
-			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.IsDirectory, &f.SizeBytes,
+			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.Path, &f.IsDirectory, &f.SizeBytes,
 			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,
 			&aggregateSize, &itemCount, &originalLocation,
 			&f.TargetID, &f.MimeType, &f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary,
@@ -215,23 +241,25 @@ func (r *FileRepository) ListTrash(ctx context.Context, userID string) ([]*domai
 	return out, rows.Err()
 }
 
-// GetDescendants recursively retrieves all non-deleted files and subfolders nested under rootID.
+// GetDescendants retrieves all non-deleted files and subfolders nested under rootID using materialized path prefix scan.
 func (r *FileRepository) GetDescendants(ctx context.Context, rootID string) ([]*domain.File, error) {
-	const q = `
-		WITH RECURSIVE subtree AS (
-			SELECT id, user_id, name, parent_id, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status
-			FROM files
-			WHERE parent_id = $1 AND deleted_at IS NULL
-			UNION ALL
-			SELECT f.id, f.user_id, f.name, f.parent_id, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
-			FROM files f
-			INNER JOIN subtree s ON f.parent_id = s.id
-			WHERE f.deleted_at IS NULL
-		)
-		SELECT id, user_id, name, parent_id, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status
-		FROM subtree
-	`
-	rows, err := r.db.QueryContext(ctx, q, rootID)
+	var rootPath string
+	err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1", rootID).Scan(&rootPath)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("lookup root path: %w", err)
+	}
+
+	escapedPrefix := EscapeSQLLike(rootPath) + "%"
+	q := fmt.Sprintf(`
+		SELECT %s
+		FROM files
+		WHERE path LIKE $1 ESCAPE '\' AND path != $2 AND deleted_at IS NULL
+		ORDER BY path ASC
+	`, fileSelectColumns)
+	rows, err := r.db.QueryContext(ctx, q, escapedPrefix, rootPath)
 	if err != nil {
 		return nil, fmt.Errorf("query descendants: %w", err)
 	}
@@ -240,9 +268,7 @@ func (r *FileRepository) GetDescendants(ctx context.Context, rootID string) ([]*
 	var out []*domain.File
 	for rows.Next() {
 		var f domain.File
-		if err := rows.Scan(
-			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.IsDirectory, &f.SizeBytes,
-			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.TargetID, &f.MimeType, &f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary, &f.Status); err != nil {
+		if err := scanFileRow(rows, &f); err != nil {
 			return nil, fmt.Errorf("scan descendant file row: %w", err)
 		}
 		out = append(out, &f)
@@ -323,53 +349,61 @@ func (r *FileRepository) GetSubtreeForItems(ctx context.Context, ids []string, u
 	return items, nil
 }
 
-// SoftDelete recursively sets deleted_at = CURRENT_TIMESTAMP for rootID and all nested descendants.
+// SoftDelete sets deleted_at = CURRENT_TIMESTAMP for rootID and all nested descendants in O(1) prefix match.
 func (r *FileRepository) SoftDelete(ctx context.Context, rootID string, userID string) error {
+	var rootPath string
+	err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1 AND user_id = $2", rootID, userID).Scan(&rootPath)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("lookup root path: %w", err)
+	}
+
+	escapedPrefix := EscapeSQLLike(rootPath) + "%"
+
+	// 1. Orphan foreign files whose parent is inside this subtree
 	const qOrphan = `
-		WITH RECURSIVE subtree AS (
-			SELECT id, user_id FROM files WHERE id = $1 AND user_id = $2
-			UNION ALL
-			SELECT f.id, f.user_id FROM files f JOIN subtree s ON f.parent_id = s.id
-		)
 		UPDATE files
 		SET parent_id = NULL
-		WHERE parent_id IN (SELECT id FROM subtree WHERE user_id = $2)
-		  AND user_id != $2;
+		WHERE parent_id IN (
+			SELECT id FROM files WHERE user_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\')
+		) AND user_id != $1;
 	`
-	if _, err := r.db.ExecContext(ctx, qOrphan, rootID, userID); err != nil {
+	if _, err := r.db.ExecContext(ctx, qOrphan, userID, rootPath, escapedPrefix); err != nil {
 		return fmt.Errorf("soft delete orphan foreign files: %w", err)
 	}
 
+	// 2. Soft delete the folder and all descendants
 	const qDelete = `
-		WITH RECURSIVE subtree AS (
-			SELECT id FROM files WHERE id = $1 AND user_id = $2
-			UNION ALL
-			SELECT f.id FROM files f JOIN subtree s ON f.parent_id = s.id
-		)
 		UPDATE files
 		SET deleted_at = CURRENT_TIMESTAMP
-		WHERE id IN (SELECT id FROM subtree) AND user_id = $2;
+		WHERE user_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\');
 	`
-	if _, err := r.db.ExecContext(ctx, qDelete, rootID, userID); err != nil {
+	if _, err := r.db.ExecContext(ctx, qDelete, userID, rootPath, escapedPrefix); err != nil {
 		return fmt.Errorf("soft delete: %w", err)
 	}
 	return nil
 }
 
-// Restore recursively sets deleted_at = NULL for rootID and all nested descendants.
+// Restore sets deleted_at = NULL for rootID and all nested descendants in O(1) prefix match.
 func (r *FileRepository) Restore(ctx context.Context, rootID string, userID string) error {
+	var rootPath string
+	err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1", rootID).Scan(&rootPath)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("lookup root path: %w", err)
+	}
+
+	escapedPrefix := EscapeSQLLike(rootPath) + "%"
 	const q = `
-		WITH RECURSIVE subtree AS (
-			SELECT id FROM files WHERE id = $1
-			UNION ALL
-			SELECT f.id FROM files f JOIN subtree s ON f.parent_id = s.id
-		)
 		UPDATE files
 		SET deleted_at = NULL
-		WHERE id IN (SELECT id FROM subtree);
+		WHERE (path = $1 OR path LIKE $2 ESCAPE '\');
 	`
-	_, err := r.db.ExecContext(ctx, q, rootID)
-	if err != nil {
+	if _, err := r.db.ExecContext(ctx, q, rootPath, escapedPrefix); err != nil {
 		return fmt.Errorf("restore: %w", err)
 	}
 	return nil
@@ -379,10 +413,10 @@ func (r *FileRepository) Restore(ctx context.Context, rootID string, userID stri
 // (excluding files owned by the user themselves and excluding soft-deleted files).
 func (r *FileRepository) ListSharedWithUser(ctx context.Context, userEmail, userID string) ([]*domain.File, error) {
 	const q = `
-		SELECT f.id, f.user_id, f.name, f.parent_id, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, p.created_at, f.target_id, p.role
+		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, p.created_at, f.target_id, p.role
 		FROM files f
 		JOIN permissions p ON f.id = p.file_id
-		WHERE p.grantee_email = $1 AND f.user_id != $2 AND f.deleted_at IS NULL
+		WHERE p.grantee_email = $1 AND p.status = 'ACCEPTED' AND f.user_id != $2 AND f.deleted_at IS NULL
 		ORDER BY p.created_at DESC
 	`
 	rows, err := r.db.QueryContext(ctx, q, userEmail, userID)
@@ -396,7 +430,7 @@ func (r *FileRepository) ListSharedWithUser(ctx context.Context, userEmail, user
 		var f domain.File
 		var sharedAt time.Time
 		if err := rows.Scan(
-			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.IsDirectory, &f.SizeBytes,
+			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.Path, &f.IsDirectory, &f.SizeBytes,
 			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &sharedAt, &f.TargetID, &f.Role); err != nil {
 			return nil, fmt.Errorf("scan shared file row: %w", err)
 		}
@@ -406,120 +440,203 @@ func (r *FileRepository) ListSharedWithUser(ctx context.Context, userEmail, user
 	return out, rows.Err()
 }
 
+// MoveSubtree atomically moves a folder and all its nested descendants to a new parent,
+// updating all materialized paths in O(1) via prefix substitution.
+func (r *FileRepository) MoveSubtree(ctx context.Context, folderID string, newParentID *string, userID string) error {
+	var (
+		oldPath    string
+		targetPath string
+		newPrefix  string
+	)
+
+	// 1. Fetch current folder path
+	err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1 AND user_id = $2", folderID, userID).Scan(&oldPath)
+	if err != nil {
+		return fmt.Errorf("lookup folder %s: %w", folderID, err)
+	}
+
+	// 2. Resolve new parent path
+	if newParentID == nil || *newParentID == "" {
+		newPrefix = "/" + folderID + "/"
+	} else {
+		if *newParentID == folderID {
+			return fmt.Errorf("cannot move a folder into itself")
+		}
+		err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1", *newParentID).Scan(&targetPath)
+		if err != nil {
+			return fmt.Errorf("lookup new parent %s: %w", *newParentID, err)
+		}
+
+		// Cycle check: target parent path cannot start with oldPath
+		if strings.HasPrefix(targetPath, oldPath) {
+			return fmt.Errorf("cannot move directory inside its own descendant")
+		}
+		newPrefix = targetPath + folderID + "/"
+	}
+
+	if newPrefix == oldPath {
+		// Nothing to move
+		return nil
+	}
+
+	// 3. Subtree relocation
+	// In PostgreSQL, SUBSTRING is 1-indexed. Starting at len(oldPath)+1 yields the remainder after oldPath.
+	oldPrefixEscaped := EscapeSQLLike(oldPath) + "%"
+	oldLenPlusOne := len(oldPath) + 1
+
+	const q = `
+		UPDATE files
+		SET path = $1 || SUBSTRING(path FROM $2),
+		    parent_id = CASE WHEN id = $6 THEN $7 ELSE parent_id END,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE user_id = $3 AND (path = $4 OR path LIKE $5 ESCAPE '\')
+	`
+	_, err = r.db.ExecContext(ctx, q,
+		newPrefix,
+		oldLenPlusOne,
+		userID,
+		oldPath,
+		oldPrefixEscaped,
+		folderID,
+		newParentID,
+	)
+	if err != nil {
+		return fmt.Errorf("relocate subtree %s: %w", folderID, err)
+	}
+
+	return nil
+}
+
 // Update mutates a file/folder's name and/or parent_id and refreshes
 // updated_at. The file.ID must already be set; on return the struct is
-// repopulated with the persisted row (including a server-set updated_at).
-//
-// Parent semantics:
-//   - nil *string   -> leave parent_id UNCHANGED
-//   - non-nil ""    -> move to root (parent_id = NULL)
-//   - non-nil value -> set parent_id to that value
-//
-// Name semantics: an empty name leaves the column unchanged; this lets the
-// caller update only parent_id (a pure move) in one round trip.
+// repopulated with the persisted row (including server-set path and updated_at).
 func (r *FileRepository) Update(ctx context.Context, file *domain.File) error {
-	// Build the SET clause dynamically from whichever fields are present, so a
-	// pure move (no name) or a pure rename (no parent change) each send a
-	// minimal UPDATE.
-	setParts := []string{"updated_at = CURRENT_TIMESTAMP"}
-	args := []any{file.ID}
-	argIdx := 2 // $1 is the file id used in WHERE
-
-	if file.Name != "" {
-		setParts = append(setParts, fmt.Sprintf("name = $%d", argIdx))
-		args = append(args, file.Name)
-		argIdx++
-	}
+	// If parent_id changed, handle subtree relocation or single file move
 	if file.ParentID != nil {
-		// Non-nil pointer (possibly empty string). Empty string => root.
-		if *file.ParentID == "" {
-			setParts = append(setParts, "parent_id = NULL")
-		} else {
-			setParts = append(setParts, fmt.Sprintf("parent_id = $%d", argIdx))
-			args = append(args, *file.ParentID)
-			argIdx++
+		var (
+			currentParentID *string
+			isDir           bool
+			userID          string
+		)
+		err := r.db.QueryRowContext(ctx, "SELECT parent_id, is_directory, user_id FROM files WHERE id = $1", file.ID).Scan(
+			&currentParentID, &isDir, &userID)
+		if err != nil {
+			return fmt.Errorf("lookup file for update %s: %w", file.ID, err)
+		}
+
+		var reqParentID *string
+		if *file.ParentID != "" {
+			reqParentID = file.ParentID
+		}
+
+		parentChanged := false
+		if (currentParentID == nil && reqParentID != nil) || (currentParentID != nil && reqParentID == nil) {
+			parentChanged = true
+		} else if currentParentID != nil && reqParentID != nil && *currentParentID != *reqParentID {
+			parentChanged = true
+		}
+
+		if parentChanged {
+			if isDir {
+				if err := r.MoveSubtree(ctx, file.ID, reqParentID, userID); err != nil {
+					return err
+				}
+			} else {
+				// Single file move
+				var newPath string
+				if reqParentID == nil {
+					newPath = "/" + file.ID + "/"
+				} else {
+					var parentPath string
+					if err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1", *reqParentID).Scan(&parentPath); err != nil {
+						return fmt.Errorf("lookup parent path: %w", err)
+					}
+					newPath = parentPath + file.ID + "/"
+				}
+				_, err := r.db.ExecContext(ctx, "UPDATE files SET parent_id = $1, path = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3",
+					reqParentID, newPath, file.ID)
+				if err != nil {
+					return fmt.Errorf("update file parent/path %s: %w", file.ID, err)
+				}
+			}
 		}
 	}
 
-	// If nothing changed besides updated_at, still touch the row so updated_at
-	// advances and the client gets a consistent response. RETURNING gives us
-	// the authoritative post-update values.
-		q := fmt.Sprintf(`
-		UPDATE files
-		SET %s
-		WHERE id = $1
-		RETURNING id, user_id, name, parent_id, is_directory, size_bytes, created_at, updated_at
-	`, strings.Join(setParts, ", "))
-
-	if err := r.db.QueryRowContext(ctx, q, args...).Scan(
-		&file.ID, &file.UserID, &file.Name, &file.ParentID, &file.IsDirectory,
-		&file.SizeBytes, &file.CreatedAt, &file.UpdatedAt); err != nil {
-		return fmt.Errorf("update file %s: %w", file.ID, err)
+	// Update mutable fields (name, size, mime_type, status, encryption)
+	q := `
+		UPDATE files 
+		SET name = CASE WHEN $1 != '' THEN $1 ELSE name END,
+		    size_bytes = $2,
+		    mime_type = CASE WHEN $3 != '' THEN $3 ELSE mime_type END,
+		    status = CASE WHEN $4 != '' THEN $4 ELSE status END,
+		    is_encrypted = $5,
+		    encryption_salt = $6,
+		    updated_at = CURRENT_TIMESTAMP 
+		WHERE id = $7
+	`
+	if _, err := r.db.ExecContext(ctx, q, file.Name, file.SizeBytes, file.MimeType, file.Status, file.IsEncrypted, file.EncryptionSalt, file.ID); err != nil {
+		return fmt.Errorf("update file row %s: %w", file.ID, err)
 	}
+
+	// Read back the fresh state
+	fresh, err := r.GetByID(ctx, file.ID)
+	if err != nil {
+		return fmt.Errorf("refresh file after update %s: %w", file.ID, err)
+	}
+	*file = *fresh
 	return nil
 }
 
 // IsDescendant reports whether candidateID equals ancestorID or is reachable
-// by walking DOWN the parent_id tree starting from ancestorID. It uses a
-// recursive CTE so the full subtree is examined in a single query.
-//
-// Use this before reparenting a folder to reject moves that would create a
-// cycle: moving /Docs into /Docs/Sub would make /Docs its own grandparent.
+// by walking DOWN the folder tree starting from ancestorID.
+// It uses materialized path prefix matching.
 func (r *FileRepository) IsDescendant(ctx context.Context, candidateID, ancestorID string) (bool, error) {
 	if candidateID == ancestorID {
 		return true, nil
 	}
 	const q = `
-		WITH RECURSIVE subtree AS (
-			-- Anchor: the proposed new parent (the "ancestor" we descend from).
-			SELECT id FROM files WHERE id = $1
-			UNION ALL
-			-- Recurse: every direct child of a node already in the subtree.
-			SELECT f.id
-			FROM files f
-			JOIN subtree s ON f.parent_id = s.id
+		SELECT EXISTS (
+			SELECT 1 FROM files c, files a
+			WHERE c.id = $1 AND a.id = $2
+			  AND (c.id = a.id OR c.path LIKE a.path || '%')
 		)
-		SELECT EXISTS (SELECT 1 FROM subtree WHERE id = $2) AS is_desc
 	`
 	var isDesc bool
-	if err := r.db.QueryRowContext(ctx, q, ancestorID, candidateID).Scan(&isDesc); err != nil {
+	if err := r.db.QueryRowContext(ctx, q, candidateID, ancestorID).Scan(&isDesc); err != nil {
 		return false, fmt.Errorf("is-descendant check (%s in %s): %w", candidateID, ancestorID, err)
 	}
 	return isDesc, nil
 }
 
 // DeleteRecursive removes the file/folder identified by rootID and, when it is
-// a directory, every descendant. file_blocks and permissions rows are removed
-// automatically by the schema's ON DELETE CASCADE; we still gather the hashes
-// of blocks that became orphaned (no remaining file_blocks references) so the
-// caller can delete the physical storage objects as garbage collection.
-//
-// The collection + delete runs as a single statement sequence. When the
-// repository is bound to a caller-owned transaction (via WithTx) the whole
-// operation participates in that tx; otherwise it runs against the pool.
+// a directory, every descendant using materialized path prefix matching.
 func (r *FileRepository) DeleteRecursive(ctx context.Context, rootID string, userID string) (int64, []string, error) {
-	// 1. Gather the sha256 of every block referenced by any file in the
-	//    subtree being deleted. We collect the FULL set (even blocks still
-	//    referenced elsewhere) and then, after the delete, filter to those
-	//    that no longer have any file_blocks row — those are safe to GC.
+	var rootPath string
+	err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1 AND user_id = $2", rootID, userID).Scan(&rootPath)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil, nil
+		}
+		return 0, nil, fmt.Errorf("lookup root path %s: %w", rootID, err)
+	}
+
+	escapedPrefix := EscapeSQLLike(rootPath) + "%"
+
+	// 1. Gather hashes of blocks referenced by files in this subtree
 	const collectSubtreeHashes = `
-		WITH RECURSIVE subtree AS (
-			SELECT id FROM files WHERE id = $1
-			UNION ALL
-			SELECT f.id FROM files f JOIN subtree s ON f.parent_id = s.id
-		)
 		SELECT DISTINCT b.sha256
 		FROM file_blocks fb
 		JOIN blocks b ON b.id = fb.block_id
-		WHERE fb.file_id IN (SELECT id FROM subtree)
+		WHERE fb.file_id IN (
+			SELECT id FROM files
+			WHERE user_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\')
+		)
 	`
-	hashes := make([]string, 0)
-	// Edge case: a directory with no files (only empty subfolders) has no
-	// blocks at all; we must still perform the delete, so don't bail early.
-	rows, err := r.db.QueryContext(ctx, collectSubtreeHashes, rootID)
+	rows, err := r.db.QueryContext(ctx, collectSubtreeHashes, userID, rootPath, escapedPrefix)
 	if err != nil {
 		return 0, nil, fmt.Errorf("collect subtree hashes: %w", err)
 	}
+	var hashes []string
 	for rows.Next() {
 		var h string
 		if err := rows.Scan(&h); err != nil {
@@ -528,68 +645,67 @@ func (r *FileRepository) DeleteRecursive(ctx context.Context, rootID string, use
 		}
 		hashes = append(hashes, h)
 	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return 0, nil, fmt.Errorf("iterate subtree hashes: %w", err)
-	}
 	_ = rows.Close()
 
 	// 2. Orphan files owned by other users in the subtree before deleting
 	const orphanSubtree = `
-		WITH RECURSIVE subtree AS (
-			SELECT id FROM files WHERE id = $1
-			UNION ALL
-			SELECT f.id FROM files f JOIN subtree s ON f.parent_id = s.id
-		)
-		UPDATE files SET parent_id = NULL 
-		WHERE id IN (SELECT id FROM subtree) AND user_id != $2
+		UPDATE files
+		SET parent_id = NULL
+		WHERE parent_id IN (
+			SELECT id FROM files WHERE user_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\')
+		) AND user_id != $1
 	`
-	if _, err := r.db.ExecContext(ctx, orphanSubtree, rootID, userID); err != nil {
-		return 0, nil, fmt.Errorf("orphan subtree %s: %w", rootID, err)
+	if _, err := r.db.ExecContext(ctx, orphanSubtree, userID, rootPath, escapedPrefix); err != nil {
+		return 0, nil, fmt.Errorf("orphan foreign files under subtree %s: %w", rootID, err)
 	}
 
-	// 2b. Delete the subtree. The recursive CTE + single DELETE cascades
-	//     through file_blocks and permissions via the FK triggers.
+	// 3. Delete the subtree
 	const deleteSubtree = `
-		WITH RECURSIVE subtree AS (
-			SELECT id FROM files WHERE id = $1
-			UNION ALL
-			SELECT f.id FROM files f JOIN subtree s ON f.parent_id = s.id
-		)
-		DELETE FROM files WHERE id IN (SELECT id FROM subtree) AND user_id = $2
+		DELETE FROM files
+		WHERE user_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\')
 	`
-	res, err := r.db.ExecContext(ctx, deleteSubtree, rootID, userID)
+	res, err := r.db.ExecContext(ctx, deleteSubtree, userID, rootPath, escapedPrefix)
 	if err != nil {
 		return 0, nil, fmt.Errorf("delete subtree %s: %w", rootID, err)
 	}
 	deleted, _ := res.RowsAffected()
 
-	// 3. Of the blocks the subtree referenced, find which are now orphaned
-	//    (no file anywhere still needs them). Those are GC candidates. We do
-	//    this AFTER the delete so the result reflects post-delete state.
+	// 4. Find orphaned block hashes safe for GC
 	var orphans []string
 	if len(hashes) > 0 {
 		orphans, err = r.findOrphanedHashes(ctx, hashes)
 		if err != nil {
-			// Non-fatal: the metadata delete already succeeded. Surface the
-			// count but return the GC error so the caller can log it.
 			return deleted, nil, err
 		}
 	}
 	return deleted, orphans, nil
 }
 
-// GetUserStorageUsage calculates real total byte usage and category breakdown for a user.
+// GetUserStorageUsage calculates real total byte usage and category breakdown for a user,
+// aggregating both active files and historical file revisions.
 func (r *FileRepository) GetUserStorageUsage(ctx context.Context, userID string) (*domain.UserStorageUsage, error) {
 	const q = `
+		WITH active_files AS (
+			SELECT name, size_bytes FROM files WHERE user_id = $1 AND is_directory = FALSE
+		),
+		version_files AS (
+			SELECT f.name, fv.size_bytes
+			FROM file_versions fv
+			JOIN files f ON fv.file_id = f.id
+			WHERE f.user_id = $1
+		),
+		all_files AS (
+			SELECT name, size_bytes FROM active_files
+			UNION ALL
+			SELECT name, size_bytes FROM version_files
+		)
 		SELECT 
 			COALESCE(SUM(size_bytes), 0) AS total_used,
 			COALESCE(SUM(CASE WHEN LOWER(SUBSTRING(name FROM '\.([^\.]+)$')) IN ('png','jpg','jpeg','webp','gif','svg','bmp') THEN size_bytes ELSE 0 END), 0) AS images,
 			COALESCE(SUM(CASE WHEN LOWER(SUBSTRING(name FROM '\.([^\.]+)$')) IN ('pdf','doc','docx','txt','rtf','xls','xlsx','csv') THEN size_bytes ELSE 0 END), 0) AS documents,
 			COALESCE(SUM(CASE WHEN LOWER(SUBSTRING(name FROM '\.([^\.]+)$')) IN ('mp3','wav','flac','mp4','webm','mov','mkv','avi') THEN size_bytes ELSE 0 END), 0) AS media,
 			COALESCE(SUM(CASE WHEN LOWER(SUBSTRING(name FROM '\.([^\.]+)$')) IN ('js','ts','jsx','tsx','go','py','json','html','css','zip','tar','gz') THEN size_bytes ELSE 0 END), 0) AS code
-		FROM files
-		WHERE user_id = $1 AND is_directory = FALSE
+		FROM all_files
 	`
 	var usage domain.UserStorageUsage
 	var images, docs, media, code int64
@@ -620,7 +736,8 @@ func (r *FileRepository) GetUserStorageUsage(ctx context.Context, userID string)
 }
 
 // findOrphanedHashes returns the subset of hashes that have zero remaining
-// file_blocks references (i.e. the physical object is safe to delete).
+// file_blocks references AND zero historical file_versions references
+// (i.e. the physical object is safe to delete from CAS).
 func (r *FileRepository) findOrphanedHashes(ctx context.Context, hashes []string) ([]string, error) {
 	if len(hashes) == 0 {
 		return nil, nil
@@ -638,7 +755,7 @@ func (r *FileRepository) findOrphanedHashes(ctx context.Context, hashes []string
 		sb.WriteString(fmt.Sprintf("$%d", i+1))
 		args = append(args, h)
 	}
-	sb.WriteString(`) AND NOT EXISTS (SELECT 1 FROM file_blocks fb WHERE fb.block_id = b.id)`)
+	sb.WriteString(`) AND NOT EXISTS (SELECT 1 FROM file_blocks fb WHERE fb.block_id = b.id) AND NOT EXISTS (SELECT 1 FROM file_versions fv WHERE b.sha256 = ANY(fv.chunk_hashes))`)
 
 	rows, err := r.db.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
@@ -773,7 +890,7 @@ func (r *FileRepository) BulkMove(ctx context.Context, ids []string, parentID *s
 				if *parentID == file.ID {
 					return fmt.Errorf("cannot move a folder into itself")
 				}
-				isDesc, err := txRepo.IsDescendant(ctx, file.ID, *parentID)
+				isDesc, err := txRepo.IsDescendant(ctx, *parentID, file.ID)
 				if err != nil {
 					return fmt.Errorf("cycle check: %w", err)
 				}
@@ -979,13 +1096,13 @@ func (r *FileRepository) UpdateAIMetadata(ctx context.Context, id string, tags, 
 // SemanticSearch performs a cosine similarity search using pgvector on the user's files.
 func (r *FileRepository) SemanticSearch(ctx context.Context, userID string, queryEmbedding []float32, limit int) ([]*domain.File, error) {
 	embStr := floatsToPgVectorStr(queryEmbedding)
-	query := `
-		SELECT id, user_id, name, parent_id, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status
+	query := fmt.Sprintf(`
+		SELECT %s
 		FROM files
 		WHERE deleted_at IS NULL AND user_id = $1 AND embedding IS NOT NULL
 		ORDER BY embedding <=> $2
 		LIMIT $3
-	`
+	`, fileSelectColumns)
 
 	rows, err := r.db.QueryContext(ctx, query, userID, embStr, limit)
 	if err != nil {
@@ -996,10 +1113,7 @@ func (r *FileRepository) SemanticSearch(ctx context.Context, userID string, quer
 	var files []*domain.File
 	for rows.Next() {
 		f := &domain.File{}
-		if err := rows.Scan(
-			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.IsDirectory, &f.SizeBytes,
-			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.TargetID, &f.MimeType, &f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary,
-		); err != nil {
+		if err := scanFileRow(rows, f); err != nil {
 			return nil, fmt.Errorf("scan semantic search result: %w", err)
 		}
 		files = append(files, f)
@@ -1034,7 +1148,7 @@ func (r *FileRepository) RecordView(ctx context.Context, userID, fileID string) 
 // GetRecentViews returns the user's recently viewed files, ordered by most recent first.
 func (r *FileRepository) GetRecentViews(ctx context.Context, userID string, limit int) ([]*domain.File, error) {
 	const q = `
-		SELECT f.id, f.user_id, f.name, f.parent_id, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
+		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
 		FROM files f
 		JOIN user_file_views v ON f.id = v.file_id
 		WHERE v.user_id = $1 AND f.deleted_at IS NULL
@@ -1050,11 +1164,7 @@ func (r *FileRepository) GetRecentViews(ctx context.Context, userID string, limi
 	var files []*domain.File
 	for rows.Next() {
 		var f domain.File
-		if err := rows.Scan(
-			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.IsDirectory, &f.SizeBytes,
-			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.TargetID, &f.MimeType,
-			&f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary, &f.Status,
-		); err != nil {
+		if err := scanFileRow(rows, &f); err != nil {
 			return nil, fmt.Errorf("scan file: %w", err)
 		}
 		files = append(files, &f)
@@ -1153,7 +1263,7 @@ func (r *FileRepository) SemanticSearchChunks(ctx context.Context, userID string
 			GROUP BY file_id
 			ORDER BY min_distance ASC
 		)
-		SELECT f.id, f.user_id, f.name, f.parent_id, f.is_directory, f.size_bytes, 
+		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, 
 			f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, 
 			f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
 		FROM RankedFiles rf
@@ -1185,7 +1295,7 @@ func (r *FileRepository) SemanticSearchChunks(ctx context.Context, userID string
 			GROUP BY file_id
 			ORDER BY min_distance ASC
 		)
-		SELECT f.id, f.user_id, f.name, f.parent_id, f.is_directory, f.size_bytes, 
+		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, 
 			f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, 
 			f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
 		FROM RankedFiles rf
@@ -1202,12 +1312,144 @@ func (r *FileRepository) SemanticSearchChunks(ctx context.Context, userID string
 	var files []*domain.File
 	for rows.Next() {
 		f := &domain.File{}
-		if err := rows.Scan(
-			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.IsDirectory, &f.SizeBytes,
-			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.TargetID, &f.MimeType, 
-			&f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary, &f.Status,
-		); err != nil {
+		if err := scanFileRow(rows, f); err != nil {
 			return nil, fmt.Errorf("scan semantic search chunks result: %w", err)
+		}
+		files = append(files, f)
+	}
+	return files, rows.Err()
+}
+
+// HybridSearch performs a unified search matching filenames, tags, summaries, and vector chunk embeddings.
+// It searches both files owned by the user and files explicitly shared with the user.
+func (r *FileRepository) HybridSearch(ctx context.Context, userID, userEmail, query string, queryEmbedding []float32, limit int) ([]*domain.File, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+
+	searchPattern := "%" + strings.TrimSpace(query) + "%"
+
+	// If queryEmbedding is available, perform full hybrid search:
+	// keyword match + semantic chunk vector distance match
+	if len(queryEmbedding) > 0 {
+		embStr := floatsToPgVectorStr(queryEmbedding)
+		sqlQuery := `
+			WITH AccessibleFiles AS (
+				SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, 
+					f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, 
+					f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
+				FROM files f
+				WHERE f.deleted_at IS NULL AND (
+					f.user_id = $1 OR 
+					EXISTS (
+						SELECT 1 FROM permissions p 
+						WHERE p.file_id = f.id AND (p.grantee_email = $2 OR $2 = '')
+					)
+				)
+			),
+			KeywordMatches AS (
+				SELECT id, 
+					CASE 
+						WHEN LOWER(name) = LOWER($3) THEN 1.0
+						WHEN LOWER(name) LIKE LOWER($4) THEN 0.8
+						WHEN tags IS NOT NULL AND LOWER(tags) LIKE LOWER($4) THEN 0.6
+						WHEN summary IS NOT NULL AND LOWER(summary) LIKE LOWER($4) THEN 0.5
+						ELSE 0.3
+					END AS keyword_score
+				FROM AccessibleFiles
+				WHERE LOWER(name) LIKE LOWER($4)
+				   OR (tags IS NOT NULL AND LOWER(tags) LIKE LOWER($4))
+				   OR (summary IS NOT NULL AND LOWER(summary) LIKE LOWER($4))
+			),
+			SemanticMatches AS (
+				SELECT fc.file_id AS id, 
+					MIN(1.0 - (fc.embedding <=> $5)) AS semantic_score
+				FROM file_chunks fc
+				JOIN AccessibleFiles af ON fc.file_id = af.id
+				GROUP BY fc.file_id
+			),
+			CombinedScores AS (
+				SELECT af.id,
+					COALESCE(km.keyword_score, 0.0) AS kw_score,
+					COALESCE(sm.semantic_score, 0.0) AS sem_score,
+					(COALESCE(km.keyword_score, 0.0) * 1.5 + COALESCE(sm.semantic_score, 0.0)) AS total_rank
+				FROM AccessibleFiles af
+				LEFT JOIN KeywordMatches km ON af.id = km.id
+				LEFT JOIN SemanticMatches sm ON af.id = sm.id
+				WHERE km.id IS NOT NULL OR (sm.id IS NOT NULL AND sm.semantic_score > 0.4)
+			)
+			SELECT af.id, af.user_id, af.name, af.parent_id, af.path, af.is_directory, af.size_bytes, 
+				af.created_at, af.updated_at, af.deleted_at, af.target_id, af.mime_type, 
+				af.shortcut_target_id, af.is_encrypted, af.encryption_salt, af.tags, af.summary, af.status
+			FROM CombinedScores cs
+			JOIN AccessibleFiles af ON af.id = cs.id
+			ORDER BY cs.total_rank DESC, af.updated_at DESC
+			LIMIT $6;
+		`
+
+		rows, err := r.db.QueryContext(ctx, sqlQuery, userID, userEmail, query, searchPattern, embStr, limit)
+		if err == nil {
+			defer rows.Close()
+			var files []*domain.File
+			for rows.Next() {
+				f := &domain.File{}
+				if err := scanFileRow(rows, f); err != nil {
+					break
+				}
+				files = append(files, f)
+			}
+			if len(files) > 0 {
+				return files, nil
+			}
+		}
+	}
+
+	// Fallback or when no queryEmbedding provided: Keyword/tag/summary search
+	return r.keywordSearch(ctx, userID, userEmail, query, limit)
+}
+
+func (r *FileRepository) keywordSearch(ctx context.Context, userID, userEmail, query string, limit int) ([]*domain.File, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	searchPattern := "%" + strings.TrimSpace(query) + "%"
+	sqlQuery := `
+		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, 
+			f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, 
+			f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
+		FROM files f
+		WHERE f.deleted_at IS NULL AND (
+			f.user_id = $1 OR 
+			EXISTS (
+				SELECT 1 FROM permissions p 
+				WHERE p.file_id = f.id AND (p.grantee_email = $2 OR $2 = '')
+			)
+		) AND (
+			f.name ILIKE $3 OR 
+			(f.tags IS NOT NULL AND f.tags ILIKE $3) OR 
+			(f.summary IS NOT NULL AND f.summary ILIKE $3)
+		)
+		ORDER BY 
+			CASE 
+				WHEN LOWER(f.name) = LOWER($4) THEN 1
+				WHEN LOWER(f.name) LIKE LOWER($3) THEN 2
+				ELSE 3
+			END ASC,
+			f.updated_at DESC
+		LIMIT $5;
+	`
+
+	rows, err := r.db.QueryContext(ctx, sqlQuery, userID, userEmail, searchPattern, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("keyword search: %w", err)
+	}
+	defer rows.Close()
+
+	var files []*domain.File
+	for rows.Next() {
+		f := &domain.File{}
+		if err := scanFileRow(rows, f); err != nil {
+			return nil, fmt.Errorf("scan keyword search: %w", err)
 		}
 		files = append(files, f)
 	}

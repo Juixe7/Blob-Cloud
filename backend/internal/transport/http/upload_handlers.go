@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"go-drive-clone/internal/audit"
 	"go-drive-clone/internal/service"
 )
 
@@ -130,6 +131,17 @@ func (s *Server) HandleCompleteUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, code, map[string]string{"error": err.Error()})
 		return
 	}
+
+	// Fire audit event — non-blocking, never delays the response.
+	s.auditLog.Log(r.Context(), audit.Entry{
+		UserID:       userID,
+		Action:       audit.ActionFileUploaded,
+		ResourceType: audit.ResourceFile,
+		ResourceID:   resp.FileID,
+		Metadata:     audit.MarshalMeta(map[string]string{"session_id": req.SessionID}),
+		ClientIP:     r.RemoteAddr,
+	})
+
 	writeJSON(w, http.StatusOK, resp)
 }
 

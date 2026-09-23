@@ -129,6 +129,10 @@ export interface InitiateRespChunk {
   already_exists: boolean
   /** Presigned S3 URL. Omitted when already_exists is true (omitempty). */
   upload_url?: string
+  /** S3 Multipart Upload ID when block exceeds 5 GiB */
+  upload_id?: string
+  /** Presigned URLs for each part when block exceeds 5 GiB */
+  part_urls?: string[]
 }
 
 /** POST /api/upload/initiate response body (HTTP 201). */
@@ -192,6 +196,9 @@ export interface CollaboratorPermission {
   file_id: string
   grantee_email: string
   role: CollaboratorRole
+  status?: string
+  message?: string | null
+  expires_at?: string | null
   created_at: string
 }
 
@@ -199,6 +206,25 @@ export interface CollaboratorPermission {
 export interface ShareRequest {
   grantee_email: string
   role: Exclude<CollaboratorRole, 'OWNER'>
+  message?: string
+}
+
+/** Share invitation row returned by GET /api/shares/invitations. */
+export interface ShareInvitation {
+  id: string
+  file_id: string
+  role: 'VIEWER' | 'EDITOR' | 'OWNER'
+  status: 'PENDING' | 'ACCEPTED' | 'DECLINED' | 'EXPIRED'
+  message?: string | null
+  expires_at: string
+  created_at: string
+  file_name: string
+  is_directory: boolean
+  size_bytes: number
+  mime_type: string
+  summary?: string | null
+  tags?: string | null
+  sender_email: string
 }
 
 /** PATCH /api/files/{id} request body. Either or both fields may be sent. */

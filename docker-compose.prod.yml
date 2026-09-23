@@ -1,0 +1,95 @@
+# ==============================================================================
+# Production Docker Compose Configuration for Blob-Cloud
+# Usage: docker compose -f docker-compose.prod.yml up -d --build
+# ==============================================================================
+
+services:
+  # ----------------------------------------------------------------------------
+  # Redis 7: Pub/Sub WebSocket Backplane & Per-IP Rate Limiting
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: blobcloud-redis
+    restart: always
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ----------------------------------------------------------------------------
+  # API Gateway: Stateless Go HTTP Server & WebSocket Hub (cmd/api)
+  # ----------------------------------------------------------------------------
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: api
+    container_name: blobcloud-api
+    restart: always
+    expose:
+      - "8090"
+    ports:
+      - "127.0.0.1:8090:8090"
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ----------------------------------------------------------------------------
+  # Background Worker: SQS Consumer for ClamAV, Thumbnails & AI Embeddings (cmd/worker)
+  # ----------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: worker
+    container_name: blobcloud-worker
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ----------------------------------------------------------------------------
+  # Frontend: Production React SPA & Nginx Reverse Proxy
+  # ----------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: blobcloud-frontend
+    restart: always
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+
+  # ----------------------------------------------------------------------------
+  # Prometheus: Time-Series Metrics Scraper
+  # ----------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: blobcloud-prometheus
+    restart: always
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    depends_on:
+      - api
+
+volumes:
+  redis_data:
+  prometheus_data:

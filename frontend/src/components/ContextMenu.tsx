@@ -14,6 +14,7 @@ import type { FileItem } from '../types/file'
  * (Dashboard) to the corresponding modal / handler.
  */
 export interface ContextMenuActions {
+  onOpenFolder?: (item: FileItem) => void
   onPreview?: (item: FileItem) => void
   onShare: (item: FileItem) => void
   onRename: (item: FileItem) => void
@@ -150,6 +151,17 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
       )}
       style={{ left, top }}
     >
+      {isDirectory && actions.onOpenFolder && (
+        <MenuItem
+          icon={
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+            </svg>
+          }
+          label="Open"
+          onClick={run(actions.onOpenFolder)}
+        />
+      )}
       {!isDirectory && actions.onPreview && !isQuarantined && (
         <MenuItem
           icon={

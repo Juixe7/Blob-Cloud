@@ -58,6 +58,16 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
       style={style}
       onClick={(e) => {
         e.stopPropagation()
+        if (e.detail === 2) {
+          if (isBrokenShortcut) return
+          if (item.is_directory) {
+            onOpenFolder(item)
+            return
+          } else if (onOpenFile) {
+            onOpenFile(item)
+            return
+          }
+        }
         if (e.shiftKey && onSelectRange) {
           onSelectRange(item.id)
         } else if ((e.ctrlKey || e.metaKey) && onToggleSelect) {
@@ -74,14 +84,22 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
           onOpenFile(item)
         }
       }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          if (isBrokenShortcut) return
+          if (item.is_directory) onOpenFolder(item)
+          else if (onOpenFile) onOpenFile(item)
+        }
+      }}
       onContextMenu={(e) => {
         if (onToggleSelect && !isSelected) {
           onToggleSelect(item.id)
         }
         onContextMenu(item, e)
       }}
+      tabIndex={0}
       className={cn(
-        'flex items-center text-[11px] group cursor-default transition-colors duration-150 border-b border-arch-border/50',
+        'flex items-center text-[11px] group cursor-default transition-colors duration-150 border-b border-arch-border/50 focus:outline-none focus:bg-amber-500/5',
         isSelected ? 'bg-amber-500/10 border-l-2 border-l-amber-500 border-b-transparent' : 'hover:bg-arch-850/60',
         item.status === 'QUARANTINED' && 'bg-[repeating-linear-gradient(45deg,transparent,transparent_10px,rgba(220,38,38,0.1)_10px,rgba(220,38,38,0.1)_20px)]'
       )}
@@ -97,7 +115,18 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
       </div>
       
       <div className="flex-1 min-w-0 pr-4 py-1.5 flex items-center gap-3">
-        <div className="shrink-0 flex items-center relative">
+        <div
+          className={cn(
+            "shrink-0 flex items-center relative",
+            item.is_directory && !isTrash && "cursor-pointer"
+          )}
+          onClick={(e) => {
+            if (item.is_directory && !isTrash) {
+              e.stopPropagation()
+              onOpenFolder(item)
+            }
+          }}
+        >
           {showThumbnail ? (
             <img 
               src={thumbUrl} 
@@ -119,7 +148,19 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
           )}
         </div>
         <div className="flex flex-col min-w-0">
-          <span className={cn('truncate font-medium text-xs md:text-[11px]', isTrash ? 'text-zinc-500 line-through' : 'text-zinc-200')}>
+          <span
+            className={cn(
+              'truncate font-medium text-xs md:text-[11px]',
+              isTrash ? 'text-zinc-500 line-through' : 'text-zinc-200',
+              item.is_directory && !isTrash && 'hover:text-amber-400 hover:underline cursor-pointer'
+            )}
+            onClick={(e) => {
+              if (item.is_directory && !isTrash) {
+                e.stopPropagation()
+                onOpenFolder(item)
+              }
+            }}
+          >
             {item.name}
           </span>
           <span className="md:hidden truncate text-zinc-500 font-mono text-[9px] mt-0.5">

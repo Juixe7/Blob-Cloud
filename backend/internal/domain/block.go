@@ -43,4 +43,6 @@ type BlockRepository interface {
 	// file, ordered by sequence_number. Used by the thumbnail processor to
 	// assemble the image bytes from storage.
 	ListFileBlockHashes(ctx context.Context, fileID string) ([]string, error)
+	// ListFileBlocks returns the ordered blocks (with sha256 and size_bytes) linked to a file.
+	ListFileBlocks(ctx context.Context, fileID string) ([]*Block, error)
 }

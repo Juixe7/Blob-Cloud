@@ -22,7 +22,7 @@ export function Button({
   ...rest
 }: ButtonProps) {
   const base =
-    'relative inline-flex items-center justify-center gap-2 rounded-md px-4 py-2 text-xs font-semibold tracking-wide transition-all duration-150 ease-out focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-500 disabled:pointer-events-none disabled:opacity-40 active:scale-[0.98] select-none cursor-pointer'
+    'relative inline-flex items-center justify-center gap-2 rounded-md px-4 py-2 text-xs font-semibold tracking-wide whitespace-nowrap transition-all duration-150 ease-out focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-500 disabled:pointer-events-none disabled:opacity-40 active:scale-[0.98] select-none cursor-pointer'
 
   const variants: Record<string, string> = {
     primary:

@@ -1,0 +1,19 @@
+name = "blob-cloud-edge-validator"
+main = "edge_validator.js"
+compatibility_date = "2024-01-01"
+
+# Routes: intercept PUT /blocks/* on your R2 public domain.
+# Replace <your-account-id> and <your-r2-public-domain> before deploying.
+#
+# [[routes]]
+# pattern = "https://<your-r2-public-domain>/blocks/*"
+# zone_name = "<your-zone>"
+
+[vars]
+# Maximum block size the Worker will accept (default 5 GiB = S3 single-PUT limit).
+# Increase this if you allow >5 GiB single-PUT blocks in local dev (not recommended).
+MAX_BLOCK_BYTES = "5368709120"
+ALLOWED_ORIGIN = "*"
+
+# To set secrets (not committed to source):
+#   wrangler secret put MAX_BLOCK_BYTES

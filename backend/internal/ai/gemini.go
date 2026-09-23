@@ -87,7 +87,7 @@ func (c *GeminiClient) GenerateDocumentSummary(ctx context.Context, text string)
 		text = text[:1000000] // safety limit
 	}
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=%s", c.apiKey)
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=%s", c.apiKey)
 
 	prompt := fmt.Sprintf(`You are a metadata extraction utility. Analyze the following document text. Return exactly 5 highly specific keywords/tags (comma-separated) and a dense, 2-sentence conceptual summary of the entire document. Do not include any introductory or conversational text. Format your output strictly as:
 Tags: tag1, tag2, tag3
@@ -165,7 +165,7 @@ Document text:
 
 // GenerateImageTags uses gemini-1.5-flash for vision to describe the image, and extracts keywords.
 func (c *GeminiClient) GenerateImageTags(ctx context.Context, imageBytes []byte) ([]string, error) {
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=%s", c.apiKey)
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=%s", c.apiKey)
 
 	b64Img := base64.StdEncoding.EncodeToString(imageBytes)
 	prompt := "Provide exactly 5 highly descriptive keywords (comma-separated) describing this image. Format strictly as: Tags: tag1, tag2, tag3"

@@ -167,3 +167,61 @@ func TestPutObject_NoPathTraversal(t *testing.T) {
 		t.Fatalf("traversal escaped baseDir: stat(%q) err = %v", escapedPath, err)
 	}
 }
+
+func TestGenerateStagingUploadURL(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	url, err := store.GenerateStagingUploadURL(context.Background(), "staging/sess123/0", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("GenerateStagingUploadURL: %v", err)
+	}
+	want := "http://localhost:8080/local-storage/staging/sess123/0"
+	if url != want {
+		t.Fatalf("got %q, want %q", url, want)
+	}
+
+	if _, err := store.GenerateStagingUploadURL(context.Background(), "", time.Minute); err == nil {
+		t.Fatal("expected error for empty stagingKey, got nil")
+	}
+}
+
+func TestPromoteObject(t *testing.T) {
+	store, cleanup := newTestStore(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	srcKey := "staging/sess-xyz/0"
+	destKey := "blocks/promoted-hash"
+	data := []byte("promoted content verified")
+
+	// Put in staging
+	if err := store.PutObject(ctx, srcKey, bytes.NewReader(data), int64(len(data)), ""); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	// Promote from staging to CAS
+	if err := store.PromoteObject(ctx, srcKey, destKey); err != nil {
+		t.Fatalf("PromoteObject: %v", err)
+	}
+
+	// Verify destKey exists and matches data
+	rc, err := store.GetObject(ctx, destKey)
+	if err != nil {
+		t.Fatalf("GetObject destKey: %v", err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll destKey: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %q, want %q", got, data)
+	}
+
+	// Verify srcKey was removed
+	if _, err := store.GetObject(ctx, srcKey); err == nil {
+		t.Fatalf("expected srcKey %s to be deleted after promotion, but it still exists", srcKey)
+	}
+}

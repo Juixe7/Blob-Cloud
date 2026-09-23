@@ -1,6 +1,8 @@
-// Package main is the API server entry point. It wires dependencies (config ->
-// logger -> storage -> hub -> router -> HTTP server) and orchestrates a graceful
-// shutdown on SIGINT/SIGTERM.
+// Package main is the entrypoint for the Blob-Cloud API server.
+//
+// It parses configuration from environment variables, initialises dependencies
+// (Postgres connection pool, local/S3 storage provider, SQS worker pool, WebSocket
+// hub), builds the chi HTTP router, and runs the server with graceful shutdown.
 package main
 
 import (
@@ -17,17 +19,19 @@ import (
 
 	"github.com/joho/godotenv"
 	"go-drive-clone/internal/ai"
+	"go-drive-clone/internal/antivirus"
 	"go-drive-clone/internal/config"
 	"go-drive-clone/internal/database"
 	"go-drive-clone/internal/domain"
 	"go-drive-clone/internal/email"
-	postgresrepo "go-drive-clone/internal/repository/postgres"
+	"go-drive-clone/internal/metrics"
 	"go-drive-clone/internal/queue"
-	"go-drive-clone/internal/antivirus"
-	wsSync "go-drive-clone/internal/sync"
+	"go-drive-clone/internal/ratelimit"
+	postgresrepo "go-drive-clone/internal/repository/postgres"
 	"go-drive-clone/internal/service"
-	httpx "go-drive-clone/internal/transport/http"
 	"go-drive-clone/internal/storage"
+	wsSync "go-drive-clone/internal/sync"
+	httpx "go-drive-clone/internal/transport/http"
 )
 
 // shutdownTimeout is the maximum time allowed for in-flight requests to drain
@@ -51,6 +55,10 @@ func main() {
 	}
 
 	log := newLogger(cfg.ENV)
+
+	// Register all Prometheus metrics with the private registry before the
+	// HTTP server starts accepting requests.
+	metrics.Init()
 
 	log.Info("starting go-drive-clone",
 		"env", cfg.ENV,
@@ -98,18 +106,49 @@ func main() {
 
 	// Phase 6: WebSocket Hub — started unconditionally so WS connections
 	// can be accepted even if the DB is unavailable (auth only requires JWT).
-	var hub *wsSync.Hub
-	if cfg.JWTSecret != "" {
-		hub = wsSync.NewHub(log)
-		go hub.Run()
-		srv = srv.WithRealtime(hub, cfg.JWTSecret, cfg.WSCORSOrigins)
-		log.Info("websocket hub started")
-	}
-
-	// workerWg tracks SQS worker goroutines for graceful shutdown.
+	//
+	// workerWg / workerCtx are declared here so the backplane goroutine can be
+	// tracked alongside SQS workers for graceful shutdown.
 	var workerWg sync.WaitGroup
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
+
+	var hub *wsSync.Hub
+	var notifier wsSync.Notifier = wsSync.NoopNotifier()
+	if cfg.JWTSecret != "" {
+		hub = wsSync.NewHub(log)
+		go hub.Run()
+		notifier = hub // single-node default: hub IS the notifier
+
+		// Tier 2D: Redis backplane for horizontal scale.
+		// When REDIS_URL is set, the backplane replaces the direct hub as the
+		// Notifier — it still delivers locally via hub AND publishes to Redis so
+		// peer nodes can deliver to their local connections.
+		if cfg.RedisURL != "" {
+			redisClient, err := wsSync.NewRedisClient(cfg.RedisURL)
+			if err != nil {
+				log.Error("redis client init failed, falling back to single-node hub",
+					"redis_url", cfg.RedisURL, "err", err)
+			} else if pingErr := wsSync.Ping(context.Background(), redisClient); pingErr != nil {
+				log.Error("redis ping failed, falling back to single-node hub",
+					"redis_url", cfg.RedisURL, "err", pingErr)
+			} else {
+				bp := wsSync.NewRedisBackplane(redisClient, hub, log)
+				workerWg.Add(1)
+				go func() {
+					defer workerWg.Done()
+					if err := bp.Run(workerCtx); err != nil {
+						log.Error("backplane subscriber exited", "err", err)
+					}
+				}()
+				notifier = bp
+				log.Info("redis backplane started", "channel", "blobcloud:ws:events")
+			}
+		}
+
+		srv = srv.WithRealtime(hub, cfg.JWTSecret, cfg.WSCORSOrigins)
+		log.Info("websocket hub started")
+	}
 
 	db, dbErr := database.New(ctx, cfg, log)
 	if dbErr != nil {
@@ -139,65 +178,111 @@ func main() {
 			perms := postgresrepo.NewPermissionRepository(db)
 			userSessions := postgresrepo.NewSessionRepository(db)
 			shares := postgresrepo.NewShareableLinkRepository(db)
+			auditRepo := postgresrepo.NewAuditRepository(db, log)
+			srv = srv.WithAudit(auditRepo)
+			journal := postgresrepo.NewJournalRepository(db)
+			srv = srv.WithJournal(journal)
 
-			// Build the notifier that integration points will use.
-			// Falls back to a no-op if the Hub isn't configured.
-			var notifier wsSync.Notifier = wsSync.NoopNotifier()
-			if hub != nil {
-				notifier = hub
+			// AI Client initialization (available for search, summarisation, and queue processing)
+			var aiClient ai.AIClient
+			if token := os.Getenv("GEMINI_API_KEY"); token != "" {
+				aiClient = ai.NewGeminiClient(token)
+				log.Info("Gemini AI client initialised")
+			}
+			srv = srv.WithAI(aiClient)
+
+			clamAddress := os.Getenv("CLAMAV_ADDRESS")
+			var clamClient *antivirus.ClamAVClient
+			if clamAddress != "" {
+				clamClient = antivirus.NewClamAVClient(clamAddress)
+				log.Info("ClamAV antivirus client initialised", "address", clamAddress)
 			}
 
-			// SQS publisher: publishes thumbnail jobs after upload completes.
-			var publisher queue.Publisher = queue.NoopPublisher{}
+			// Processor for thumbnail generation, virus scanning, and AI metadata extraction
+			processor := queue.NewFileProcessor(files, blocks, storageProvider, notifier, aiClient, clamClient, log)
+
+			// Queue & Worker Pool wiring:
+			// If SQS_QUEUE_URL is provided, use AWS SQS Publisher and WorkerPool.
+			// Otherwise, fall back to in-process ChannelQueue for local / single-node deployments.
+			var publisher queue.Publisher
 			if cfg.SQSQueueURL != "" {
 				sqsClient := queue.NewSQSClient(cfg)
 				publisher = queue.NewSQSPublisher(sqsClient, cfg.SQSQueueURL, log)
-				log.Info("SQS publisher configured", "queue_url", cfg.SQSQueueURL)
+				log.Info("SQS publisher configured for decoupled worker service", "queue_url", cfg.SQSQueueURL)
+
+				// Start in-process SQS worker pool so jobs are processed immediately without requiring a standalone daemon
+				if os.Getenv("ENABLE_INPROCESS_WORKER") != "false" {
+					numWorkers := cfg.SQSNumWorkers
+					if numWorkers <= 0 {
+						numWorkers = 2
+					}
+					pollTimeout := cfg.SQSPollTimeoutSec
+					if pollTimeout <= 0 {
+						pollTimeout = 10
+					}
+					wp := queue.NewWorkerPool(sqsClient, cfg.SQSQueueURL, processor, numWorkers, int32(pollTimeout), log)
+					wp.Start(workerCtx, &workerWg)
+					log.Info("in-process SQS worker pool started", "workers", numWorkers, "queue_url", cfg.SQSQueueURL)
+				}
+			} else {
+				channelQueue := queue.NewChannelQueue(processor, 100, 2, log)
+				channelQueue.Start(workerCtx, &workerWg)
+				publisher = channelQueue
+				log.Info("in-process channel worker pool started (SQS not configured)", "workers", 2)
 			}
 
-			uploadSvc := service.NewUploadService(db, users, files, blocks, sessions, perms, storageProvider, publisher, notifier, log)
-				srv = srv.WithUploads(uploadSvc, perms)
-				srv = srv.WithUsers(users)
-				srv = srv.WithSessions(userSessions)
+			uploadSvc := service.NewUploadService(db, users, files, blocks, sessions, perms, storageProvider, publisher, notifier, log).WithJournal(journal)
+			srv = srv.WithUploads(uploadSvc, perms)
+			srv = srv.WithUsers(users)
+			srv = srv.WithSessions(userSessions)
 
-				// Phase 7.4: file operations (rename, move, delete, download).
-				fileSvc := service.NewFileService(db, users, files, blocks, perms, storageProvider, log)
-				srv = srv.WithFileOperations(fileSvc, files, blocks)
+			// Phase 7.4: file operations (rename, move, delete, download).
+			fileSvc := service.NewFileService(db, users, files, blocks, perms, storageProvider, log).WithJournal(journal).WithNotifier(notifier)
+			srv = srv.WithFileOperations(fileSvc, files, blocks)
 
-				zipSvc := service.NewZipService(files, blocks, storageProvider)
-				srv = srv.WithZipOperations(zipSvc)
-				srv = srv.WithShareableLinks(shares)
+			zipSvc := service.NewZipService(files, blocks, storageProvider)
+			srv = srv.WithZipOperations(zipSvc)
+			srv = srv.WithShareableLinks(shares)
 
-			// Worker pool: background thumbnail and AI processing.
-			if cfg.SQSQueueURL != "" {
-				var aiClient ai.AIClient
-				if token := os.Getenv("GEMINI_API_KEY"); token != "" {
-					aiClient = ai.NewGeminiClient(token)
+			// Background periodic cleaner for stale/expired share invitations (Option A)
+			go func() {
+				ticker := time.NewTicker(1 * time.Hour)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-workerCtx.Done():
+						return
+					case <-ticker.C:
+						if purged, err := perms.PurgeStaleInvitations(workerCtx); err != nil {
+							log.Error("failed to purge stale share invitations", "err", err)
+						} else if purged > 0 {
+							log.Info("purged stale share invitations", "count", purged)
+						}
+					}
 				}
-				srv = srv.WithAI(aiClient)
-				clamAddress := os.Getenv("CLAMAV_ADDRESS")
-				var clamClient *antivirus.ClamAVClient
-				if clamAddress != "" {
-					clamClient = antivirus.NewClamAVClient(clamAddress)
-				}
-				processor := queue.NewFileProcessor(files, blocks, storageProvider, notifier, aiClient, clamClient, log)
-				wp := queue.NewWorkerPool(
-					queue.NewSQSClient(cfg),
-					cfg.SQSQueueURL,
-					processor,
-					cfg.SQSNumWorkers,
-					int32(cfg.SQSPollTimeoutSec),
-					log,
-				)
-				wp.Start(workerCtx, &workerWg)
-				log.Info("SQS worker pool started", "workers", cfg.SQSNumWorkers)
-			}
+			}()
 
 			log.Info("repositories and upload service initialised")
 		}
 	}
 
-	router := httpx.NewRouter(srv)
+	// Build rate limiters from config. In-memory by default; for multi-node
+	// deployments swap to ratelimit.NewRedisLimiter using the same Redis client
+	// wired for the backplane.
+	rl := httpx.RateLimiters{}
+	if cfg.RateLimitAuthPerMin > 0 {
+		rl.Auth = ratelimit.NewInMemoryLimiter(cfg.RateLimitAuthPerMin, time.Minute)
+		rl.AuthCfg = ratelimit.NewZoneConfig(cfg.RateLimitAuthPerMin, time.Minute)
+	}
+	if cfg.RateLimitUploadPerMin > 0 {
+		rl.Upload = ratelimit.NewInMemoryLimiter(cfg.RateLimitUploadPerMin, time.Minute)
+		rl.UploadCfg = ratelimit.NewZoneConfig(cfg.RateLimitUploadPerMin, time.Minute)
+	}
+	if cfg.RateLimitAPIPerMin > 0 {
+		rl.API = ratelimit.NewInMemoryLimiter(cfg.RateLimitAPIPerMin, time.Minute)
+		rl.APICfg = ratelimit.NewZoneConfig(cfg.RateLimitAPIPerMin, time.Minute)
+	}
+	router := httpx.NewRouter(srv, rl)
 
 	httpServer := &http.Server{
 		Addr:              ":" + strconv.Itoa(cfg.Port),
@@ -239,27 +324,26 @@ func main() {
 
 	// 2. Close WebSocket hub: send CloseGoingAway to all connected clients.
 	if hub != nil {
-		log.Info("shutting down websocket hub...")
 		hub.Shutdown()
-		log.Info("websocket hub stopped")
 	}
 
-	// 3. Drain the HTTP server.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
+	// 3. Drain in-flight HTTP requests.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Error("graceful shutdown failed, forcing exit", "err", err)
-		os.Exit(1)
+		log.Error("graceful shutdown failed, forcing close", "err", err)
+		_ = httpServer.Close()
 	}
-	log.Info("server stopped cleanly")
+	log.Info("server stopped gracefully")
 }
 
-// newLogger returns an slog.Logger configured for the environment: JSON for
-// production (machine-parseable) and human-readable text for development.
+// newLogger builds a structured JSON logger for production or a human-friendly
+// text logger for development.
 func newLogger(env string) *slog.Logger {
 	var handler slog.Handler
 	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+
 	if env == "production" {
 		handler = slog.NewJSONHandler(os.Stdout, opts)
 	} else {

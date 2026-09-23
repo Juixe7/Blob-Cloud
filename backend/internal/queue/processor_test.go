@@ -23,11 +23,24 @@ import (
 // fakeFileRepo satisfies fileGetter. It returns a configured file for a known
 // id, or an error otherwise.
 type fakeFileRepo struct {
-	files map[string]*domain.File
-	err   error // when set, GetByID always fails
+	files         map[string]*domain.File
+	err           error // when set, GetByID always fails
+	updatedStatus map[string]string
 }
 
 func (f *fakeFileRepo) UpdateAIMetadata(ctx context.Context, id string, tags, summary *string, embedding []float32) error {
+	return nil
+}
+
+func (f *fakeFileRepo) UpdateStatus(ctx context.Context, id string, status string) error {
+	if f.updatedStatus == nil {
+		f.updatedStatus = make(map[string]string)
+	}
+	f.updatedStatus[id] = status
+	return nil
+}
+
+func (f *fakeFileRepo) InsertFileChunks(ctx context.Context, chunks []*domain.FileChunk) error {
 	return nil
 }
 
@@ -125,6 +138,18 @@ func (m *memStorage) HeadObject(_ context.Context, key string) (*domain.ObjectMe
 }
 func (m *memStorage) DeleteObject(_ context.Context, key string) error {
 	delete(m.objects, key)
+	return nil
+}
+func (m *memStorage) GenerateStagingUploadURL(context.Context, string, time.Duration) (string, error) {
+	return "", nil
+}
+func (m *memStorage) PromoteObject(_ context.Context, srcKey, destKey string) error {
+	b, ok := m.objects[srcKey]
+	if !ok {
+		return errors.New("src not found: " + srcKey)
+	}
+	m.objects[destKey] = b
+	delete(m.objects, srcKey)
 	return nil
 }
 
@@ -334,5 +359,61 @@ func TestProcessMessage_BlockFetchError(t *testing.T) {
 	err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "f1"})
 	if err == nil {
 		t.Fatal("expected error when block fetch fails, got nil")
+	}
+}
+
+func TestProcessMessage_LargeFileSkipsAssembly(t *testing.T) {
+	fakeFiles := &fakeFileRepo{
+		files: map[string]*domain.File{
+			"large-1": {
+				ID:        "large-1",
+				Name:      "massive_video.mp4",
+				SizeBytes: MaxAssemblySize + 1024,
+			},
+		},
+	}
+	// Blocks repo fails if called to prove assembly was completely skipped
+	failingBlocks := &fakeBlockRepo{err: errors.New("should not be called for large file")}
+	proc := &FileProcessor{
+		files:   fakeFiles,
+		blocks:  failingBlocks,
+		storage: newMemStorage(),
+		log:     testLogger(),
+	}
+
+	err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "large-1"})
+	if err != nil {
+		t.Fatalf("expected nil error for large file bypass, got: %v", err)
+	}
+	if fakeFiles.updatedStatus["large-1"] != "ACTIVE" {
+		t.Fatalf("expected status to be set to ACTIVE, got: %s", fakeFiles.updatedStatus["large-1"])
+	}
+}
+
+func TestProcessMessage_NonImageNonDocSkipsAssembly(t *testing.T) {
+	fakeFiles := &fakeFileRepo{
+		files: map[string]*domain.File{
+			"zip-1": {
+				ID:        "zip-1",
+				Name:      "backup.zip",
+				SizeBytes: 1024 * 1024,
+			},
+		},
+	}
+	// Blocks repo fails if called to prove assembly was skipped when no processor applies
+	failingBlocks := &fakeBlockRepo{err: errors.New("should not be called for non-processable file")}
+	proc := &FileProcessor{
+		files:   fakeFiles,
+		blocks:  failingBlocks,
+		storage: newMemStorage(),
+		log:     testLogger(),
+	}
+
+	err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "zip-1"})
+	if err != nil {
+		t.Fatalf("expected nil error for non-processable file bypass, got: %v", err)
+	}
+	if fakeFiles.updatedStatus["zip-1"] != "ACTIVE" {
+		t.Fatalf("expected status to be set to ACTIVE, got: %s", fakeFiles.updatedStatus["zip-1"])
 	}
 }

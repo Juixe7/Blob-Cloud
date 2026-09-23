@@ -1,0 +1,140 @@
+services:
+  # ----------------------------------------------------------------------------
+  # PostgreSQL with pgvector extension
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: blobcloud-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: blobcloud
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d blobcloud"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------------------
+  # Redis: Pub/Sub WebSocket Backplane & Per-IP Rate Limiting
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: blobcloud-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ----------------------------------------------------------------------------
+  # API Gateway: Stateless HTTP REST, WebSockets & Auth (cmd/api)
+  # ----------------------------------------------------------------------------
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: api
+    container_name: blobcloud-api
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENV: production
+      PORT: 8090
+      DB_URL: postgres://postgres:password@postgres:5432/blobcloud?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      STORAGE_PROVIDER: s3
+      AWS_REGION: us-east-1
+      S3_BUCKET: blobcloud-storage
+      # When SQS_QUEUE_URL is provided, API pushes thumbnail jobs to SQS
+      # SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/123456789012/blobcloud-jobs
+      JWT_SECRET: super-secret-production-key-blobcloud-jwt-token
+      RATE_LIMIT_AUTH_PER_MIN: 10
+      RATE_LIMIT_UPLOAD_PER_MIN: 30
+      RATE_LIMIT_API_PER_MIN: 120
+
+  # ----------------------------------------------------------------------------
+  # Standalone Background Worker Daemon: SQS / Job Consumer (cmd/worker)
+  # ----------------------------------------------------------------------------
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: worker
+    container_name: blobcloud-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENV: production
+      DB_URL: postgres://postgres:password@postgres:5432/blobcloud?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      STORAGE_PROVIDER: s3
+      AWS_REGION: us-east-1
+      S3_BUCKET: blobcloud-storage
+      SQS_NUM_WORKERS: 3
+      # SQS_QUEUE_URL: https://sqs.us-east-1.amazonaws.com/123456789012/blobcloud-jobs
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
+  # ----------------------------------------------------------------------------
+  # Prometheus: Time-Series Observability & Metrics Scraper
+  # ----------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: blobcloud-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+
+  # ----------------------------------------------------------------------------
+  # Grafana: Observability Dashboards & Real-Time Visualization
+  # ----------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.3.3
+    container_name: blobcloud-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:
+

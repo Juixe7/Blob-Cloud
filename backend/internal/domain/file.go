@@ -17,6 +17,7 @@ type File struct {
 	UserID           string     `json:"user_id"`
 	Name             string     `json:"name"`
 	ParentID         *string    `json:"parent_id,omitempty"`
+	Path             string     `json:"path"`
 	IsDirectory      bool       `json:"is_directory"`
 	SizeBytes        int64      `json:"size_bytes"`
 	CreatedAt        time.Time  `json:"created_at"`
@@ -133,6 +134,9 @@ type FileRepository interface {
 	// pointer (nil parentID means "move to root"; empty name means "leave
 	// unchanged"). The updated row is read back onto file.
 	Update(ctx context.Context, file *File) error
+	// MoveSubtree atomically moves a folder and all its nested descendants to a new parent,
+	// updating all materialized paths in O(1) via prefix substitution.
+	MoveSubtree(ctx context.Context, folderID string, newParentID *string, userID string) error
 	// IsDescendant reports whether candidateID is the same as ancestorID or
 	// nested anywhere beneath it in the folder tree. Used to reject moves that
 	// would create a parent-cycle (moving a folder into itself or one of its
@@ -170,6 +174,8 @@ type FileRepository interface {
 	InsertFileChunks(ctx context.Context, chunks []*FileChunk) error
 	// SemanticSearchChunks searches across all chunks and returns the matching files.
 	SemanticSearchChunks(ctx context.Context, userID string, queryEmbedding []float32, limit int) ([]*File, error)
+	// HybridSearch combines keyword/tag/summary text matching and vector semantic search across owned and shared files.
+	HybridSearch(ctx context.Context, userID, userEmail, query string, queryEmbedding []float32, limit int) ([]*File, error)
 }
 
 // ZippableItem represents a nested file returned by the recursive CTE for archiving.

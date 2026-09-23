@@ -30,6 +30,7 @@ go.work.sum
 # Scratch / test files at repo root
 TEST.png
 *.local
+*.mp4
 
 # Frontend — Node / Vite
 node_modules/
@@ -40,6 +41,7 @@ dist-ssr/
 .env
 .env.*
 !.env.example
+!.env.production.example
 
 # Frontend — scaffolded boilerplate we don't track
 frontend/.oxlintrc.json
@@ -50,3 +52,12 @@ frontend/README.md
 npm-debug.log*
 backend/check_s3.go
 backend/test_*.go
+
+# Backup & scratch directories
+.git_backup2/
+.git_corrupted/
+scratch/
+frontend_change.md
+# Binary & Lambda build artifacts
+bootstrap
+*.zip

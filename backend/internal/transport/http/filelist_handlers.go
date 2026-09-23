@@ -2,6 +2,7 @@ package httpx
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"go-drive-clone/internal/domain"
@@ -72,6 +73,13 @@ func (s *Server) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []*domain.File{}
 	}
+
+	if s.journal != nil {
+		if cur, curErr := s.journal.GetLatestCursor(r.Context(), userID); curErr == nil {
+			w.Header().Set("X-Delta-Cursor", strconv.FormatInt(cur, 10))
+		}
+	}
+
 	writeJSON(w, http.StatusOK, items)
 }
 

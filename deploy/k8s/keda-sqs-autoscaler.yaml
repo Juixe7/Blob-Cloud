@@ -1,0 +1,36 @@
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: blobcloud-worker-sqs-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: blobcloud-worker
+  minReplicaCount: 0  # Scales to zero when no upload processing jobs exist!
+  maxReplicaCount: 15 # Scales up to 15 worker pods under heavy upload bursts
+  pollingInterval: 15 # Polls SQS every 15 seconds
+  cooldownPeriod: 60  # Waits 60s of empty queue before scaling down
+  triggers:
+    - type: aws-sqs-queue
+      metadata:
+        queueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/blobcloud-jobs"
+        queueLength: "5" # Add 1 worker pod for every 5 messages queued
+        awsRegion: "us-east-1"
+      authenticationRef:
+        name: keda-aws-credentials
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-aws-credentials
+  namespace: default
+spec:
+  secretTargetRef:
+    - parameter: awsAccessKeyID
+      name: blobcloud-secrets
+      key: AWS_ACCESS_KEY_ID
+    - parameter: awsSecretAccessKey
+      name: blobcloud-secrets
+      key: AWS_SECRET_ACCESS_KEY

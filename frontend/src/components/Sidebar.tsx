@@ -26,6 +26,12 @@ interface SidebarProps {
   storageLimit?: number
   /** Real-time WebSocket connection status (Phase 7.5). */
   syncStatus?: WebSocketStatus
+  /** Whether the circuit breaker has tripped after consecutive connection failures. */
+  isCircuitBroken?: boolean
+  /** Trigger manual reconnection to reset the circuit breaker. */
+  onRetrySync?: () => void
+  /** Pending share invitations count to display badge. */
+  pendingInvitationsCount?: number
 }
 
 /** Navigation item definition. */
@@ -57,6 +63,9 @@ export function Sidebar({
   activeNav = 'drive',
   disableNew = false,
   syncStatus = 'DISCONNECTED',
+  isCircuitBroken = false,
+  onRetrySync,
+  pendingInvitationsCount = 0,
 }: SidebarProps) {
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
@@ -321,7 +330,7 @@ export function Sidebar({
                 onCloseMobile?.()
               }}
               className={cn(
-                'flex items-center gap-3 rounded px-2.5 py-2 text-xs font-medium transition-all duration-150',
+                'relative flex items-center gap-3 rounded px-2.5 py-2 text-xs font-medium transition-all duration-150',
                 item.active && !item.disabled && 'bg-arch-850 text-white font-semibold border-l-2 border-amber-500 pl-2 shadow-sm',
                 !item.active && !item.disabled && 'text-zinc-400 hover:bg-arch-850/60 hover:text-zinc-200',
                 item.disabled && 'cursor-not-allowed text-zinc-600',
@@ -332,6 +341,15 @@ export function Sidebar({
             >
               <span className={cn(item.active ? 'text-amber-400' : 'text-zinc-400')}>{item.icon}</span>
               {!collapsed && <span>{item.label}</span>}
+              {item.id === 'shared' && pendingInvitationsCount > 0 && (
+                collapsed ? (
+                  <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-indigo-500 ring-2 ring-arch-950 animate-pulse" />
+                ) : (
+                  <span className="ml-auto inline-flex items-center justify-center rounded-full bg-indigo-600 px-1.5 py-0.5 text-[10px] font-semibold text-white animate-pulse">
+                    {pendingInvitationsCount}
+                  </span>
+                )
+              )}
             </button>
           ))}
         </nav>
@@ -396,7 +414,12 @@ export function Sidebar({
       )}
 
       {/* Connection status indicator */}
-      <ConnectionStatus status={syncStatus} collapsed={collapsed} />
+      <ConnectionStatus
+        status={syncStatus}
+        collapsed={collapsed}
+        isCircuitBroken={isCircuitBroken}
+        onRetry={onRetrySync}
+      />
 
       {/* Sign-out */}
       <div className="border-t border-arch-border px-2 py-2.5">
@@ -447,16 +470,20 @@ function statusMeta(status: WebSocketStatus): { dot: string; label: string; puls
 function ConnectionStatus({
   status,
   collapsed,
+  isCircuitBroken,
+  onRetry,
 }: {
   status: WebSocketStatus
   collapsed: boolean
+  isCircuitBroken?: boolean
+  onRetry?: () => void
 }) {
   const meta = statusMeta(status)
   return (
-    <div className="px-4 py-2" title={meta.label}>
+    <div className="px-4 py-2" title={isCircuitBroken ? 'Circuit breaker tripped — connection offline' : meta.label}>
       <div className={cn('flex items-center gap-2', collapsed && 'justify-center')}>
         <span className="relative flex h-1.5 w-1.5 flex-shrink-0">
-          {meta.pulse && (
+          {meta.pulse && !isCircuitBroken && (
             <span
               className={cn(
                 'absolute inline-flex h-full w-full animate-ping rounded-full opacity-75',
@@ -464,10 +491,23 @@ function ConnectionStatus({
               )}
             />
           )}
-          <span className={cn('relative inline-flex h-1.5 w-1.5 rounded-full', meta.dot)} />
+          <span className={cn('relative inline-flex h-1.5 w-1.5 rounded-full', isCircuitBroken ? 'bg-rose-500' : meta.dot)} />
         </span>
         {!collapsed && (
-          <span className="font-mono text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">{meta.label}</span>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-[10px] font-semibold text-zinc-400 uppercase tracking-wider">
+              {isCircuitBroken ? 'OFFLINE' : meta.label}
+            </span>
+            {isCircuitBroken && onRetry && (
+              <button
+                type="button"
+                onClick={onRetry}
+                className="font-mono text-[9px] text-amber-400 hover:text-amber-300 underline uppercase"
+              >
+                Retry
+              </button>
+            )}
+          </div>
         )}
       </div>
     </div>

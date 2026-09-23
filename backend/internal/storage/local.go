@@ -26,6 +26,9 @@ import (
 // matches the route mounted by the HTTP layer (PUT /local-storage/blocks/{hash}).
 const BlockPrefix = "blocks"
 
+// StagingPrefix is the sub-path/key under which unverified uploads are quarantined.
+const StagingPrefix = "staging"
+
 // LocalStore is a filesystem-backed implementation of domain.StorageProvider.
 type LocalStore struct {
 	baseDir string // root directory backing the store (e.g. ./tmp/storage)
@@ -37,11 +40,14 @@ type LocalStore struct {
 var _ domain.StorageProvider = (*LocalStore)(nil)
 
 // NewLocalStore creates a LocalStore rooted at baseDir. It ensures the blocks
-// directory exists (creating it if necessary). baseURL should have no trailing
-// slash and is used to construct the URLs returned by GenerateUploadURL.
+// and staging directories exist (creating them if necessary). baseURL should
+// have no trailing slash and is used to construct the URLs returned by GenerateUploadURL.
 func NewLocalStore(baseDir, baseURL string, log *slog.Logger) (*LocalStore, error) {
 	if err := os.MkdirAll(filepath.Join(baseDir, BlockPrefix), 0o755); err != nil {
 		return nil, fmt.Errorf("create local storage dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(baseDir, StagingPrefix), 0o755); err != nil {
+		return nil, fmt.Errorf("create local staging dir: %w", err)
 	}
 	return &LocalStore{
 		baseDir: baseDir,
@@ -62,6 +68,19 @@ func (s *LocalStore) GenerateUploadURL(_ context.Context, blockHash string, _ ti
 	u, err := url.JoinPath(s.baseURL, "local-storage", BlockPrefix, blockHash)
 	if err != nil {
 		return "", fmt.Errorf("build upload URL: %w", err)
+	}
+	return u, nil
+}
+
+// GenerateStagingUploadURL returns a URL that a client can PUT a temporary chunk to.
+func (s *LocalStore) GenerateStagingUploadURL(_ context.Context, stagingKey string, _ time.Duration) (string, error) {
+	if stagingKey == "" {
+		return "", fmt.Errorf("stagingKey must not be empty")
+	}
+	// Build: <baseURL>/local-storage/<stagingKey>
+	u, err := url.JoinPath(s.baseURL, "local-storage", stagingKey)
+	if err != nil {
+		return "", fmt.Errorf("build staging upload URL: %w", err)
 	}
 	return u, nil
 }
@@ -172,6 +191,43 @@ func (s *LocalStore) DeleteObject(_ context.Context, key string) error {
 	return nil
 }
 
+// PromoteObject moves a verified object from staging to its permanent CAS key.
+func (s *LocalStore) PromoteObject(_ context.Context, srcKey, destKey string) error {
+	srcPath := s.keyToPath(srcKey)
+	destPath := s.keyToPath(destKey)
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return fmt.Errorf("create dest dir: %w", err)
+	}
+
+	// Try atomic rename first
+	if err := os.Rename(srcPath, destPath); err == nil {
+		return nil
+	}
+
+	// Fallback to copy + delete if across volume boundaries
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("open src %q for promote: %w", srcKey, err)
+	}
+	defer srcFile.Close()
+
+	destFile, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("create dest %q for promote: %w", destKey, err)
+	}
+	defer destFile.Close()
+
+	if _, err := io.Copy(destFile, srcFile); err != nil {
+		_ = os.Remove(destPath)
+		return fmt.Errorf("copy object for promote: %w", err)
+	}
+
+	_ = srcFile.Close()
+	_ = os.Remove(srcPath)
+	return nil
+}
+
 // keyToPath resolves a storage key (e.g. "blocks/<hash>") to an absolute
 // filesystem path under baseDir. Keys are cleaned to prevent path traversal.
 func (s *LocalStore) keyToPath(key string) string {
@@ -180,4 +236,51 @@ func (s *LocalStore) keyToPath(key string) string {
 	cleaned := filepath.Clean(string(os.PathSeparator) + key)
 	// Trim the leading separator that Clean prepended so Join stays in baseDir.
 	return filepath.Join(s.baseDir, cleaned[len(string(os.PathSeparator)):])
+}
+
+// ListBlockKeys walks the blocks/ subdirectory and returns every stored block
+// key in "blocks/<sha256>" form. Satisfies the gc.BlockLister interface used
+// by the orphaned-block garbage collector.
+func (s *LocalStore) ListBlockKeys(_ context.Context) ([]string, error) {
+	dir := filepath.Join(s.baseDir, BlockPrefix)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list local block keys: %w", err)
+	}
+	keys := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			keys = append(keys, BlockPrefix+"/"+e.Name())
+		}
+	}
+	return keys, nil
+}
+
+// ListStagingKeys walks the staging/ subdirectory and returns all staged object keys.
+// Satisfies the gc.StagingLister interface.
+func (s *LocalStore) ListStagingKeys(_ context.Context) ([]string, error) {
+	dir := filepath.Join(s.baseDir, StagingPrefix)
+	var keys []string
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if !info.IsDir() {
+			rel, relErr := filepath.Rel(s.baseDir, path)
+			if relErr == nil {
+				keys = append(keys, filepath.ToSlash(rel))
+			}
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("list local staging keys: %w", err)
+	}
+	return keys, nil
 }

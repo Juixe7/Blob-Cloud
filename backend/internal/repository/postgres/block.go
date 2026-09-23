@@ -156,6 +156,33 @@ func (r *BlockRepository) ListFileBlockHashes(ctx context.Context, fileID string
 	return out, rows.Err()
 }
 
+// ListFileBlocks returns the ordered blocks (with sha256 and size_bytes) linked to a file,
+// ordered by sequence_number. Used by range requests and byte-offset streaming.
+func (r *BlockRepository) ListFileBlocks(ctx context.Context, fileID string) ([]*domain.Block, error) {
+	const q = `
+		SELECT b.id, b.sha256, b.size_bytes, b.created_at
+		FROM file_blocks fb
+		JOIN blocks b ON b.id = fb.block_id
+		WHERE fb.file_id = $1
+		ORDER BY fb.sequence_number ASC
+	`
+	rows, err := r.db.QueryContext(ctx, q, fileID)
+	if err != nil {
+		return nil, fmt.Errorf("query file blocks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*domain.Block
+	for rows.Next() {
+		var b domain.Block
+		if err := rows.Scan(&b.ID, &b.SHA256, &b.SizeBytes, &b.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan file block: %w", err)
+		}
+		out = append(out, &b)
+	}
+	return out, rows.Err()
+}
+
 // LinkBlocksToFile writes all file_blocks rows for a file atomically. If the
 // repository is bound to the pool it opens its own transaction; if it is bound
 // to an in-flight transaction (via WithTx) it participates in that one. Either
@@ -226,4 +253,26 @@ func (r *BlockRepository) ReplaceBlocksForFile(ctx context.Context, fileID strin
 		return fmt.Errorf("ReplaceBlocksForFile: unsupported DBTX type %T", r.db)
 	}
 	return RunInTx(ctx, db, execRebuild)
+}
+
+// AllBlockHashes returns the sha256 of every row in the blocks table, ordered
+// for stable iteration. Used exclusively by the GC collector to build the
+// authoritative set of known blocks and identify orphans in storage.
+func (r *BlockRepository) AllBlockHashes(ctx context.Context) ([]string, error) {
+	const q = `SELECT sha256 FROM blocks ORDER BY sha256`
+	rows, err := r.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("query all block hashes: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, fmt.Errorf("scan block hash: %w", err)
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
 }

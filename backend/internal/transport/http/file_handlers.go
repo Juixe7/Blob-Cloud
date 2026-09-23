@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -9,9 +10,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"go-drive-clone/internal/audit"
 	"go-drive-clone/internal/auth"
 	"go-drive-clone/internal/domain"
 	"go-drive-clone/internal/service"
@@ -187,6 +190,15 @@ func (s *Server) HandleDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, code, map[string]string{"error": err.Error()})
 		return
 	}
+
+	// Audit: FILE_DELETED — non-blocking.
+	s.auditLog.Log(r.Context(), audit.Entry{
+		UserID:       userID,
+		Action:       audit.ActionFileDeleted,
+		ResourceType: audit.ResourceFile,
+		ResourceID:   fileID,
+		ClientIP:     r.RemoteAddr,
+	})
 
 	writeJSON(w, http.StatusOK, result)
 }
@@ -501,8 +513,22 @@ func parseRangeHeader(header string, fileSize int64) (int64, int64, bool) {
 
 // streamSingleFile streams a single file directly to the response writer, supporting range requests and inline previews.
 func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *domain.File) {
-	// Fall back to native single-file block streaming handler
-	_, hashes, err := s.fileOps.GetDownloadInfo(r.Context(), file.ID)
+	// Fetch ordered blocks and file metadata
+	var blocks []*domain.Block
+	var err error
+	if s.fileOps != nil {
+		file, blocks, err = s.fileOps.GetDownloadInfoWithBlocks(r.Context(), file.ID)
+	} else {
+		// Fallback for direct block lookup
+		var hashes []string
+		hashes, err = s.blocks.ListFileBlockHashes(r.Context(), file.ID)
+		if err == nil {
+			for _, h := range hashes {
+				blocks = append(blocks, &domain.Block{SHA256: h, SizeBytes: int32(service.BlockSize)})
+			}
+		}
+	}
+
 	if err != nil {
 		status := http.StatusInternalServerError
 		msg := err.Error()
@@ -514,7 +540,7 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 		return
 	}
 
-	if len(hashes) == 0 {
+	if len(blocks) == 0 {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no blocks found for this file"})
 		return
 	}
@@ -564,17 +590,13 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 		rangeStart, rangeEnd, isRange = parseRangeHeader(rangeHeader, file.SizeBytes)
 	}
 
-	var startBlockIndex int64
+	var startBlockIndex int
 	var blockOffset int64
 	var remainingBytes int64
 
 	if isRange {
 		remainingBytes = (rangeEnd - rangeStart) + 1
-		if s.fileOps != nil {
-			startBlockIndex, blockOffset = s.fileOps.CalculateRangeBlockOffset(rangeStart)
-		} else {
-			startBlockIndex, blockOffset = service.CalculateRangeBlockOffset(rangeStart)
-		}
+		startBlockIndex, blockOffset = service.CalculateDynamicRangeBlockOffset(blocks, rangeStart)
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, file.SizeBytes))
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", remainingBytes))
 		w.WriteHeader(http.StatusPartialContent)
@@ -584,10 +606,10 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 		w.WriteHeader(http.StatusOK)
 	}
 
-	logCtx := s.log.With("file_id", file.ID, "blocks", len(hashes), "size_bytes", file.SizeBytes, "is_range", isRange, "range_start", rangeStart, "range_end", rangeEnd)
+	logCtx := s.log.With("file_id", file.ID, "blocks", len(blocks), "size_bytes", file.SizeBytes, "is_range", isRange, "range_start", rangeStart, "range_end", rangeEnd)
 	logCtx.Info("download started")
 
-	for idx := int(startBlockIndex); idx < len(hashes); idx++ {
+	for idx := startBlockIndex; idx < len(blocks); idx++ {
 		if remainingBytes <= 0 {
 			break
 		}
@@ -599,18 +621,18 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 		default:
 		}
 
-		hash := hashes[idx]
+		blk := blocks[idx]
 		var rc io.ReadCloser
 		var err error
 
-		if isRange && idx == int(startBlockIndex) {
-			rc, err = s.storage.GetObjectRange(r.Context(), "blocks/"+hash, blockOffset, -1)
+		if isRange && idx == startBlockIndex {
+			rc, err = s.storage.GetObjectRange(r.Context(), "blocks/"+blk.SHA256, blockOffset, -1)
 		} else {
-			rc, err = s.storage.GetObject(r.Context(), "blocks/"+hash)
+			rc, err = s.storage.GetObject(r.Context(), "blocks/"+blk.SHA256)
 		}
 
 		if err != nil {
-			logCtx.Error("download: failed to read block", "block_index", idx, "hash", hash, "err", err)
+			logCtx.Error("download: failed to read block", "block_index", idx, "hash", blk.SHA256, "err", err)
 			return
 		}
 
@@ -622,7 +644,7 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 		}()
 
 		if copyErr != nil {
-			logCtx.Error("download: stream copy failed", "block_index", idx, "hash", hash, "err", copyErr)
+			logCtx.Error("download: stream copy failed", "block_index", idx, "hash", blk.SHA256, "err", copyErr)
 			return
 		}
 	}
@@ -630,10 +652,10 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 	logCtx.Info("download completed")
 }
 
-// HandleSearchFiles performs a semantic search over the user's files.
+// HandleSearchFiles performs hybrid search (keywords, AI tags, summary, and semantic vectors) over accessible files.
 func (s *Server) HandleSearchFiles(w http.ResponseWriter, r *http.Request) {
-	if s.aiClient == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "semantic search is not configured"})
+	if s.files == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "file search is not configured"})
 		return
 	}
 
@@ -643,22 +665,35 @@ func (s *Server) HandleSearchFiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := r.URL.Query().Get("q")
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if query == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing query parameter 'q'"})
 		return
 	}
 
-	// 1. Get embedding for the query
-	embedding, err := s.aiClient.GetTextEmbedding(r.Context(), query)
-	if err != nil {
-		s.log.Error("failed to compute query embedding", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to compute query embedding"})
-		return
+	var userEmail string
+	if s.users != nil {
+		if u, err := s.users.GetByID(r.Context(), userID); err == nil && u != nil {
+			userEmail = u.Email
+		}
 	}
 
-	// 2. Perform vector search in postgres over chunks
-	results, err := s.files.SemanticSearchChunks(r.Context(), userID, embedding, 20)
+	// 1. Attempt to get embedding for query (if AI configured).
+	// If embedding times out or fails (e.g. rate limit), gracefully fall back without breaking keyword search.
+	var embedding []float32
+	if s.aiClient != nil {
+		embCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		emb, err := s.aiClient.GetTextEmbedding(embCtx, query)
+		cancel()
+		if err != nil {
+			s.log.Warn("query embedding generation skipped/failed, falling back to keyword search", "err", err)
+		} else {
+			embedding = emb
+		}
+	}
+
+	// 2. Perform hybrid search across owned and shared files
+	results, err := s.files.HybridSearch(r.Context(), userID, userEmail, query, embedding, 50)
 	if err != nil {
 		s.log.Error("failed to search files", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to search files"})

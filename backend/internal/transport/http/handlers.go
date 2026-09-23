@@ -6,6 +6,7 @@ package httpx
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -14,12 +15,17 @@ import (
 	"github.com/gorilla/websocket"
 
 	"go-drive-clone/internal/ai"
+	"go-drive-clone/internal/audit"
 	"go-drive-clone/internal/domain"
 	"go-drive-clone/internal/email"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 	"go-drive-clone/internal/service"
 	"go-drive-clone/internal/sync"
 )
+
+// auditLogger is a local alias so handlers import only the httpx package, not
+// the audit package directly (keeps the dependency graph clean).
+type auditLogger = audit.Logger
 
 // Server bundles handler dependencies. It is passed to route registration so
 // every handler shares the same injected storage provider and logger.
@@ -48,11 +54,20 @@ type Server struct {
 	mailer         *email.Mailer
 	googleClientID string
 	aiClient       ai.AIClient
+	// Tier 2F: structured audit log. Falls back to audit.NoopLogger{} when
+	// the DB is absent so handlers always have a non-nil logger to call.
+	auditLog auditLogger
+	// Phase 2: Delta Sync Engine journal repository
+	journal *postgresrepo.JournalRepository
 }
 
 // NewServer constructs a Server with its dependencies injected.
 func NewServer(storage domain.StorageProvider, log *slog.Logger) *Server {
-	return &Server{storage: storage, log: log}
+	return &Server{
+		storage:  storage,
+		log:      log,
+		auditLog: audit.NoopLogger{},
+	}
 }
 
 // WithUploads wires the upload service and permission repository. main.go calls
@@ -124,6 +139,19 @@ func (s *Server) WithShareableLinks(shares *postgresrepo.ShareableLinkRepository
 	return s
 }
 
+// WithAudit wires the structured audit logger. If not called, the Server uses
+// audit.NoopLogger{} which discards all events — safe for storage-only mode.
+func (s *Server) WithAudit(l audit.Logger) *Server {
+	s.auditLog = l
+	return s
+}
+
+// WithJournal wires the delta sync journal repository.
+func (s *Server) WithJournal(journal *postgresrepo.JournalRepository) *Server {
+	s.journal = journal
+	return s
+}
+
 // HandleHealth serves a 200 OK text response. Standard endpoint for ECS ALBss check.
 func (s *Server) HandleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -157,6 +185,34 @@ func (s *Server) HandlePutBlock(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"hash":   hash,
 		"status": "stored",
+	})
+}
+
+// HandlePutStagingBlock handles PUT /local-storage/staging/{session_id}/{index}.
+// Stores unverified upload chunks in the staging area until cryptographic verification.
+func (s *Server) HandlePutStagingBlock(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+	index := chi.URLParam(r, "index")
+	if sessionID == "" || index == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing staging parameters"})
+		return
+	}
+
+	key := fmt.Sprintf("staging/%s/%s", sessionID, index)
+	contentType := r.Header.Get("Content-Type")
+	if err := s.storage.PutObject(r.Context(), key, r.Body, r.ContentLength, contentType); err != nil {
+		if errors.Is(err, fs.ErrInvalid) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid staging path"})
+			return
+		}
+		s.log.Error("put staging block failed", "key", key, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"key":    key,
+		"status": "staged",
 	})
 }
 

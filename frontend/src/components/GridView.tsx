@@ -133,6 +133,16 @@ function Card({
     <div
       onClick={(e) => {
         e.stopPropagation()
+        if (e.detail === 2) {
+          if (isBrokenShortcut || item.status === 'QUARANTINED') return
+          if (item.is_directory) {
+            onOpenFolder(item)
+            return
+          } else if (onOpenFile) {
+            onOpenFile(item)
+            return
+          }
+        }
         if (e.shiftKey && onSelectRange) {
           onSelectRange(item.id)
         } else if ((e.ctrlKey || e.metaKey) && onToggleSelect) {
@@ -147,6 +157,13 @@ function Card({
           onOpenFolder(item)
         } else if (onOpenFile) {
           onOpenFile(item)
+        }
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          if (isBrokenShortcut || item.status === 'QUARANTINED') return
+          if (item.is_directory) onOpenFolder(item)
+          else if (onOpenFile) onOpenFile(item)
         }
       }}
       onContextMenu={(e) => {
@@ -176,7 +193,18 @@ function Card({
         />
       </div>
 
-      <div className="relative flex aspect-[4/3] w-full items-center justify-center overflow-hidden rounded-lg bg-arch-950/50">
+      <div
+        className={cn(
+          "relative flex aspect-[4/3] w-full items-center justify-center overflow-hidden rounded-lg bg-arch-950/50",
+          item.is_directory && "cursor-pointer"
+        )}
+        onClick={(e) => {
+          if (item.is_directory) {
+            e.stopPropagation()
+            onOpenFolder(item)
+          }
+        }}
+      >
         {showThumbnail ? (
           <img 
             src={thumbUrl} 
@@ -198,10 +226,38 @@ function Card({
         )}
       </div>
 
-      <div className="flex flex-1 flex-col justify-center px-3 py-3">
-        <h3 className="truncate text-[13px] font-medium text-zinc-200" title={item.name}>
+      <div className="flex flex-1 items-center justify-between px-3 py-3">
+        <h3
+          className={cn(
+            "truncate text-[13px] font-medium text-zinc-200",
+            item.is_directory && "hover:text-amber-400 hover:underline cursor-pointer"
+          )}
+          title={item.name}
+          onClick={(e) => {
+            if (item.is_directory) {
+              e.stopPropagation()
+              onOpenFolder(item)
+            }
+          }}
+        >
           {item.name}
         </h3>
+        {item.is_directory && (
+          <button
+            type="button"
+            className="ml-1 shrink-0 rounded p-1 text-zinc-400 opacity-0 group-hover:opacity-100 hover:bg-arch-800 hover:text-amber-400 transition-all"
+            title="Open folder"
+            onClick={(e) => {
+              e.stopPropagation()
+              onOpenFolder(item)
+            }}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M5 12h14" />
+              <path d="m12 5 7 7-7 7" />
+            </svg>
+          </button>
+        )}
       </div>
     </div>
   )

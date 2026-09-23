@@ -1,14 +1,70 @@
+import { useState } from 'react'
 import { cn, formatFileSize } from '../lib/format'
 import type { FileItem } from '../types/file'
 import { FileIcon } from './FileIcon'
+import { apiClient } from '../lib/api'
 
 interface DetailPanelProps {
   item: FileItem | null
   isOpen: boolean
   onClose: () => void
+  onItemUpdated?: (updated: FileItem) => void
 }
 
-export function DetailPanel({ item, isOpen, onClose }: DetailPanelProps) {
+function formatMimeType(mime?: string, isDir?: boolean): string {
+  if (isDir) return 'Folder'
+  if (!mime) return 'Unknown'
+  const map: Record<string, string> = {
+    'application/pdf': 'PDF Document (.pdf)',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'Word Document (.docx)',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'Excel Spreadsheet (.xlsx)',
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'PowerPoint (.pptx)',
+    'text/plain': 'Plain Text (.txt)',
+    'text/markdown': 'Markdown Document (.md)',
+    'text/csv': 'CSV Spreadsheet (.csv)',
+    'application/json': 'JSON File (.json)',
+    'image/png': 'PNG Image (.png)',
+    'image/jpeg': 'JPEG Image (.jpg)',
+    'image/webp': 'WebP Image (.webp)',
+    'image/gif': 'GIF Image (.gif)',
+    'image/svg+xml': 'SVG Vector (.svg)',
+    'application/zip': 'ZIP Archive (.zip)',
+  }
+  return map[mime] || mime
+}
+
+export function DetailPanel({ item, isOpen, onClose, onItemUpdated }: DetailPanelProps) {
+  const [isGenerating, setIsGenerating] = useState(false)
+  const [errorMsg, setErrorMsg] = useState<string | null>(null)
+
+  const isImage = item?.mime_type?.startsWith('image/') || (item?.name ? /\.(jpg|jpeg|png|webp|gif)$/i.test(item.name) : false)
+  const isDoc = item?.name ? /\.(txt|md|pdf)$/i.test(item.name) : false
+  const canGenerateAI = Boolean(item && !item.is_directory && (isImage || isDoc))
+
+  const handleGenerateAI = async () => {
+    if (!item) return
+    setIsGenerating(true)
+    setErrorMsg(null)
+    try {
+      const res = await apiClient.post<{ file_id: string; tags: string | null; summary: string | null }>(
+        `/files/${item.id}/ai-insights`
+      )
+      const updated: FileItem = {
+        ...item,
+        tags: res.data.tags ?? item.tags,
+        summary: res.data.summary ?? item.summary,
+      }
+      onItemUpdated?.(updated)
+    } catch (err: unknown) {
+      const msg = err && typeof err === 'object' && 'response' in err
+        ? (err as { response?: { data?: { error?: string } } }).response?.data?.error
+        : 'Failed to generate AI insights'
+      setErrorMsg(msg || 'Failed to generate AI insights')
+    } finally {
+      setIsGenerating(false)
+    }
+  }
+
   return (
     <div
       className={cn(
@@ -69,6 +125,47 @@ export function DetailPanel({ item, isOpen, onClose }: DetailPanelProps) {
                 )}
               </div>
 
+              {/* AI Actions */}
+              {canGenerateAI && (
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-amber-500">
+                      <path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83"></path>
+                    </svg>
+                    AI Insights
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleGenerateAI}
+                    disabled={isGenerating}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-amber-300 bg-amber-950/40 hover:bg-amber-900/60 border border-amber-700/50 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isGenerating ? (
+                      <>
+                        <svg className="animate-spin h-3 w-3 text-amber-400" viewBox="0 0 24 24" fill="none">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                        </svg>
+                        Analyzing...
+                      </>
+                    ) : (
+                      <>
+                        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+                        </svg>
+                        {item.summary || item.tags ? 'Re-analyze' : 'Generate'}
+                      </>
+                    )}
+                  </button>
+                </div>
+              )}
+
+              {errorMsg && (
+                <div className="p-2 text-xs text-rose-400 bg-rose-950/40 border border-rose-800/40 rounded">
+                  {errorMsg}
+                </div>
+              )}
+
               {/* AI Auto-Tags Section */}
               {item.tags && (
                 <div className="space-y-2">
@@ -105,7 +202,7 @@ export function DetailPanel({ item, isOpen, onClose }: DetailPanelProps) {
                     </svg>
                     AI Conceptual Summary
                   </h4>
-                  <div className="p-3 bg-zinc-900 border border-zinc-800 rounded-md text-xs text-zinc-300 leading-relaxed shadow-sm">
+                  <div className="p-3 bg-zinc-900 border border-zinc-800 rounded-md text-xs text-zinc-300 leading-relaxed shadow-sm max-h-48 overflow-y-auto">
                     {item.summary}
                   </div>
                 </div>
@@ -118,7 +215,7 @@ export function DetailPanel({ item, isOpen, onClose }: DetailPanelProps) {
                 <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Properties</h4>
                 <div className="grid grid-cols-[100px_1fr] gap-y-3 text-xs">
                   <span className="text-zinc-500">Type</span>
-                  <span className="text-zinc-200 truncate">{item.is_directory ? 'Folder' : (item.mime_type || 'Unknown')}</span>
+                  <span className="text-zinc-200 truncate">{formatMimeType(item.mime_type, item.is_directory)}</span>
 
                   <span className="text-zinc-500">Size</span>
                   <span className="text-zinc-200">{item.is_directory ? '--' : formatFileSize(item.size_bytes)}</span>

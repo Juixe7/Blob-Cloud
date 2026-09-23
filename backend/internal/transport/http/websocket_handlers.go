@@ -1,6 +1,8 @@
 package httpx
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -21,7 +23,20 @@ const (
 	// wsPingInterval governs the keepalive ping sent by the write pump. Must be
 	// less than the gorilla default pong deadline.
 	wsPingInterval = 30 * time.Second
+	// wsAuthTimeout is the maximum duration an unauthenticated connection has
+	// to transmit its {"type": "AUTH", "token": "..."} handshake frame.
+	wsAuthTimeout = 5 * time.Second
+
+	// Application-level WebSocket Close Codes (RFC 6455 4000-4999 range)
+	WSCloseUnauthorized = 4401
+	WSCloseAuthTimeout  = 4408
 )
+
+// wsAuthPayload defines the shape of the initial in-band authentication frame.
+type wsAuthPayload struct {
+	Type  string `json:"type"`
+	Token string `json:"token"`
+}
 
 // newUpgrader builds a websocket.Upgrader whose CheckOrigin accepts the
 // configured CORS origins. A "*" entry (or empty list) allows all origins,
@@ -48,12 +63,15 @@ func newUpgrader(allowedOrigins []string) websocket.Upgrader {
 	}
 }
 
-// HandleWSConnection upgrades an HTTP request to a WebSocket and wires the
-// connection into the Hub under the authenticated user's id.
+// HandleWSConnection upgrades an HTTP request to a WebSocket.
 //
-// Authentication is via a JWT passed as the "token" query parameter, because
-// browsers cannot attach custom headers to the WebSocket handshake. A missing
-// or invalid token yields 401 and the connection is refused.
+// Supports two authentication modes:
+//  1. Legacy query parameter: ?token=<jwt> (fallback/backward-compatible).
+//  2. In-band first-message handshake: Anonymous upgrade followed by an
+//     {"type": "AUTH", "token": "<jwt>"} frame within 5 seconds.
+//
+// In-band authentication is preferred as it prevents token leakage into proxy/server
+// access logs and yields deterministic RFC 4401 application close codes upon failure.
 func (s *Server) HandleWSConnection(w http.ResponseWriter, r *http.Request) {
 	if s.hub == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
@@ -62,36 +80,105 @@ func (s *Server) HandleWSConnection(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Authenticate via ?token=<jwt>.
+	// 1. Check if token was provided in query parameter (legacy / fallback)
 	tokenStr := r.URL.Query().Get("token")
-	if tokenStr == "" {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing token"})
+	if tokenStr != "" {
+		claims, err := auth.ValidateToken(s.jwtSecret, tokenStr)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
+			return
+		}
+		if claims.SessionID != "" && s.sessions != nil {
+			if _, err := s.sessions.GetSessionByID(r.Context(), claims.SessionID); err != nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "session has been revoked or expired"})
+				return
+			}
+		}
+
+		conn, err := s.wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			s.log.Error("ws upgrade failed", "user_id", claims.UserID, "err", err)
+			return
+		}
+
+		s.registerAndStartClient(conn, claims.UserID, claims.SessionID)
 		return
 	}
-	claims, err := auth.ValidateToken(s.jwtSecret, tokenStr)
+
+	// 2. In-Band First-Message Handshake
+	conn, err := s.wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token"})
+		s.log.Error("ws anonymous upgrade failed", "err", err)
 		return
 	}
+
+	go s.handleInBandAuth(conn)
+}
+
+// handleInBandAuth reads the mandatory initial auth frame within wsAuthTimeout.
+func (s *Server) handleInBandAuth(conn *websocket.Conn) {
+	_ = conn.SetReadDeadline(time.Now().Add(wsAuthTimeout))
+
+	_, msg, err := conn.ReadMessage()
+	if err != nil {
+		s.closeWSWithAuthError(conn, WSCloseAuthTimeout, "handshake timeout or connection closed")
+		return
+	}
+
+	var authReq wsAuthPayload
+	if err := json.Unmarshal(msg, &authReq); err != nil || authReq.Type != "AUTH" || authReq.Token == "" {
+		s.closeWSWithAuthError(conn, WSCloseUnauthorized, "missing or invalid auth payload")
+		return
+	}
+
+	claims, err := auth.ValidateToken(s.jwtSecret, authReq.Token)
+	if err != nil {
+		s.closeWSWithAuthError(conn, WSCloseUnauthorized, "invalid or expired token")
+		return
+	}
+
 	if claims.SessionID != "" && s.sessions != nil {
-		if _, err := s.sessions.GetSessionByID(r.Context(), claims.SessionID); err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "session has been revoked or expired"})
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := s.sessions.GetSessionByID(ctx, claims.SessionID); err != nil {
+			s.closeWSWithAuthError(conn, WSCloseUnauthorized, "session has been revoked or expired")
 			return
 		}
 	}
 
-	// 2. Upgrade to WebSocket.
-	conn, err := s.wsUpgrader.Upgrade(w, r, nil)
-	if err != nil {
-		// Upgrade already wrote an error response; nothing more to do.
-		s.log.Error("ws upgrade failed", "user_id", claims.UserID, "err", err)
+	// Handshake successful: reset read deadline to normal ping/pong window
+	_ = conn.SetReadDeadline(time.Time{})
+
+	// Send confirmation AUTH_OK frame
+	resp, _ := json.Marshal(map[string]any{
+		"type":    "AUTH_OK",
+		"user_id": claims.UserID,
+	})
+	if err := conn.WriteMessage(websocket.TextMessage, resp); err != nil {
+		_ = conn.Close()
 		return
 	}
 
-	// 3. Register the client with the Hub and start the read/write pumps.
+	s.registerAndStartClient(conn, claims.UserID, claims.SessionID)
+}
+
+// closeWSWithAuthError sends an AUTH_ERROR payload, an RFC close control frame, and closes the connection.
+func (s *Server) closeWSWithAuthError(conn *websocket.Conn, code int, reason string) {
+	errPayload, _ := json.Marshal(map[string]any{
+		"type":  "AUTH_ERROR",
+		"error": reason,
+	})
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_ = conn.WriteMessage(websocket.TextMessage, errPayload)
+	_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason))
+	_ = conn.Close()
+}
+
+// registerAndStartClient links the connection into the Hub and starts the pumps.
+func (s *Server) registerAndStartClient(conn *websocket.Conn, userID, sessionID string) {
 	client := &sync.Client{
-		UserID:    claims.UserID,
-		SessionID: claims.SessionID,
+		UserID:    userID,
+		SessionID: sessionID,
 		Conn:      conn,
 		Send:      make(chan []byte, wsSendQueueDepth),
 	}

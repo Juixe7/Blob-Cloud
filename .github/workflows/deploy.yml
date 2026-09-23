@@ -1,0 +1,116 @@
+name: Build & Deploy Blob-Cloud
+
+on:
+  push:
+    branches: [ main ] # Triggers the pipeline on every push to the main branch
+
+jobs:
+  build-and-test:
+    name: Continuous Integration (Test & Validate)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    # --- Backend CI ---
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23' # Matches standard backend compilation targets
+
+    - name: Run Go Tests
+      run: |
+        cd backend
+        go vet ./...
+        go test -v ./... # Runs all unit tests (automatically skips integration tests requiring live DB)
+
+    # --- Frontend CI ---
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Verify TypeScript & Build Frontend
+      run: |
+        cd frontend
+        npm ci
+        npx tsc -b
+        npm run build
+
+  deploy:
+    name: Continuous Deployment (AWS EC2 Delivery)
+    needs: build-and-test # Will only run if all Go tests and React builds pass
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    # --- Compile Production Go Binary ---
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+
+    - name: Compile Go Binary (Linux AMD64)
+      run: |
+        cd backend
+        env GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o api-server cmd/api/main.go
+
+    # --- Build React Static Assets ---
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Build React Production Assets
+      run: |
+        cd frontend
+        npm ci
+        echo "VITE_API_BASE=/api" > .env
+        echo "VITE_GOOGLE_CLIENT_ID=689293277515-joa972q2s6asi87k7h4ggf5pctlndhmq.apps.googleusercontent.com" >> .env
+        npm run build
+
+    # --- Transfer Files to EC2 ---
+    - name: Copy Assets & Binary to EC2 via SCP
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        port: 22
+        source: "backend/api-server,frontend/dist/*"
+        target: "/home/ubuntu/blobcloud-temp"
+        strip_components: 0
+
+    # --- Stop service, overwrite files, and restart service ---
+    - name: SSH & Finalize Deployment
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        port: 22
+        script: |
+          # Ensure correct production directories exist
+          sudo mkdir -p /var/www/blobcloud/html
+          sudo mkdir -p /home/ubuntu/blobcloud
+
+          # 1. Stop active Go service temporarily to release the binary lock
+          sudo systemctl stop blobcloud || true
+
+          # 2. Overwrite the active Go binary
+          mv /home/ubuntu/blobcloud-temp/backend/api-server /home/ubuntu/blobcloud/api-server
+          chmod +x /home/ubuntu/blobcloud/api-server
+
+          # 3. Overwrite static React files in the Nginx HTML directory
+          sudo rm -rf /var/www/blobcloud/html/*
+          sudo cp -r /home/ubuntu/blobcloud-temp/frontend/dist/* /var/www/blobcloud/html/
+
+          # 4. Clean up the temp transfer folder
+          rm -rf /home/ubuntu/blobcloud-temp
+
+          # 5. Restart background Go service to load the new binary
+          sudo systemctl start blobcloud
+          sudo systemctl status blobcloud --no-pager

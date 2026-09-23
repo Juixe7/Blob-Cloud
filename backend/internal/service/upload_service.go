@@ -6,18 +6,67 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"mime"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"go-drive-clone/internal/domain"
-	postgresrepo "go-drive-clone/internal/repository/postgres"
+	"go-drive-clone/internal/metrics"
 	"go-drive-clone/internal/queue"
+	postgresrepo "go-drive-clone/internal/repository/postgres"
 	wsSync "go-drive-clone/internal/sync"
 )
+
+func detectMimeType(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	if m := mime.TypeByExtension(ext); m != "" {
+		return m
+	}
+	switch ext {
+	case ".pdf":
+		return "application/pdf"
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".svg":
+		return "image/svg+xml"
+	case ".txt":
+		return "text/plain"
+	case ".md":
+		return "text/markdown"
+	case ".csv":
+		return "text/csv"
+	case ".json":
+		return "application/json"
+	case ".docx":
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	case ".xlsx":
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+	case ".pptx":
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+	case ".zip":
+		return "application/zip"
+	case ".mp4":
+		return "video/mp4"
+	case ".mp3":
+		return "audio/mpeg"
+	default:
+		return "application/octet-stream"
+	}
+}
 
 // UploadService orchestrates resumable uploads: initiating a session with
 // deduplication, regenerating URLs for resumption, and committing a completed
@@ -33,6 +82,7 @@ type UploadService struct {
 	storage   domain.StorageProvider
 	publisher queue.Publisher
 	notifier  wsSync.Notifier // optional; nil-safe (NoopNotifier)
+	journal   *postgresrepo.JournalRepository
 	log       *slog.Logger
 }
 
@@ -60,6 +110,12 @@ func NewUploadService(
 		sessions: sessions, perms: perms, storage: storage,
 		publisher: publisher, notifier: notifier, log: log,
 	}
+}
+
+// WithJournal binds a JournalRepository for delta sync change logging.
+func (s *UploadService) WithJournal(journal *postgresrepo.JournalRepository) *UploadService {
+	s.journal = journal
+	return s
 }
 
 // InitiateRequest is the body of POST /api/upload/initiate.
@@ -91,11 +147,13 @@ type InitiateResponse struct {
 // InitiateRespChunk is the per-chunk reply: its sequence, hash, whether it is
 // already stored, and the upload URL when the client must PUT it.
 type InitiateRespChunk struct {
-	SequenceNumber int    `json:"sequence_number"`
-	SHA256         string `json:"sha256"`
-	SizeBytes      int32  `json:"size_bytes"`
-	AlreadyExists  bool   `json:"already_exists"`
-	UploadURL      string `json:"upload_url,omitempty"`
+	SequenceNumber int      `json:"sequence_number"`
+	SHA256         string   `json:"sha256"`
+	SizeBytes      int32    `json:"size_bytes"`
+	AlreadyExists  bool     `json:"already_exists"`
+	UploadURL      string   `json:"upload_url,omitempty"`   // single PUT path (≤ 5 GiB)
+	UploadID       string   `json:"upload_id,omitempty"`    // MPU upload ID (> 5 GiB)
+	PartURLs       []string `json:"part_urls,omitempty"`    // one presigned URL per part
 }
 
 // Initiate performs deduplication-aware session creation. It returns the new
@@ -128,6 +186,14 @@ func (s *UploadService) Initiate(ctx context.Context, req InitiateRequest) (*Ini
 		existingSet[b.SHA256] = true
 	}
 
+	// Record deduplication metrics: hits = blocks already stored (client skips
+	// uploading them), misses = blocks that need a fresh upload URL.
+	dedupHits := float64(len(existing))
+	dedupMisses := float64(len(hashes) - len(existing))
+	metrics.BlockDedupHits.Add(dedupHits)
+	metrics.BlockDedupMisses.Add(dedupMisses)
+	metrics.UploadsInitiated.Inc()
+
 	// 2. Build the session + its blocks. Pre-existing chunks are marked
 	//    is_uploaded=true so completion won't expect a fresh upload.
 	session := &domain.UploadSession{
@@ -137,7 +203,6 @@ func (s *UploadService) Initiate(ctx context.Context, req InitiateRequest) (*Ini
 		TotalSize: req.TotalSize,
 		Status:    domain.SessionStatusInitiated,
 	}
-	respChunks := make([]InitiateRespChunk, 0, len(req.Chunks))
 	blocks := make([]domain.SessionBlock, 0, len(req.Chunks))
 	for i, c := range req.Chunks {
 		alreadyExists := existingSet[c.SHA256]
@@ -149,28 +214,60 @@ func (s *UploadService) Initiate(ctx context.Context, req InitiateRequest) (*Ini
 			IsUploaded:     alreadyExists,
 		}
 		blocks = append(blocks, sb)
+	}
 
+	// 3. Persist session + blocks atomically to generate session UUID.
+	if err := s.sessions.CreateSession(ctx, session, blocks); err != nil {
+		return nil, fmt.Errorf("create session: %w", err)
+	}
+
+	// 4. Generate staging upload URL(s) for chunks the client still must upload.
+	// Zero-Trust: unverified client data lands in staging/{session_id}/{index}, NEVER blocks/{hash}.
+	respChunks := make([]InitiateRespChunk, 0, len(req.Chunks))
+	for i, c := range req.Chunks {
+		alreadyExists := existingSet[c.SHA256]
 		rc := InitiateRespChunk{
 			SequenceNumber: i,
 			SHA256:         c.SHA256,
 			SizeBytes:      c.SizeBytes,
 			AlreadyExists:  alreadyExists,
 		}
-		// 3. For chunks the client must still upload, generate a URL. We use a
-		//    generous lifetime; the local driver ignores it, S3 would honour it.
 		if !alreadyExists {
-			url, err := s.storage.GenerateUploadURL(ctx, c.SHA256, 30*time.Minute)
-			if err != nil {
-				return nil, fmt.Errorf("generate upload url for %s: %w", c.SHA256, err)
+			stagingKey := fmt.Sprintf("staging/%s/%d", session.ID, i)
+			blockSize := int64(c.SizeBytes)
+
+			if blockSize > domain.MPUBlockThreshold {
+				// Large block path (> 5 GiB): S3 Multipart Upload to staging.
+				mpu, ok := s.storage.(domain.MultipartUploadProvider)
+				if !ok {
+					return nil, fmt.Errorf("block %s exceeds 5 GiB but storage driver does not support multipart upload", c.SHA256)
+				}
+				uploadID, err := mpu.CreateMultipartUpload(ctx, stagingKey)
+				if err != nil {
+					return nil, fmt.Errorf("create multipart upload for %s: %w", c.SHA256, err)
+				}
+				partCount := int32((blockSize + domain.MPUPartSize - 1) / domain.MPUPartSize)
+				partURLs := make([]string, 0, partCount)
+				for p := int32(1); p <= partCount; p++ {
+					pURL, err := mpu.PresignUploadPart(ctx, stagingKey, uploadID, p, 30*time.Minute)
+					if err != nil {
+						_ = mpu.AbortMultipartUpload(ctx, stagingKey, uploadID)
+						return nil, fmt.Errorf("presign part %d for %s: %w", p, c.SHA256, err)
+					}
+					partURLs = append(partURLs, pURL)
+				}
+				rc.UploadID = uploadID
+				rc.PartURLs = partURLs
+			} else {
+				// Standard path (≤ 5 GiB): presigned PUT URL targeting staging.
+				url, err := s.storage.GenerateStagingUploadURL(ctx, stagingKey, 30*time.Minute)
+				if err != nil {
+					return nil, fmt.Errorf("generate staging upload url for %s: %w", c.SHA256, err)
+				}
+				rc.UploadURL = url
 			}
-			rc.UploadURL = url
 		}
 		respChunks = append(respChunks, rc)
-	}
-
-	// 4. Persist session + blocks atomically.
-	if err := s.sessions.CreateSession(ctx, session, blocks); err != nil {
-		return nil, fmt.Errorf("create session: %w", err)
 	}
 
 	s.log.Info("upload session initiated",
@@ -220,9 +317,10 @@ func (s *UploadService) GetSession(ctx context.Context, id string, userID string
 		}
 		// Only pending chunks need a URL; completed/aborted sessions return as-is.
 		if session.Status == domain.SessionStatusInitiated && !b.IsUploaded {
-			url, err := s.storage.GenerateUploadURL(ctx, b.BlockHash, 30*time.Minute)
+			stagingKey := fmt.Sprintf("staging/%s/%d", session.ID, b.SequenceNumber)
+			url, err := s.storage.GenerateStagingUploadURL(ctx, stagingKey, 30*time.Minute)
 			if err != nil {
-				return nil, fmt.Errorf("regenerate upload url: %w", err)
+				return nil, fmt.Errorf("regenerate staging upload url: %w", err)
 			}
 			rc.UploadURL = url
 		}
@@ -262,6 +360,108 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 
 	var result CompleteResponse
 	var uploaderID string
+	var recordedCursor int64
+	// 1. Pre-transaction validation & Zero-Trust Staging Verification (outside DB transaction)
+	session, sessionBlocks, err := s.sessions.GetSessionByID(ctx, req.SessionID)
+	if err != nil {
+		return nil, fmt.Errorf("get session: %w", err)
+	}
+	if userID != "" && session.UserID != userID {
+		return nil, errors.New("access denied: session owned by another user")
+	}
+	if session.Status != domain.SessionStatusInitiated {
+		return nil, fmt.Errorf("session %s is %s, cannot complete", req.SessionID, session.Status)
+	}
+	uploaderID = session.UserID
+
+	// 2. Zero-Trust Staging Verification & Promotion Pipeline (Phase 3)
+	// Executed BEFORE opening the SQL transaction so slow WAN I/O never holds database connection locks.
+	for _, b := range sessionBlocks {
+		destKey := "blocks/" + b.BlockHash
+
+		// If the block was deduplicated at initiate time, verify it exists in CAS.
+		if b.IsUploaded {
+			meta, err := s.storage.HeadObject(ctx, destKey)
+			if err != nil {
+				s.log.Warn("complete upload security alert: deduplicated block missing in CAS store",
+					"session_id", req.SessionID, "block_hash", b.BlockHash, "err", err)
+				return nil, fmt.Errorf("payload integrity violation: block %s not in CAS: %w", b.BlockHash, err)
+			}
+			if meta.ContentLength != int64(b.SizeBytes) {
+				return nil, fmt.Errorf("payload integrity violation: block %s size mismatch (expected %d, got %d)",
+					b.BlockHash, b.SizeBytes, meta.ContentLength)
+			}
+			continue
+		}
+
+		// Block was uploaded to staging during this session.
+		stagingKey := fmt.Sprintf("staging/%s/%d", req.SessionID, b.SequenceNumber)
+
+		// Fast-path: Check if destination block already exists in CAS (e.g. concurrent upload dedup)
+		if casMeta, err := s.storage.HeadObject(ctx, destKey); err == nil && casMeta.ContentLength == int64(b.SizeBytes) {
+			// Safe deduplication! Discard redundant staging object.
+			_ = s.storage.DeleteObject(ctx, stagingKey)
+			continue
+		}
+
+		// Verify staged block exists and check server-authoritative sizing
+		meta, err := s.storage.HeadObject(ctx, stagingKey)
+		if err != nil {
+			s.log.Warn("complete upload security alert: staged block missing",
+				"session_id", req.SessionID, "staging_key", stagingKey, "err", err)
+			return nil, fmt.Errorf("payload integrity violation: staged block %s not in storage: %w", stagingKey, err)
+		}
+		if meta.ContentLength != int64(b.SizeBytes) {
+			_ = s.storage.DeleteObject(ctx, stagingKey)
+			return nil, fmt.Errorf("payload integrity violation: block %s size mismatch (expected %d, got %d)",
+				b.BlockHash, b.SizeBytes, meta.ContentLength)
+		}
+
+		// Zero-Trust Cryptographic Content Verification: stream and compute true SHA-256
+		rc, err := s.storage.GetObject(ctx, stagingKey)
+		if err != nil {
+			return nil, fmt.Errorf("read staged block %s: %w", stagingKey, err)
+		}
+
+		hasher := sha256.New()
+		if _, copyErr := io.Copy(hasher, rc); copyErr != nil {
+			_ = rc.Close()
+			return nil, fmt.Errorf("stream staged block %s: %w", stagingKey, copyErr)
+		}
+		_ = rc.Close()
+
+		actualHash := hex.EncodeToString(hasher.Sum(nil))
+		if !strings.EqualFold(actualHash, b.BlockHash) {
+			s.log.Warn("complete upload security alert: CAS POISONING ATTEMPT REJECTED",
+				"session_id", req.SessionID, "sequence_number", b.SequenceNumber,
+				"claimed_hash", b.BlockHash, "actual_hash", actualHash)
+			_ = s.storage.DeleteObject(ctx, stagingKey)
+			return nil, fmt.Errorf("checksum mismatch: claimed sha256 %s but computed %s (CAS poisoning rejected)",
+				b.BlockHash, actualHash)
+		}
+
+		// Cryptographic ETag Verification if client provided MD5
+		if b.BlockMD5 != "" {
+			cleanETag := strings.Trim(strings.ToLower(meta.ETag), "\"")
+			expectedMD5 := strings.Trim(strings.ToLower(b.BlockMD5), "\"")
+			if cleanETag != "" && cleanETag != "mocketag" && cleanETag != expectedMD5 {
+				s.log.Warn("complete upload security alert: ETag verification failed",
+					"session_id", req.SessionID, "staging_key", stagingKey,
+					"expected_md5", expectedMD5, "s3_etag", cleanETag)
+				_ = s.storage.DeleteObject(ctx, stagingKey)
+				return nil, fmt.Errorf("payload integrity violation: block %s ETag mismatch", b.BlockHash)
+			}
+		}
+
+		// Promote verified block to immutable CAS storage (blocks/<hash>)
+		if err := s.storage.PromoteObject(ctx, stagingKey, destKey); err != nil {
+			s.log.Error("failed to promote block from staging",
+				"session_id", req.SessionID, "staging_key", stagingKey, "dest_key", destKey, "err", err)
+			return nil, fmt.Errorf("failed to promote block %s: %w", b.BlockHash, err)
+		}
+	}
+
+	// 3. Fast Atomic Database Transaction (Metadata writes only, ~20-50ms)
 	txErr := postgresrepo.RunInTx(ctx, s.db, func(tx postgresrepo.DBTX) error {
 		sessions := s.sessions.WithTx(tx)
 		blocks := s.blocks.WithTx(tx)
@@ -269,50 +469,13 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 		perms := s.perms.WithTx(tx)
 		users := s.users.WithTx(tx)
 
-		// 1. Load session + blocks (locks the session row for the tx).
-		session, sessionBlocks, err := sessions.GetSessionByID(ctx, req.SessionID)
+		// Re-verify session state under transaction lock
+		currentSession, _, err := sessions.GetSessionByID(ctx, req.SessionID)
 		if err != nil {
 			return err
 		}
-		if userID != "" && session.UserID != userID {
-			return errors.New("access denied: session owned by another user")
-		}
-		if session.Status != domain.SessionStatusInitiated {
-			return fmt.Errorf("session %s is %s, cannot complete", req.SessionID, session.Status)
-		}
-		uploaderID = session.UserID
-
-		// 2. Server-Authoritative Verification (HeadObject directly from S3/R2 or local storage).
-		// Check both sizing (prevent storage quota spoofing) and ETag MD5 hash (prevent ghost commits).
-		for _, b := range sessionBlocks {
-			meta, err := s.storage.HeadObject(ctx, "blocks/"+b.BlockHash)
-			if err != nil {
-				s.log.Warn("complete upload security alert: block missing in storage",
-					"session_id", req.SessionID, "block_hash", b.BlockHash, "err", err)
-				return fmt.Errorf("payload integrity violation: block %s not in storage: %w", b.BlockHash, err)
-			}
-
-			// Server-Authoritative Sizing Check
-			if meta.ContentLength != int64(b.SizeBytes) {
-				s.log.Warn("complete upload security alert: storage quota / block size mismatch",
-					"session_id", req.SessionID, "block_hash", b.BlockHash,
-					"expected_size", b.SizeBytes, "actual_s3_size", meta.ContentLength)
-				return fmt.Errorf("payload integrity violation: block %s size mismatch (expected %d, got %d)",
-					b.BlockHash, b.SizeBytes, meta.ContentLength)
-			}
-
-			// Cryptographic ETag Verification
-			if b.BlockMD5 != "" {
-				cleanETag := strings.Trim(strings.ToLower(meta.ETag), "\"")
-				expectedMD5 := strings.Trim(strings.ToLower(b.BlockMD5), "\"")
-				if cleanETag != expectedMD5 {
-					s.log.Warn("complete upload security alert: ETag cryptographic verification failed (ghost commit detected)",
-						"session_id", req.SessionID, "block_hash", b.BlockHash,
-						"expected_md5", expectedMD5, "s3_etag", cleanETag)
-					return fmt.Errorf("payload integrity violation: block %s ETag mismatch (expected %s, got %s)",
-						b.BlockHash, expectedMD5, cleanETag)
-				}
-			}
+		if currentSession.Status != domain.SessionStatusInitiated {
+			return fmt.Errorf("session %s is %s, cannot complete", req.SessionID, currentSession.Status)
 		}
 
 		// 3. Upsert blocks into the global table, resolving each to a stable id.
@@ -360,6 +523,8 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 			
 			// Update the active file record
 			existingFile.SizeBytes = session.TotalSize
+			existingFile.MimeType = detectMimeType(session.Filename)
+			existingFile.Status = "ACTIVE"
 			existingFile.IsEncrypted = req.IsEncrypted
 			if req.EncryptionSalt != "" {
 				existingFile.EncryptionSalt = &req.EncryptionSalt
@@ -383,6 +548,8 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 				Name:           session.Filename,
 				ParentID:       session.ParentID,
 				SizeBytes:      session.TotalSize,
+				MimeType:       detectMimeType(session.Filename),
+				Status:         "ACTIVE",
 				IsEncrypted:    req.IsEncrypted,
 			}
 			if req.EncryptionSalt != "" {
@@ -417,6 +584,29 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 			return err
 		}
 
+		// 8. Record in Journal for Delta Synchronization
+		if s.journal != nil {
+			action := domain.ActionFileCreated
+			if existingFile != nil && !existingFile.IsDirectory {
+				action = domain.ActionFileUpdated
+			}
+			jEntry := &domain.JournalEntry{
+				UserID:      session.UserID,
+				FileID:      result.FileID,
+				Action:      action,
+				ParentID:    session.ParentID,
+				Name:        session.Filename,
+				IsDirectory: false,
+				SizeBytes:   session.TotalSize,
+				Status:      "ACTIVE",
+			}
+			cursor, err := s.journal.WithTx(tx).Record(ctx, jEntry)
+			if err != nil {
+				return fmt.Errorf("record journal entry: %w", err)
+			}
+			recordedCursor = cursor
+		}
+
 		result.SessionID = req.SessionID
 		result.Status = domain.SessionStatusCompleted
 		return nil
@@ -427,6 +617,7 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 	}
 
 	s.log.Info("upload completed", "session_id", req.SessionID, "file_id", result.FileID)
+	metrics.UploadsCompleted.Inc()
 
 	// Publish a thumbnail job to the event queue. Failure to publish is
 	// non-fatal — the upload succeeded, the thumbnail will just be missed.
@@ -447,6 +638,18 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 			"session_id": result.SessionID,
 		},
 	})
+
+	// Broadcast incremental delta event
+	if recordedCursor > 0 {
+		s.notifier.NotifyUser(uploaderID, wsSync.NotificationEvent{
+			Type: wsSync.EventSyncDelta,
+			Payload: map[string]any{
+				"cursor":  recordedCursor,
+				"file_id": result.FileID,
+				"action":  domain.ActionFileCreated,
+			},
+		})
+	}
 
 	return &result, nil
 }

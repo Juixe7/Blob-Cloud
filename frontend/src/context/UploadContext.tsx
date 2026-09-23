@@ -17,7 +17,7 @@ import type {
   InitiateResponse,
   CompleteResponse,
 } from '../types/file'
-import type { ChunkHashResult, HashWorkerResponse } from '../workers/hash.worker'
+import type { FastCDCChunkResult, FastCDCWorkerResponse } from '../workers/fastcdc.worker'
 import { deriveKeyPBKDF2, encryptChunkPayload } from '../lib/crypto'
 
 /** Custom event dispatched on window when an upload finishes, so the file
@@ -60,39 +60,67 @@ export function UploadProvider({ children }: { children: ReactNode }) {
   const jobsRef = useRef<UploadJob[]>([])
   jobsRef.current = jobs
 
-  /** Patch a single job by id immutably. */
+  /** Concurrency limiter to prevent browser tab freezes and OOM on massive folder uploads. */
+  const MAX_CONCURRENT_UPLOADS = 3
+  const uploadQueueRef = useRef<(() => Promise<void>)[]>([])
+  const activeUploadsRef = useRef(0)
+
+  /** Patch a single job by id immutably and propagate folder status. */
   const patchJob = useCallback((id: string, patch: Partial<UploadJob>) => {
-    setJobs((prev) =>
-      prev.map((j) => (j.id === id ? { ...j, ...patch } : j)),
-    )
+    setJobs((prev) => {
+      const next = prev.map((j) => (j.id === id ? { ...j, ...patch } : j))
+      const target = next.find((j) => j.id === id)
+      if (target?.folder_job_id) {
+        const folderId = target.folder_job_id
+        const siblings = next.filter((j) => j.folder_job_id === folderId)
+        if (siblings.length > 0 && siblings.every((s) => s.status === 'COMPLETED' || s.status === 'FAILED')) {
+          const hasFailed = siblings.some((s) => s.status === 'FAILED')
+          const totalProgress = siblings.reduce((acc, s) => acc + s.progress, 0)
+          const avgProgress = totalProgress / siblings.length
+          return next.map((j) =>
+            j.id === folderId
+              ? {
+                  ...j,
+                  status: hasFailed ? 'FAILED' : 'COMPLETED',
+                  progress: avgProgress,
+                  error: hasFailed ? 'Some files failed to upload' : undefined,
+                }
+              : j,
+          )
+        }
+      }
+      return next
+    })
+  }, [])
+
+  /** Dequeue waiting jobs up to MAX_CONCURRENT_UPLOADS. */
+  const processQueue = useCallback(() => {
+    while (activeUploadsRef.current < MAX_CONCURRENT_UPLOADS && uploadQueueRef.current.length > 0) {
+      const nextTask = uploadQueueRef.current.shift()
+      if (!nextTask) break
+      activeUploadsRef.current++
+      nextTask().finally(() => {
+        activeUploadsRef.current--
+        processQueue()
+      })
+    }
   }, [])
 
   /**
    * Run the full upload lifecycle for a single file. Each invocation owns its
    * own worker instance, which is terminated on completion/failure.
    */
-  const uploadFile = useCallback(
-    async (file: File, parentId: string | null, folderJobId?: string, passphrase?: string) => {
+  const executeUpload = useCallback(
+    async (jobId: string, file: File, parentId: string | null, passphrase?: string) => {
       if (!user) {
-        // eslint-disable-next-line no-console
-        console.warn('[upload] no authenticated user — aborting')
+        patchJob(jobId, { status: 'FAILED', error: 'User not authenticated', progress: 0 })
         return
       }
+      patchJob(jobId, { status: 'HASHING' })
 
-      const jobId = generateJobId()
-      const newJob: UploadJob = {
-        id: jobId,
-        filename: file.name,
-        totalSize: file.size,
-        status: 'HASHING',
-        progress: 0,
-        folder_job_id: folderJobId,
-      }
-      setJobs((prev) => [...prev, newJob])
-
-      // Spawn the hashing worker.
+      // Spawn the FastCDC content-defined chunking worker.
       const worker = new Worker(
-        new URL('../workers/hash.worker.ts', import.meta.url),
+        new URL('../workers/fastcdc.worker.ts', import.meta.url),
         { type: 'module' },
       )
 
@@ -108,9 +136,9 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       let activeSessionId: string | null = null
 
       try {
-        /* ---- 1. HASHING (SHA-256 + MD5 via Bounded Concurrency Worker) ---- */
-        const { chunks, encryptionSalt } = await new Promise<{ chunks: ChunkHashResult[], encryptionSalt?: string }>((resolve, reject) => {
-          worker.onmessage = (e: MessageEvent<HashWorkerResponse>) => {
+        /* ---- 1. HASHING (FastCDC Rolling Gear Hash with Dual Masks) ---- */
+        const { chunks, encryptionSalt } = await new Promise<{ chunks: FastCDCChunkResult[], encryptionSalt?: string }>((resolve, reject) => {
+          worker.onmessage = (e: MessageEvent<FastCDCWorkerResponse>) => {
             const msg = e.data
             if (msg.type === 'progress') {
               // Map 0..100 hashing progress onto the 0..30 band.
@@ -218,28 +246,58 @@ export function UploadProvider({ children }: { children: ReactNode }) {
           cryptoKey = derived.key
         }
 
-        // Match each missing chunk to its original slice by sequence_number.
-        await Promise.all(
-          missing.map(async (chunk) => {
-            const offset = chunk.sequence_number * CHUNK_SIZE
-            const blobSlice = file.slice(offset, Math.min(file.size, offset + CHUNK_SIZE))
-            
-            let uploadPayload: Blob | ArrayBuffer = blobSlice
-            if (cryptoKey && encryptionSalt) {
-              const arrayBuffer = await blobSlice.arrayBuffer()
-              uploadPayload = await encryptChunkPayload(arrayBuffer, cryptoKey, encryptionSalt, chunk.sequence_number)
-            }
+        // Upload missing chunks with bounded concurrency (limit = 3) and exponential backoff retry.
+        // This avoids saturating browser network connections and tripping upload rate limits.
+        const CHUNK_UPLOAD_CONCURRENCY = 3
+        const MAX_RETRIES = 3
 
-            return axios.put(chunk.upload_url as string, uploadPayload, {
-              headers: { 'Content-Type': 'application/octet-stream' },
-              onUploadProgress: (evt) => {
-                const loaded = evt.loaded ?? 0
-                chunkBytesUploaded.set(chunk.sequence_number, Math.min(loaded, chunk.size_bytes))
-                recomputeProgress()
-              },
-            })
-          }),
-        )
+        const uploadChunkWithRetry = async (chunk: typeof missing[0]) => {
+          const chunkMeta = chunks[chunk.sequence_number]
+          const offset = chunkMeta ? chunkMeta.offset : chunk.sequence_number * CHUNK_SIZE
+          const plainSize = chunkMeta ? chunkMeta.plaintext_size : chunk.size_bytes
+          const blobSlice = file.slice(offset, offset + plainSize)
+          
+          let uploadPayload: Blob | ArrayBuffer = blobSlice
+          if (cryptoKey && encryptionSalt) {
+            const arrayBuffer = await blobSlice.arrayBuffer()
+            uploadPayload = await encryptChunkPayload(arrayBuffer, cryptoKey, encryptionSalt, chunk.sequence_number)
+          }
+
+          let attempt = 0
+          while (attempt < MAX_RETRIES) {
+            try {
+              await axios.put(chunk.upload_url as string, uploadPayload, {
+                headers: { 'Content-Type': 'application/octet-stream' },
+                onUploadProgress: (evt) => {
+                  const loaded = evt.loaded ?? 0
+                  chunkBytesUploaded.set(chunk.sequence_number, Math.min(loaded, chunk.size_bytes))
+                  recomputeProgress()
+                },
+              })
+              return
+            } catch (err) {
+              attempt++
+              if (attempt >= MAX_RETRIES) {
+                throw err
+              }
+              // Exponential backoff before retry (e.g. 500ms, 1000ms)
+              await new Promise((resolve) => setTimeout(resolve, attempt * 500))
+            }
+          }
+        }
+
+        let chunkCursor = 0
+        const workerCount = Math.min(CHUNK_UPLOAD_CONCURRENCY, missing.length)
+        if (workerCount > 0) {
+          const pool = Array.from({ length: workerCount }, async () => {
+            while (chunkCursor < missing.length) {
+              const currentChunk = missing[chunkCursor++]
+              await uploadChunkWithRetry(currentChunk)
+            }
+          })
+          await Promise.all(pool)
+        }
+
 
         /* ---- 4. COMPLETING ---- */
         patchJob(jobId, { status: 'COMPLETING', progress: COMPLETING_BAND_END })
@@ -276,6 +334,35 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       }
     },
     [user, patchJob],
+  )
+
+  /**
+   * Enqueue a file upload task. Adds job in IDLE state and schedules it through
+   * the bounded concurrency worker queue.
+   */
+  const uploadFile = useCallback(
+    (file: File, parentId: string | null = null, folderJobId?: string, passphrase?: string) => {
+      if (!user) {
+        // eslint-disable-next-line no-console
+        console.warn('[upload] no authenticated user — aborting')
+        return
+      }
+
+      const jobId = generateJobId()
+      const newJob: UploadJob = {
+        id: jobId,
+        filename: file.name,
+        totalSize: file.size,
+        status: 'IDLE',
+        progress: 0,
+        folder_job_id: folderJobId,
+      }
+      setJobs((prev) => [...prev, newJob])
+
+      uploadQueueRef.current.push(() => executeUpload(jobId, file, parentId, passphrase))
+      processQueue()
+    },
+    [user, executeUpload, processQueue],
   )
 
   /**
@@ -342,11 +429,23 @@ export function UploadProvider({ children }: { children: ReactNode }) {
 
   /** Remove all COMPLETED and FAILED jobs from the queue. */
   const clearCompleted = useCallback(() => {
-    setJobs((prev) =>
-      prev.filter(
-        (j) => j.status !== 'COMPLETED' && j.status !== 'FAILED',
-      ),
-    )
+    setJobs((prev) => {
+      const completedFolderIds = new Set<string>()
+      for (const j of prev) {
+        if (j.is_folder) {
+          const children = prev.filter((c) => c.folder_job_id === j.id)
+          if (children.length > 0 && children.every((c) => c.status === 'COMPLETED' || c.status === 'FAILED')) {
+            completedFolderIds.add(j.id)
+          }
+        }
+      }
+
+      return prev.filter((j) => {
+        if (j.is_folder && completedFolderIds.has(j.id)) return false
+        if (j.folder_job_id && completedFolderIds.has(j.folder_job_id)) return false
+        return j.status !== 'COMPLETED' && j.status !== 'FAILED'
+      })
+    })
   }, [])
 
   const value = useMemo<UploadContextValue>(

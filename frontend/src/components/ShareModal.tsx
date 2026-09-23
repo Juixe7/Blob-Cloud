@@ -77,6 +77,7 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
   const [listError, setListError] = useState<string | null>(null)
 
   const [email, setEmail] = useState('')
+  const [message, setMessage] = useState('')
   const [role, setRole] = useState<Exclude<CollaboratorRole, 'OWNER'>>('VIEWER')
   const [inviting, setInviting] = useState(false)
   const [inviteError, setInviteError] = useState<string | null>(null)
@@ -90,6 +91,7 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
   useEffect(() => {
     if (!open) return
     setEmail('')
+    setMessage('')
     setRole('VIEWER')
     setInviteError(null)
   }, [open, fileId])
@@ -136,7 +138,7 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
     try {
       const res = await apiClient.post<CollaboratorPermission>(
         `/files/${fileId}/share`,
-        { grantee_email: trimmed, role },
+        { grantee_email: trimmed, role, message: message.trim() || undefined },
       )
       // Append, de-duping by id (the API enforces uniqueness, but be safe).
       setCollaborators((prev) => {
@@ -144,6 +146,7 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
         return exists ? prev : [...prev, res.data]
       })
       setEmail('')
+      setMessage('')
     } catch (err) {
       setInviteError(extractInviteError(err))
     } finally {
@@ -249,6 +252,19 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
             Invite
           </Button>
         </div>
+        <div className="mt-2">
+          <Input
+            id="collab-message"
+            type="text"
+            placeholder="Add an optional note or context for recipient..."
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            disabled={inviting}
+          />
+          <p className="mt-1.5 text-[11px] text-zinc-500">
+            Recipients receive a safe, sandboxed invitation card with a 7-day review window.
+          </p>
+        </div>
         {inviteError && (
           <div className="mt-2.5">
             <Alert variant="error">{inviteError}</Alert>
@@ -297,9 +313,19 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
                   {initialsFor(c.grantee_email)}
                 </span>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm text-zinc-200" title={c.grantee_email}>
-                    {c.grantee_email}
-                  </p>
+                  <div className="flex items-center gap-2">
+                    <p className="truncate text-sm text-zinc-200" title={c.grantee_email}>
+                      {c.grantee_email}
+                    </p>
+                    {c.status === 'PENDING' && (
+                      <span className="flex-shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-300">
+                        Pending
+                      </span>
+                    )}
+                  </div>
+                  {c.message && (
+                    <p className="truncate text-xs text-zinc-400 italic">"{c.message}"</p>
+                  )}
                 </div>
                 
                 {/* Role indicator / selector */}

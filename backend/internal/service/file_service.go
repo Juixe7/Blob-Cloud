@@ -14,19 +14,22 @@ import (
 
 	"go-drive-clone/internal/domain"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
+	wsSync "go-drive-clone/internal/sync"
 )
 
 // FileService orchestrates file-level operations: rename, move, delete, and
 // download. It validates permissions before mutating metadata and handles
 // garbage collection of orphaned S3 blocks after recursive deletes.
 type FileService struct {
-	db      *sql.DB
-	users   *postgresrepo.UserRepository
-	files   *postgresrepo.FileRepository
-	blocks  *postgresrepo.BlockRepository
-	perms   *postgresrepo.PermissionRepository
-	storage domain.StorageProvider
-	log     *slog.Logger
+	db       *sql.DB
+	users    *postgresrepo.UserRepository
+	files    *postgresrepo.FileRepository
+	blocks   *postgresrepo.BlockRepository
+	perms    *postgresrepo.PermissionRepository
+	storage  domain.StorageProvider
+	journal  *postgresrepo.JournalRepository
+	notifier wsSync.Notifier
+	log      *slog.Logger
 }
 
 // NewFileService wires the service with all the repositories it needs.
@@ -42,6 +45,64 @@ func NewFileService(
 	return &FileService{
 		db: db, users: users, files: files, blocks: blocks,
 		perms: perms, storage: storage, log: log,
+	}
+}
+
+// WithJournal sets the journal repository for delta synchronization.
+func (s *FileService) WithJournal(journal *postgresrepo.JournalRepository) *FileService {
+	s.journal = journal
+	return s
+}
+
+// WithNotifier sets the real-time event notifier.
+func (s *FileService) WithNotifier(notifier wsSync.Notifier) *FileService {
+	s.notifier = notifier
+	return s
+}
+
+func (s *FileService) recordAndNotify(ctx context.Context, userID, fileID, action string, file *domain.File) {
+	if s.journal == nil {
+		return
+	}
+	name := ""
+	var parentID *string
+	isDir := false
+	var sizeBytes int64 = 0
+	status := "ACTIVE"
+	var mimeType string
+	if file != nil {
+		name = file.Name
+		parentID = file.ParentID
+		isDir = file.IsDirectory
+		sizeBytes = file.SizeBytes
+		status = file.Status
+		mimeType = file.MimeType
+	}
+	jEntry := &domain.JournalEntry{
+		UserID:      userID,
+		FileID:      fileID,
+		Action:      action,
+		ParentID:    parentID,
+		Name:        name,
+		IsDirectory: isDir,
+		SizeBytes:   sizeBytes,
+		MimeType:    mimeType,
+		Status:      status,
+	}
+	cursor, err := s.journal.Record(ctx, jEntry)
+	if err != nil {
+		s.log.Error("failed to record journal entry", "file_id", fileID, "action", action, "err", err)
+		return
+	}
+	if s.notifier != nil {
+		s.notifier.NotifyUser(userID, wsSync.NotificationEvent{
+			Type: wsSync.EventSyncDelta,
+			Payload: map[string]any{
+				"cursor":  cursor,
+				"file_id": fileID,
+				"action":  action,
+			},
+		})
 	}
 }
 
@@ -128,20 +189,20 @@ func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req
 	}
 
 	// 4. Cycle guard: if parent_id is changing, the new parent must not be the
-	//    file itself nor any of its own descendants.
+	//    file itself nor any of its own descendants (O(1) materialized path check).
 	if req.ParentID != nil && existing.IsDirectory {
-		targetParent := *req.ParentID
-		if targetParent == "" {
-			targetParent = existing.ID // self-check handled below
-		}
-		if targetParent == "" || updated.ParentID == nil {
-			// Moving to root — always safe, no cycle possible.
-		} else if updated.ParentID != nil {
-			isDesc, err := s.files.IsDescendant(ctx, existing.ID, *updated.ParentID)
-			if err != nil {
-				return nil, fmt.Errorf("cycle check: %w", err)
+		if updated.ParentID != nil && *updated.ParentID != "" {
+			if *updated.ParentID == existing.ID {
+				return nil, fmt.Errorf("cannot move a folder into itself")
 			}
-			if isDesc {
+			targetParent, err := s.files.GetByID(ctx, *updated.ParentID)
+			if err != nil {
+				return nil, fmt.Errorf("lookup target folder: %w", err)
+			}
+			if !targetParent.IsDirectory {
+				return nil, fmt.Errorf("target parent is not a directory")
+			}
+			if strings.HasPrefix(targetParent.Path, existing.Path) {
 				return nil, fmt.Errorf("cannot move directory inside its own descendant")
 			}
 		}
@@ -160,6 +221,13 @@ func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req
 		"file_id", fileID, "user_id", userID,
 		"new_name", updated.Name,
 		"new_parent_id", logNilStr(updated.ParentID))
+
+	if updated.Name != existing.Name {
+		s.recordAndNotify(ctx, userID, fileID, domain.ActionFileRenamed, &updated)
+	}
+	if isMove {
+		s.recordAndNotify(ctx, userID, fileID, domain.ActionFileMoved, &updated)
+	}
 
 	return &updated, nil
 }
@@ -201,6 +269,7 @@ func (s *FileService) SoftDelete(ctx context.Context, userID, fileID string) (*D
 	}
 
 	s.log.Info("file soft deleted", "file_id", fileID, "user_id", userID)
+	s.recordAndNotify(ctx, userID, fileID, domain.ActionFileTrashed, nil)
 
 	return &DeleteResult{
 		Status:  "success",
@@ -235,6 +304,8 @@ func (s *FileService) Restore(ctx context.Context, userID, fileID string) (*Dele
 	}
 
 	s.log.Info("file restored", "file_id", fileID, "user_id", userID)
+	restoredFile, _ := s.files.GetByID(ctx, fileID)
+	s.recordAndNotify(ctx, userID, fileID, domain.ActionFileRestored, restoredFile)
 
 	return &DeleteResult{
 		Status:  "success",
@@ -291,6 +362,7 @@ func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string
 		"file_id", fileID, "user_id", userID,
 		"deleted_count", deletedCount,
 		"orphaned_blocks", len(orphanHashes))
+	s.recordAndNotify(ctx, userID, fileID, domain.ActionFileDeleted, nil)
 
 	return &DeleteResult{
 		Status:       "success",
@@ -361,6 +433,7 @@ func (s *FileService) CreateFolder(ctx context.Context, userID, name string, par
 
 	if wasNew {
 		s.log.Info("folder created", "folder_id", folder.ID, "user_id", userID, "name", name)
+		s.recordAndNotify(ctx, userID, folder.ID, domain.ActionFileCreated, folder)
 	} else {
 		s.log.Info("folder reused", "folder_id", folder.ID, "user_id", userID, "name", name)
 	}
@@ -443,6 +516,24 @@ func (s *FileService) GetDownloadInfo(ctx context.Context, fileID string) (*doma
 		return nil, nil, fmt.Errorf("get block hashes: %w", err)
 	}
 	return f, hashes, nil
+}
+
+// GetDownloadInfoWithBlocks returns the ordered domain.Block list and the File metadata needed
+// to stream a download. The caller verifies permissions before calling this.
+func (s *FileService) GetDownloadInfoWithBlocks(ctx context.Context, fileID string) (*domain.File, []*domain.Block, error) {
+	f, err := s.files.GetByID(ctx, fileID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get file: %w", err)
+	}
+	if f.IsDirectory {
+		return nil, nil, fmt.Errorf("cannot download a directory")
+	}
+
+	blocks, err := s.blocks.ListFileBlocks(ctx, fileID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get blocks: %w", err)
+	}
+	return f, blocks, nil
 }
 
 // garbageCollectBlocks deletes orphaned physical blocks from storage. Each
@@ -698,6 +789,28 @@ func (s *FileService) CalculateRangeBlockOffset(startByte int64) (startBlockInde
 // CalculateRangeBlockOffset calculates startBlockIndex and blockOffset from a startByte.
 func CalculateRangeBlockOffset(startByte int64) (int64, int64) {
 	return startByte / BlockSize, startByte % BlockSize
+}
+
+// CalculateDynamicRangeBlockOffset dynamically calculates the starting block index and intra-block offset
+// given arbitrary variable-sized FastCDC blocks.
+func CalculateDynamicRangeBlockOffset(blocks []*domain.Block, startByte int64) (startBlockIndex int, blockOffset int64) {
+	if len(blocks) == 0 || startByte <= 0 {
+		return 0, 0
+	}
+	var accumulated int64 = 0
+	for i, b := range blocks {
+		bSize := int64(b.SizeBytes)
+		if startByte < accumulated+bSize {
+			return i, startByte - accumulated
+		}
+		accumulated += bSize
+	}
+	return len(blocks) - 1, 0
+}
+
+// CalculateDynamicRangeBlockOffset dynamically calculates the starting block index and intra-block offset.
+func (s *FileService) CalculateDynamicRangeBlockOffset(blocks []*domain.Block, startByte int64) (startBlockIndex int, blockOffset int64) {
+	return CalculateDynamicRangeBlockOffset(blocks, startByte)
 }
 
 

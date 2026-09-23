@@ -186,6 +186,38 @@ func TestDownloadRangeRequest(t *testing.T) {
 	}
 }
 
+func TestCalculateDynamicRangeBlockOffset(t *testing.T) {
+	// Simulate FastCDC variable chunks: 1.5MB, 2.5MB, 1.2MB
+	blocks := []*domain.Block{
+		{SHA256: "hash1", SizeBytes: 1500000},
+		{SHA256: "hash2", SizeBytes: 2500000},
+		{SHA256: "hash3", SizeBytes: 1200000},
+	}
+
+	tests := []struct {
+		startByte int64
+		wantIdx   int
+		wantOff   int64
+	}{
+		{startByte: 0, wantIdx: 0, wantOff: 0},
+		{startByte: 500000, wantIdx: 0, wantOff: 500000},
+		{startByte: 1499999, wantIdx: 0, wantOff: 1499999},
+		{startByte: 1500000, wantIdx: 1, wantOff: 0},
+		{startByte: 2000000, wantIdx: 1, wantOff: 500000},
+		{startByte: 3999999, wantIdx: 1, wantOff: 2499999},
+		{startByte: 4000000, wantIdx: 2, wantOff: 0},
+		{startByte: 4500000, wantIdx: 2, wantOff: 500000},
+	}
+
+	for _, tc := range tests {
+		idx, off := service.CalculateDynamicRangeBlockOffset(blocks, tc.startByte)
+		if idx != tc.wantIdx || off != tc.wantOff {
+			t.Errorf("CalculateDynamicRangeBlockOffset(%d): got (%d, %d), want (%d, %d)",
+				tc.startByte, idx, off, tc.wantIdx, tc.wantOff)
+		}
+	}
+}
+
 type testMemStorage struct {
 	objects map[string][]byte
 }
@@ -228,5 +260,18 @@ func (s *testMemStorage) HeadObject(ctx context.Context, key string) (*domain.Ob
 	}, nil
 }
 func (s *testMemStorage) DeleteObject(ctx context.Context, key string) error {
+	delete(s.objects, key)
+	return nil
+}
+func (s *testMemStorage) GenerateStagingUploadURL(ctx context.Context, stagingKey string, expires time.Duration) (string, error) {
+	return "", nil
+}
+func (s *testMemStorage) PromoteObject(ctx context.Context, srcKey, destKey string) error {
+	b, ok := s.objects[srcKey]
+	if !ok {
+		return errors.New("not found: " + srcKey)
+	}
+	s.objects[destKey] = b
+	delete(s.objects, srcKey)
 	return nil
 }

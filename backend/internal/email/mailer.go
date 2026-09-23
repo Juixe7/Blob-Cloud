@@ -1,11 +1,14 @@
 package email
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/smtp"
 	"os"
 	"strings"
+	"time"
 )
 
 // Mailer handles sending verification and notification emails via SMTP.
@@ -83,7 +86,7 @@ func (m *Mailer) SendVerificationEmail(toEmail, code string) error {
 	auth := smtp.PlainAuth("", m.user, m.password, m.host)
 	addr := fmt.Sprintf("%s:%s", m.host, m.port)
 
-	err := smtp.SendMail(addr, auth, m.sender, []string{toEmail}, msg)
+	err := m.sendMailWithTimeout(addr, auth, m.sender, []string{toEmail}, msg, 15*time.Second)
 	if err != nil {
 		m.log.Error("failed to send verification email via SMTP", "to", toEmail, "err", err)
 		return fmt.Errorf("send mail: %w", err)
@@ -149,7 +152,7 @@ func (m *Mailer) SendPasswordResetEmail(toEmail, resetLink string) error {
 	auth := smtp.PlainAuth("", m.user, m.password, m.host)
 	addr := fmt.Sprintf("%s:%s", m.host, m.port)
 
-	err := smtp.SendMail(addr, auth, m.sender, []string{toEmail}, msg)
+	err := m.sendMailWithTimeout(addr, auth, m.sender, []string{toEmail}, msg, 15*time.Second)
 	if err != nil {
 		m.log.Error("failed to send password reset email via SMTP", "to", toEmail, "err", err)
 		return fmt.Errorf("send password reset mail: %w", err)
@@ -204,7 +207,7 @@ func (m *Mailer) SendShareNotificationEmail(toEmail, sharedBy, filename, role, l
 	auth := smtp.PlainAuth("", m.user, m.password, m.host)
 	addr := fmt.Sprintf("%s:%s", m.host, m.port)
 
-	err := smtp.SendMail(addr, auth, m.sender, []string{toEmail}, msg)
+	err := m.sendMailWithTimeout(addr, auth, m.sender, []string{toEmail}, msg, 15*time.Second)
 	if err != nil {
 		m.log.Error("failed to send share notification email via SMTP", "to", toEmail, "err", err)
 		return fmt.Errorf("send share notification mail: %w", err)
@@ -212,6 +215,69 @@ func (m *Mailer) SendShareNotificationEmail(toEmail, sharedBy, filename, role, l
 
 	m.log.Info("share notification email sent successfully", "to", toEmail)
 	return nil
+}
+
+// sendMailWithTimeout dispatches email via SMTP with a strict network dial/read/write deadline.
+func (m *Mailer) sendMailWithTimeout(addr string, auth smtp.Auth, from string, to []string, msg []byte, timeout time.Duration) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+
+	conn, err := net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return fmt.Errorf("dial smtp server: %w", err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("set smtp deadline: %w", err)
+	}
+
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		return fmt.Errorf("create smtp client: %w", err)
+	}
+	defer client.Close()
+
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		tlsConfig := &tls.Config{ServerName: host}
+		if err := client.StartTLS(tlsConfig); err != nil {
+			return fmt.Errorf("smtp starttls: %w", err)
+		}
+	}
+
+	if auth != nil {
+		if ok, _ := client.Extension("AUTH"); ok {
+			if err := client.Auth(auth); err != nil {
+				return fmt.Errorf("smtp auth: %w", err)
+			}
+		}
+	}
+
+	if err := client.Mail(from); err != nil {
+		return fmt.Errorf("smtp mail: %w", err)
+	}
+
+	for _, recipient := range to {
+		if err := client.Rcpt(recipient); err != nil {
+			return fmt.Errorf("smtp rcpt: %w", err)
+		}
+	}
+
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("smtp data: %w", err)
+	}
+	if _, err := w.Write(msg); err != nil {
+		_ = w.Close()
+		return fmt.Errorf("smtp write: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("smtp close: %w", err)
+	}
+
+	return client.Quit()
 }
 
 func getEnvOrDefault(key, fallback string) string {

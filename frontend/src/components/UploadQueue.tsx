@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useUpload } from '../context/UploadContext'
 import { formatFileSize, cn } from '../lib/format'
 import { Spinner } from './ui/Spinner'
@@ -13,9 +13,31 @@ export function UploadQueue() {
   const { jobs, clearCompleted } = useUpload()
   const [collapsed, setCollapsed] = useState(false)
 
-  const topLevelJobs = jobs.filter((j) => !j.folder_job_id)
-  const activeCount = topLevelJobs.filter((j) => !isTerminal(j.status)).length
-  const allTerminal = topLevelJobs.length > 0 && activeCount === 0
+  const effectiveTopLevelJobs = useMemo(() => {
+    const topLevel = jobs.filter((j) => !j.folder_job_id)
+    return topLevel.map((job) => {
+      if (job.is_folder) {
+        const children = jobs.filter((j) => j.folder_job_id === job.id)
+        if (children.length > 0) {
+          const totalProgress = children.reduce((acc, c) => acc + c.progress, 0)
+          const avgProgress = totalProgress / children.length
+          const isFailed = children.some((c) => c.status === 'FAILED')
+          const isCompleted = children.every((c) => c.status === 'COMPLETED' || c.status === 'FAILED')
+          const aggStatus: UploadStatus = isFailed ? 'FAILED' : isCompleted ? 'COMPLETED' : 'UPLOADING'
+          return {
+            ...job,
+            progress: avgProgress,
+            status: aggStatus,
+            error: isFailed ? 'Some files failed to upload' : undefined,
+          }
+        }
+      }
+      return job
+    })
+  }, [jobs])
+
+  const activeCount = effectiveTopLevelJobs.filter((j) => !isTerminal(j.status)).length
+  const allTerminal = effectiveTopLevelJobs.length > 0 && activeCount === 0
 
   useEffect(() => {
     if (allTerminal) {
@@ -44,7 +66,7 @@ export function UploadQueue() {
             </h2>
           </div>
           <div className="flex items-center gap-1">
-            {topLevelJobs.some((j) => isTerminal(j.status)) && (
+            {effectiveTopLevelJobs.some((j) => isTerminal(j.status)) && (
               <button
                 onClick={clearCompleted}
                 className="rounded px-2 py-0.5 font-mono text-[10px] text-zinc-400 transition-colors hover:bg-arch-850 hover:text-zinc-200"
@@ -80,22 +102,9 @@ export function UploadQueue() {
         {/* Rows */}
         {!collapsed && (
           <ul className="max-h-72 divide-y divide-arch-border/50 overflow-y-auto">
-            {topLevelJobs.map((job) => {
-              if (job.is_folder) {
-                const children = jobs.filter(j => j.folder_job_id === job.id)
-                if (children.length > 0) {
-                  // Compute aggregate progress
-                  const totalProgress = children.reduce((acc, c) => acc + c.progress, 0)
-                  const avgProgress = totalProgress / children.length
-                  // Determine aggregate status
-                  const isFailed = children.some(c => c.status === 'FAILED')
-                  const isCompleted = children.every(c => c.status === 'COMPLETED' || c.status === 'FAILED')
-                  const aggStatus = isFailed ? 'FAILED' : (isCompleted ? 'COMPLETED' : 'UPLOADING')
-                  job = { ...job, progress: avgProgress, status: aggStatus, error: isFailed ? 'Some files failed to upload' : undefined }
-                }
-              }
-              return <JobRow key={job.id} job={job} />
-            })}
+            {effectiveTopLevelJobs.map((job) => (
+              <JobRow key={job.id} job={job} />
+            ))}
           </ul>
         )}
       </div>
