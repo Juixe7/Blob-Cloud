@@ -12,6 +12,13 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
+# Declare build arguments so Docker Compose and CI/CD can inject
+# environment variables at image build time
+ARG VITE_API_BASE=/api
+ARG VITE_GOOGLE_CLIENT_ID
+ENV VITE_API_BASE=$VITE_API_BASE
+ENV VITE_GOOGLE_CLIENT_ID=$VITE_GOOGLE_CLIENT_ID
+
 # Copy frontend source
 COPY . .
 

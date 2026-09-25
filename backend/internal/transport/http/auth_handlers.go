@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -680,7 +679,7 @@ func (s *Server) HandleForgotPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	baseURL := getEnvOrDefault("APP_BASE_URL", "http://localhost:5173")
+	baseURL := getAppBaseURL()
 	resetLink := fmt.Sprintf("%s/reset-password?token=%s", baseURL, token)
 
 	if s.mailer != nil {
@@ -840,13 +839,6 @@ func (s *Server) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{
 		"message": "Logged out successfully.",
 	})
-}
-
-func getEnvOrDefault(key, fallback string) string {
-	if val := strings.TrimSpace(os.Getenv(key)); val != "" {
-		return val
-	}
-	return fallback
 }
 
 

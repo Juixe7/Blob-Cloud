@@ -10,6 +10,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
@@ -225,3 +227,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		http.Error(w, "failed to encode response", http.StatusInternalServerError)
 	}
 }
+
+// getAppBaseURL returns the configured base URL for user-facing links (invitations,
+// password resets, public shares). It prioritises APP_BASE_URL, then BASE_URL,
+// and defaults safely to the production domain https://blobcloud.dev.
+func getAppBaseURL() string {
+	if val := strings.TrimSpace(os.Getenv("APP_BASE_URL")); val != "" {
+		return strings.TrimRight(val, "/")
+	}
+	if val := strings.TrimSpace(os.Getenv("BASE_URL")); val != "" {
+		return strings.TrimRight(val, "/")
+	}
+	return "https://blobcloud.dev"
+}
+

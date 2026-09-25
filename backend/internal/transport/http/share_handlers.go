@@ -154,8 +154,8 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 
 	// Dispatch asynchronous background email notification
 	if s.mailer != nil {
-		baseURL := getEnvOrDefault("APP_BASE_URL", "http://localhost:5173")
-		link := strings.TrimRight(baseURL, "/") + "/dashboard"
+		baseURL := getAppBaseURL()
+		link := baseURL + "/dashboard"
 		go func() {
 			_ = s.mailer.SendShareNotificationEmail(req.GranteeEmail, sender.Email, filename, req.Role, link)
 		}()

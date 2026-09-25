@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"time"
 	"database/sql"
-	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"golang.org/x/crypto/bcrypt"
@@ -98,8 +97,8 @@ func (s *Server) HandleCreatePublicLink(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	baseURL := getEnvOrDefault("APP_BASE_URL", "http://localhost:5173")
-	shareURL := strings.TrimRight(baseURL, "/") + "/share/" + link.LinkToken
+	baseURL := getAppBaseURL()
+	shareURL := baseURL + "/share/" + link.LinkToken
 
 	writeJSON(w, http.StatusCreated, CreateLinkResponse{
 		LinkToken: link.LinkToken,

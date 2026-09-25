@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
+	"github.com/redis/go-redis/v9"
 	"go-drive-clone/internal/ai"
 	"go-drive-clone/internal/antivirus"
 	"go-drive-clone/internal/config"
@@ -113,6 +114,26 @@ func main() {
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
 
+	var redisClient *redis.Client
+	if cfg.RedisURL != "" {
+		rc, err := wsSync.NewRedisClient(cfg.RedisURL)
+		if err != nil {
+			log.Error("redis client init failed, falling back to in-memory mode",
+				"redis_url", cfg.RedisURL, "err", err)
+		} else if pingErr := wsSync.Ping(context.Background(), rc); pingErr != nil {
+			log.Error("redis ping failed, falling back to in-memory mode",
+				"redis_url", cfg.RedisURL, "err", pingErr)
+		} else {
+			redisClient = rc
+			defer func() {
+				if err := redisClient.Close(); err != nil {
+					log.Error("closing redis client", "err", err)
+				}
+			}()
+			log.Info("redis client connected", "redis_url", cfg.RedisURL)
+		}
+	}
+
 	var hub *wsSync.Hub
 	var notifier wsSync.Notifier = wsSync.NoopNotifier()
 	if cfg.JWTSecret != "" {
@@ -124,26 +145,17 @@ func main() {
 		// When REDIS_URL is set, the backplane replaces the direct hub as the
 		// Notifier — it still delivers locally via hub AND publishes to Redis so
 		// peer nodes can deliver to their local connections.
-		if cfg.RedisURL != "" {
-			redisClient, err := wsSync.NewRedisClient(cfg.RedisURL)
-			if err != nil {
-				log.Error("redis client init failed, falling back to single-node hub",
-					"redis_url", cfg.RedisURL, "err", err)
-			} else if pingErr := wsSync.Ping(context.Background(), redisClient); pingErr != nil {
-				log.Error("redis ping failed, falling back to single-node hub",
-					"redis_url", cfg.RedisURL, "err", pingErr)
-			} else {
-				bp := wsSync.NewRedisBackplane(redisClient, hub, log)
-				workerWg.Add(1)
-				go func() {
-					defer workerWg.Done()
-					if err := bp.Run(workerCtx); err != nil {
-						log.Error("backplane subscriber exited", "err", err)
-					}
-				}()
-				notifier = bp
-				log.Info("redis backplane started", "channel", "blobcloud:ws:events")
-			}
+		if redisClient != nil {
+			bp := wsSync.NewRedisBackplane(redisClient, hub, log)
+			workerWg.Add(1)
+			go func() {
+				defer workerWg.Done()
+				if err := bp.Run(workerCtx); err != nil {
+					log.Error("backplane subscriber exited", "err", err)
+				}
+			}()
+			notifier = bp
+			log.Info("redis backplane started", "channel", "blobcloud:ws:events")
 		}
 
 		srv = srv.WithRealtime(hub, cfg.JWTSecret, cfg.WSCORSOrigins)
@@ -266,20 +278,32 @@ func main() {
 		}
 	}
 
-	// Build rate limiters from config. In-memory by default; for multi-node
-	// deployments swap to ratelimit.NewRedisLimiter using the same Redis client
-	// wired for the backplane.
+	// Build rate limiters from config. Uses Redis-backed distributed fixed-window
+	// counters when Redis is connected; falls back cleanly to in-process token-bucket
+	// limiters for local or standalone operation.
 	rl := httpx.RateLimiters{}
 	if cfg.RateLimitAuthPerMin > 0 {
-		rl.Auth = ratelimit.NewInMemoryLimiter(cfg.RateLimitAuthPerMin, time.Minute)
+		if redisClient != nil {
+			rl.Auth = ratelimit.NewRedisLimiter(redisClient, "auth", cfg.RateLimitAuthPerMin, time.Minute)
+		} else {
+			rl.Auth = ratelimit.NewInMemoryLimiter(cfg.RateLimitAuthPerMin, time.Minute)
+		}
 		rl.AuthCfg = ratelimit.NewZoneConfig(cfg.RateLimitAuthPerMin, time.Minute)
 	}
 	if cfg.RateLimitUploadPerMin > 0 {
-		rl.Upload = ratelimit.NewInMemoryLimiter(cfg.RateLimitUploadPerMin, time.Minute)
+		if redisClient != nil {
+			rl.Upload = ratelimit.NewRedisLimiter(redisClient, "upload", cfg.RateLimitUploadPerMin, time.Minute)
+		} else {
+			rl.Upload = ratelimit.NewInMemoryLimiter(cfg.RateLimitUploadPerMin, time.Minute)
+		}
 		rl.UploadCfg = ratelimit.NewZoneConfig(cfg.RateLimitUploadPerMin, time.Minute)
 	}
 	if cfg.RateLimitAPIPerMin > 0 {
-		rl.API = ratelimit.NewInMemoryLimiter(cfg.RateLimitAPIPerMin, time.Minute)
+		if redisClient != nil {
+			rl.API = ratelimit.NewRedisLimiter(redisClient, "api", cfg.RateLimitAPIPerMin, time.Minute)
+		} else {
+			rl.API = ratelimit.NewInMemoryLimiter(cfg.RateLimitAPIPerMin, time.Minute)
+		}
 		rl.APICfg = ratelimit.NewZoneConfig(cfg.RateLimitAPIPerMin, time.Minute)
 	}
 	router := httpx.NewRouter(srv, rl)
