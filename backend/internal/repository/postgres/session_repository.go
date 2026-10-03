@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 
 	"go-drive-clone/internal/domain"
 )
@@ -157,4 +158,26 @@ func (r *SessionRepository) GetSessionByRefreshTokenID(ctx context.Context, refr
 		return nil, fmt.Errorf("get session by refresh token: %w", err)
 	}
 	return s, nil
+}
+
+// RotateRefreshToken atomically replaces the old refresh token hash with a new one
+// using Compare-And-Swap (CAS) semantics to guard against token reuse or concurrent refreshes.
+func (r *SessionRepository) RotateRefreshToken(ctx context.Context, sessionID string, oldRefreshTokenID string, newRefreshTokenID string, newExpiresAt time.Time) error {
+	const query = `
+		UPDATE user_sessions
+		SET refresh_token_id = $1, expires_at = $2, last_active_at = CURRENT_TIMESTAMP
+		WHERE id = $3 AND refresh_token_id = $4 AND is_active = true;
+	`
+	res, err := r.db.ExecContext(ctx, query, newRefreshTokenID, newExpiresAt, sessionID, oldRefreshTokenID)
+	if err != nil {
+		return fmt.Errorf("rotate refresh token: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rotate refresh token rows affected: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("session %s token rotation failed (concurrent refresh or inactive)", sessionID)
+	}
+	return nil
 }

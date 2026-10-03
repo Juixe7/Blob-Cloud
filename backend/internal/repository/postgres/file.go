@@ -126,6 +126,40 @@ func (r *FileRepository) GetFolderByNameAndParent(ctx context.Context, userID, n
 	return &f, nil
 }
 
+// GetFileByNameAndParent checks if an active (non-deleted) file or folder with exact name and parentID exists for userID.
+func (r *FileRepository) GetFileByNameAndParent(ctx context.Context, userID, name string, parentID *string) (*domain.File, error) {
+	var (
+		row *sql.Row
+		f   domain.File
+	)
+	if parentID == nil {
+		q := fmt.Sprintf(`
+			SELECT %s
+			FROM files
+			WHERE user_id = $1 AND name = $2 AND parent_id IS NULL AND deleted_at IS NULL
+			LIMIT 1
+		`, fileSelectColumns)
+		row = r.db.QueryRowContext(ctx, q, userID, name)
+	} else {
+		q := fmt.Sprintf(`
+			SELECT %s
+			FROM files
+			WHERE user_id = $1 AND name = $2 AND parent_id = $3 AND deleted_at IS NULL
+			LIMIT 1
+		`, fileSelectColumns)
+		row = r.db.QueryRowContext(ctx, q, userID, name, *parentID)
+	}
+
+	err := scanFileRow(row, &f)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, sql.ErrNoRows
+	case err != nil:
+		return nil, fmt.Errorf("query file by name and parent: %w", err)
+	}
+	return &f, nil
+}
+
 // ListDirectory returns the immediate children of parentID for a user. A nil
 // parentID lists the user's top-level entries (parent_id IS NULL). If parentID is provided,
 // returns children even if the parent folder itself is soft-deleted.
@@ -795,6 +829,8 @@ func (r *FileRepository) GetResolvedPermission(ctx context.Context, fileID strin
 		FROM file_hierarchy fh
 		INNER JOIN permissions p ON fh.id = p.file_id
 		WHERE p.grantee_email = $2
+		  AND p.status = 'ACCEPTED'
+		  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
 		ORDER BY fh.depth ASC
 		LIMIT 1;
 	`

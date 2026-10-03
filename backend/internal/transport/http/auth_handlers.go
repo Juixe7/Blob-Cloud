@@ -56,7 +56,8 @@ type refreshRequest struct {
 
 // refreshResponse is the JSON body returned on successful token refresh.
 type refreshResponse struct {
-	Token string `json:"token"`
+	Token        string `json:"token"`
+	RefreshToken string `json:"refresh_token,omitempty"`
 }
 
 // forgotPasswordRequest is the JSON body for POST /api/auth/forgot-password.
@@ -354,6 +355,7 @@ func (s *Server) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sessionID := ""
+	newRefreshToken := ""
 	if s.sessions != nil {
 		hashedToken := fmt.Sprintf("%x", sha256.Sum256([]byte(req.RefreshToken)))
 		session, err := s.sessions.GetSessionByRefreshTokenID(r.Context(), hashedToken)
@@ -361,8 +363,25 @@ func (s *Server) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "session has been revoked or expired"})
 			return
 		}
-		_ = s.sessions.TouchSession(r.Context(), session.ID)
 		sessionID = session.ID
+
+		// Rotate refresh token: mint new refresh token bound to session
+		newRefreshToken, err = auth.CreateRefreshTokenWithSession(s.jwtSecret, claims.UserID, sessionID)
+		if err != nil {
+			s.log.Error("refresh: create rotated refresh token failed", "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+
+		newHashedToken := fmt.Sprintf("%x", sha256.Sum256([]byte(newRefreshToken)))
+		newExpiresAt := time.Now().Add(auth.RefreshTokenLifetime)
+		if err := s.sessions.RotateRefreshToken(r.Context(), sessionID, hashedToken, newHashedToken, newExpiresAt); err != nil {
+			s.log.Warn("refresh: token rotation conflict / reuse detected", "session_id", sessionID, "err", err)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "session has been revoked or expired"})
+			return
+		}
+	} else {
+		newRefreshToken, _ = auth.CreateRefreshToken(s.jwtSecret, claims.UserID)
 	}
 
 	// Issue a new access token bound to the existing session.
@@ -374,7 +393,8 @@ func (s *Server) HandleRefresh(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, refreshResponse{
-		Token: accessToken,
+		Token:        accessToken,
+		RefreshToken: newRefreshToken,
 	})
 }
 
@@ -820,9 +840,6 @@ func (s *Server) HandleLogout(w http.ResponseWriter, r *http.Request) {
 					_ = s.sessions.DeleteSession(r.Context(), sess.ID, claims.UserID)
 				}
 			}
-			_ = s.users.DeleteRefreshToken(r.Context(), req.RefreshToken)
-		} else {
-			_ = s.users.DeleteRefreshToken(r.Context(), req.RefreshToken)
 		}
 	}
 

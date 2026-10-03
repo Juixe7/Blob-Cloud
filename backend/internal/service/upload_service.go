@@ -360,7 +360,8 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 
 	var result CompleteResponse
 	var uploaderID string
-	var recordedCursor int64
+	var recordedCursors map[string]int64
+	var recordedAction string
 	// 1. Pre-transaction validation & Zero-Trust Staging Verification (outside DB transaction)
 	session, sessionBlocks, err := s.sessions.GetSessionByID(ctx, req.SessionID)
 	if err != nil {
@@ -492,9 +493,13 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 		}
 
 		// 4. Handle File Versioning / Collision
-		existingFile, err := files.GetFolderByNameAndParent(ctx, session.UserID, session.Filename, session.ParentID)
+		existingFile, err := files.GetFileByNameAndParent(ctx, session.UserID, session.Filename, session.ParentID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("check existing file: %w", err)
+		}
+
+		if existingFile != nil && existingFile.IsDirectory {
+			return fmt.Errorf("a folder named %q already exists in this destination", session.Filename)
 		}
 
 		if existingFile != nil && !existingFile.IsDirectory {
@@ -584,27 +589,51 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 			return err
 		}
 
-		// 8. Record in Journal for Delta Synchronization
+		// 8. Record in Journal for Delta Synchronization (Fan-out to all collaborators)
 		if s.journal != nil {
 			action := domain.ActionFileCreated
 			if existingFile != nil && !existingFile.IsDirectory {
 				action = domain.ActionFileUpdated
 			}
-			jEntry := &domain.JournalEntry{
-				UserID:      session.UserID,
-				FileID:      result.FileID,
-				Action:      action,
-				ParentID:    session.ParentID,
-				Name:        session.Filename,
-				IsDirectory: false,
-				SizeBytes:   session.TotalSize,
-				Status:      "ACTIVE",
+			recordedAction = action
+
+			recipientSet := map[string]struct{}{
+				session.UserID: {},
 			}
-			cursor, err := s.journal.WithTx(tx).Record(ctx, jEntry)
+			if s.perms != nil {
+				if collabs, err := perms.FindCollaboratorUserIDs(ctx, result.FileID); err == nil {
+					for _, c := range collabs {
+						if c != "" {
+							recipientSet[c] = struct{}{}
+						}
+					}
+				}
+			}
+
+			entries := make([]*domain.JournalEntry, 0, len(recipientSet))
+			for rUID := range recipientSet {
+				entries = append(entries, &domain.JournalEntry{
+					UserID:      rUID,
+					FileID:      result.FileID,
+					Action:      action,
+					ParentID:    session.ParentID,
+					Name:        session.Filename,
+					IsDirectory: false,
+					SizeBytes:   session.TotalSize,
+					Status:      "ACTIVE",
+				})
+			}
+
+			cursors, err := s.journal.WithTx(tx).BatchRecord(ctx, entries)
 			if err != nil {
-				return fmt.Errorf("record journal entry: %w", err)
+				return fmt.Errorf("record journal entries: %w", err)
 			}
-			recordedCursor = cursor
+			recordedCursors = make(map[string]int64)
+			for i, e := range entries {
+				if i < len(cursors) {
+					recordedCursors[e.UserID] = cursors[i]
+				}
+			}
 		}
 
 		result.SessionID = req.SessionID
@@ -639,14 +668,14 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 		},
 	})
 
-	// Broadcast incremental delta event
-	if recordedCursor > 0 {
-		s.notifier.NotifyUser(uploaderID, wsSync.NotificationEvent{
+	// Broadcast incremental delta event to uploader and all collaborators
+	for uID, cursor := range recordedCursors {
+		s.notifier.NotifyUser(uID, wsSync.NotificationEvent{
 			Type: wsSync.EventSyncDelta,
 			Payload: map[string]any{
-				"cursor":  recordedCursor,
+				"cursor":  cursor,
 				"file_id": result.FileID,
-				"action":  domain.ActionFileCreated,
+				"action":  recordedAction,
 			},
 		})
 	}

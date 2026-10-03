@@ -35,6 +35,7 @@ type JournalEntry struct {
 // JournalRepository defines operations on the append-only journal table.
 type JournalRepository interface {
 	Record(ctx context.Context, entry *JournalEntry) (int64, error)
+	BatchRecord(ctx context.Context, entries []*JournalEntry) ([]int64, error)
 	ListSince(ctx context.Context, userID string, sinceCursor int64, limit int) ([]*JournalEntry, int64, bool, error)
 	GetLatestCursor(ctx context.Context, userID string) (int64, error)
 }

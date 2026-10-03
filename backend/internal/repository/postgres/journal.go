@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
+	"time"
 
 	"go-drive-clone/internal/domain"
 )
@@ -52,6 +54,75 @@ func (r *JournalRepository) Record(ctx context.Context, entry *domain.JournalEnt
 	}
 	entry.Cursor = cursor
 	return cursor, nil
+}
+
+// BatchRecord inserts multiple journal entries in a single multi-row query.
+func (r *JournalRepository) BatchRecord(ctx context.Context, entries []*domain.JournalEntry) ([]int64, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	if len(entries) == 1 {
+		c, err := r.Record(ctx, entries[0])
+		if err != nil {
+			return nil, err
+		}
+		return []int64{c}, nil
+	}
+
+	var b strings.Builder
+	b.WriteString(`INSERT INTO journal_entries (
+		user_id, file_id, action, parent_id, name,
+		is_directory, size_bytes, mime_type, status, thumbnail_url
+	) VALUES `)
+
+	args := make([]any, 0, len(entries)*10)
+	for i, e := range entries {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		offset := i * 10
+		b.WriteString(fmt.Sprintf(
+			"($%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d, $%d)",
+			offset+1, offset+2, offset+3, offset+4, offset+5,
+			offset+6, offset+7, offset+8, offset+9, offset+10,
+		))
+		args = append(args,
+			e.UserID,
+			e.FileID,
+			e.Action,
+			e.ParentID,
+			e.Name,
+			e.IsDirectory,
+			e.SizeBytes,
+			e.MimeType,
+			e.Status,
+			e.ThumbnailURL,
+		)
+	}
+	b.WriteString(" RETURNING cursor, created_at")
+
+	rows, err := r.db.QueryContext(ctx, b.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("batch record journal entries: %w", err)
+	}
+	defer rows.Close()
+
+	cursors := make([]int64, 0, len(entries))
+	idx := 0
+	for rows.Next() {
+		var cursor int64
+		var createdAt time.Time
+		if err := rows.Scan(&cursor, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan batch journal entry: %w", err)
+		}
+		if idx < len(entries) {
+			entries[idx].Cursor = cursor
+			entries[idx].CreatedAt = createdAt
+			idx++
+		}
+		cursors = append(cursors, cursor)
+	}
+	return cursors, rows.Err()
 }
 
 // ListSince retrieves up to `limit` entries with cursor > sinceCursor for a user.

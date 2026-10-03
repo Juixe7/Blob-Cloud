@@ -183,13 +183,3 @@ func (r *UserRepository) UpdatePassword(ctx context.Context, userID, hashedPassw
 	return nil
 }
 
-// DeleteRefreshToken deletes/invalidates the specific refresh token session during logout.
-func (r *UserRepository) DeleteRefreshToken(ctx context.Context, refreshToken string) error {
-	const q = `DELETE FROM user_sessions WHERE id = $1 OR user_id = $1`
-	_, err := r.db.ExecContext(ctx, q, refreshToken)
-	if err != nil {
-		return fmt.Errorf("delete refresh token session: %w", err)
-	}
-	return nil
-}
-

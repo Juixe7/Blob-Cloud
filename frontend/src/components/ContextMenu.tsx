@@ -26,6 +26,7 @@ export interface ContextMenuActions {
   onCreateShortcut?: (item: FileItem) => void
   onSharePublic?: (item: FileItem) => void
   onVersionHistory?: (item: FileItem) => void
+  onUploadVersion?: (item: FileItem) => void
   onGetInfo?: (item: FileItem) => void
 }
 
@@ -207,6 +208,19 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
       )}
       {isOwnerOrEditor && !isQuarantined && (
         <MenuItem icon={<FolderInputIcon size={14} />} label="Move To" onClick={run(actions.onMove)} />
+      )}
+      {!isDirectory && actions.onUploadVersion && isOwnerOrEditor && !isQuarantined && (
+        <MenuItem
+          icon={
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="17 8 12 3 7 8" />
+              <line x1="12" y1="3" x2="12" y2="15" />
+            </svg>
+          }
+          label="Upload New Version"
+          onClick={run(actions.onUploadVersion)}
+        />
       )}
       {!isDirectory && actions.onVersionHistory && !isQuarantined && (
         <MenuItem

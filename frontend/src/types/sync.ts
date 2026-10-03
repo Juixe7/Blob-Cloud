@@ -30,8 +30,10 @@ export interface WSMessage<T = unknown> {
 export type JournalAction =
   | 'FILE_CREATED'
   | 'FILE_UPDATED'
-  | 'FILE_DELETED'
+  | 'FILE_RENAMED'
   | 'FILE_MOVED'
+  | 'FILE_TRASHED'
+  | 'FILE_DELETED'
   | 'FILE_RESTORED'
 
 /** A single append-only change log entry from GET /api/sync/delta. */

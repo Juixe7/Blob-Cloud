@@ -7,17 +7,10 @@ import (
 	"strings"
 
 	"go-drive-clone/internal/auth"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
 type revokeSessionRequest struct {
 	SessionID string `json:"session_id"`
-	Password  string `json:"password"`
-}
-
-type revokeAllRequest struct {
-	Password string `json:"password"`
 }
 
 // HandleListSessions implements GET /api/user/sessions.
@@ -53,7 +46,7 @@ func (s *Server) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleRevokeSession implements POST /api/user/sessions/revoke.
-// Requires password verification for security.
+// Revokes the targeted device session verified via the caller's active Bearer JWT.
 func (s *Server) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 	userID, currentSessionID, code, msg := s.userAndSessionFromBearer(r)
 	if code != 0 {
@@ -61,7 +54,7 @@ func (s *Server) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.sessions == nil || s.users == nil {
+	if s.sessions == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service unconfigured"})
 		return
 	}
@@ -73,26 +66,8 @@ func (s *Server) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.SessionID = strings.TrimSpace(req.SessionID)
-	req.Password = strings.TrimSpace(req.Password)
-
 	if req.SessionID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session_id is required"})
-		return
-	}
-	if req.Password == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password is required to confirm session revocation"})
-		return
-	}
-
-	// Verify user password
-	user, err := s.users.GetByID(r.Context(), userID)
-	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
-		return
-	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "incorrect password"})
 		return
 	}
 
@@ -121,7 +96,7 @@ func (s *Server) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleRevokeAllOtherSessions implements POST /api/user/sessions/revoke-all.
-// Requires password verification.
+// Revokes all sessions belonging to the user except the current caller.
 func (s *Server) HandleRevokeAllOtherSessions(w http.ResponseWriter, r *http.Request) {
 	userID, currentSessionID, code, msg := s.userAndSessionFromBearer(r)
 	if code != 0 {
@@ -129,32 +104,8 @@ func (s *Server) HandleRevokeAllOtherSessions(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if s.sessions == nil || s.users == nil {
+	if s.sessions == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service unconfigured"})
-		return
-	}
-
-	var req revokeAllRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body: " + err.Error()})
-		return
-	}
-
-	req.Password = strings.TrimSpace(req.Password)
-	if req.Password == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password is required to confirm revoking all other sessions"})
-		return
-	}
-
-	// Verify user password
-	user, err := s.users.GetByID(r.Context(), userID)
-	if err != nil {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
-		return
-	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "incorrect password"})
 		return
 	}
 

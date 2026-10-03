@@ -119,6 +119,7 @@ func (r *PermissionRepository) CheckUserPermission(ctx context.Context, fileID s
 			WHERE p.grantee_email = $2
 			  AND p.status = 'ACCEPTED'
 			  AND p.role IN (%s)
+			  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
 		) AS allowed
 	`, rolePlaceholders.String())
 
@@ -290,3 +291,59 @@ func (r *PermissionRepository) IsBlocked(ctx context.Context, userID string, sen
 	}
 	return blocked, nil
 }
+
+// FindCollaboratorUserIDs resolves all users who have access to fileID:
+// 1. All users with direct or inherited ACCEPTED and unexpired permissions.
+// 2. The owner of the file itself and all ancestor folder owners.
+func (r *PermissionRepository) FindCollaboratorUserIDs(ctx context.Context, fileID string) ([]string, error) {
+	if fileID == "" {
+		return nil, nil
+	}
+
+	const q = `
+		WITH RECURSIVE chain AS (
+			-- Anchor: target file itself
+			SELECT id, parent_id, user_id
+			FROM files
+			WHERE id = $1
+			UNION ALL
+			-- Recurse: walk up to each ancestor folder
+			SELECT f.id, f.parent_id, f.user_id
+			FROM files f
+			JOIN chain c ON f.id = c.parent_id
+		)
+		-- 1. All users holding direct or inherited ACCEPTED and unexpired permissions
+		SELECT DISTINCT u.id::text
+		FROM chain c
+		JOIN permissions p ON c.id = p.file_id
+		JOIN users u ON LOWER(u.email) = LOWER(p.grantee_email)
+		WHERE p.status = 'ACCEPTED'
+		  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
+		UNION
+		-- 2. All owners of any node in the chain
+		SELECT DISTINCT user_id::text
+		FROM chain
+	`
+	rows, err := r.db.QueryContext(ctx, q, fileID)
+	if err != nil {
+		return nil, fmt.Errorf("find collaborator user ids: %w", err)
+	}
+	defer rows.Close()
+
+	var userIDs []string
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			return nil, fmt.Errorf("scan collaborator user id: %w", err)
+		}
+		if uid != "" {
+			if _, ok := seen[uid]; !ok {
+				seen[uid] = struct{}{}
+				userIDs = append(userIDs, uid)
+			}
+		}
+	}
+	return userIDs, rows.Err()
+}
+

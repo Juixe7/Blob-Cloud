@@ -84,13 +84,13 @@ apiClient.interceptors.response.use(
       // Collapse concurrent 401s into a single refresh round-trip.
       const newToken = await withRefreshLock(async () => {
         // Use a bare axios call so the response interceptor doesn't recurse.
-        const res = await axios.post<{ token: string }>(
+        const res = await axios.post<{ token: string; refresh_token?: string }>(
           `${apiClient.defaults.baseURL}/auth/refresh`,
           { refresh_token: refreshToken },
           { headers: { 'Content-Type': 'application/json' } },
         )
         const next = res.data.token
-        setTokens(next)
+        setTokens(next, res.data.refresh_token)
         return next
       })
 

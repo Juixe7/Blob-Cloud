@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback, type ChangeEvent } from 'react'
 import { Modal } from './ui/Modal'
 import { Button } from './ui/Button'
 import { Spinner } from './ui/Spinner'
 import { formatDate, formatFileSize } from '../lib/format'
 import { apiClient } from '../lib/api'
 import { useToast } from './Toast'
+import { useUpload, UPLOAD_COMPLETE_EVENT } from '../context/UploadContext'
 import type { FileItem } from '../types/file'
 
 export interface FileVersion {
@@ -32,19 +33,45 @@ export function VersionHistoryModal({
   const [loading, setLoading] = useState(false)
   const [restoring, setRestoring] = useState<string | null>(null)
   const { push: pushToast } = useToast()
+  const { uploadFile } = useUpload()
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const fetchVersions = useCallback(() => {
+    if (!file) return
+    setLoading(true)
+    apiClient
+      .get<{ versions: FileVersion[] }>(`/files/${file.id}/versions`)
+      .then((res) => setVersions(res.data.versions || []))
+      .catch(() => pushToast({ message: 'Failed to load version history.', variant: 'error' }))
+      .finally(() => setLoading(false))
+  }, [file, pushToast])
 
   useEffect(() => {
     if (open && file) {
-      setLoading(true)
-      apiClient
-        .get<{ versions: FileVersion[] }>(`/files/${file.id}/versions`)
-        .then((res) => setVersions(res.data.versions || []))
-        .catch(() => pushToast({ message: 'Failed to load version history.', variant: 'error' }))
-        .finally(() => setLoading(false))
+      fetchVersions()
     } else {
       setVersions([])
     }
-  }, [open, file])
+  }, [open, file, fetchVersions])
+
+  useEffect(() => {
+    if (!open || !file) return
+    const onUploadDone = () => {
+      fetchVersions()
+      onRestoreComplete()
+    }
+    window.addEventListener(UPLOAD_COMPLETE_EVENT, onUploadDone)
+    return () => window.removeEventListener(UPLOAD_COMPLETE_EVENT, onUploadDone)
+  }, [open, file, fetchVersions, onRestoreComplete])
+
+  const handleUploadNewVersion = (e: ChangeEvent<HTMLInputElement>) => {
+    const selected = e.target.files?.[0]
+    if (!selected || !file) return
+    const versioned = new File([selected], file.name, { type: selected.type })
+    uploadFile(versioned, file.parent_id)
+    pushToast({ message: `Uploading new version for ${file.name}...`, variant: 'info' })
+    e.target.value = ''
+  }
 
   const handleRestore = async (versionId: string) => {
     if (!file) return
@@ -67,11 +94,33 @@ export function VersionHistoryModal({
   return (
     <Modal open={open} onClose={onClose} label="Version History" maxWidthClass="max-w-xl">
       <div className="space-y-5">
-        <div>
-          <h2 className="text-xl font-bold text-slate-900 dark:text-zinc-50">Version History</h2>
-          <p className="text-xs text-slate-500 dark:text-zinc-400 mt-1">
-            Restore previous versions of <span className="font-semibold text-slate-700 dark:text-zinc-300">{file.name}</span>.
-          </p>
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-xl font-bold text-slate-900 dark:text-zinc-50">Version History</h2>
+            <p className="text-xs text-slate-500 dark:text-zinc-400 mt-1">
+              Restore or update versions of <span className="font-semibold text-slate-700 dark:text-zinc-300">{file.name}</span>.
+            </p>
+          </div>
+          <div>
+            <input
+              type="file"
+              ref={fileInputRef}
+              className="hidden"
+              onChange={handleUploadNewVersion}
+            />
+            <Button
+              variant="primary"
+              className="py-1.5 px-3 text-xs flex items-center gap-1.5"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+              Upload New Version
+            </Button>
+          </div>
         </div>
 
         {loading ? (

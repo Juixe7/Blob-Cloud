@@ -60,10 +60,38 @@ func (s *FileService) WithNotifier(notifier wsSync.Notifier) *FileService {
 	return s
 }
 
-func (s *FileService) recordAndNotify(ctx context.Context, userID, fileID, action string, file *domain.File) {
-	if s.journal == nil {
+func (s *FileService) recordAndNotify(ctx context.Context, userID, fileID, action string, file *domain.File, preResolvedRecipients ...string) {
+	if s.journal == nil && s.notifier == nil {
 		return
 	}
+
+	// 1. Resolve all recipients (actor + pre-resolved + collaborators & owners via DB)
+	recipientSet := make(map[string]struct{})
+	if userID != "" {
+		recipientSet[userID] = struct{}{}
+	}
+	for _, r := range preResolvedRecipients {
+		if r != "" {
+			recipientSet[r] = struct{}{}
+		}
+	}
+
+	if len(preResolvedRecipients) == 0 && s.perms != nil && fileID != "" {
+		if collabs, err := s.perms.FindCollaboratorUserIDs(ctx, fileID); err == nil {
+			for _, c := range collabs {
+				if c != "" {
+					recipientSet[c] = struct{}{}
+				}
+			}
+		} else {
+			s.log.Warn("failed to resolve collaborators for sync fanout", "file_id", fileID, "err", err)
+		}
+	}
+
+	if len(recipientSet) == 0 {
+		return
+	}
+
 	name := ""
 	var parentID *string
 	isDir := false
@@ -78,31 +106,54 @@ func (s *FileService) recordAndNotify(ctx context.Context, userID, fileID, actio
 		status = file.Status
 		mimeType = file.MimeType
 	}
-	jEntry := &domain.JournalEntry{
-		UserID:      userID,
-		FileID:      fileID,
-		Action:      action,
-		ParentID:    parentID,
-		Name:        name,
-		IsDirectory: isDir,
-		SizeBytes:   sizeBytes,
-		MimeType:    mimeType,
-		Status:      status,
-	}
-	cursor, err := s.journal.Record(ctx, jEntry)
-	if err != nil {
-		s.log.Error("failed to record journal entry", "file_id", fileID, "action", action, "err", err)
-		return
-	}
-	if s.notifier != nil {
-		s.notifier.NotifyUser(userID, wsSync.NotificationEvent{
-			Type: wsSync.EventSyncDelta,
-			Payload: map[string]any{
-				"cursor":  cursor,
-				"file_id": fileID,
-				"action":  action,
-			},
+
+	// 2. Prepare journal entries for batch insert
+	entries := make([]*domain.JournalEntry, 0, len(recipientSet))
+	for rUID := range recipientSet {
+		entries = append(entries, &domain.JournalEntry{
+			UserID:      rUID,
+			FileID:      fileID,
+			Action:      action,
+			ParentID:    parentID,
+			Name:        name,
+			IsDirectory: isDir,
+			SizeBytes:   sizeBytes,
+			MimeType:    mimeType,
+			Status:      status,
 		})
+	}
+
+	if s.journal != nil {
+		cursors, err := s.journal.BatchRecord(ctx, entries)
+		if err != nil {
+			s.log.Error("failed to record journal entries", "file_id", fileID, "action", action, "err", err)
+		} else if s.notifier != nil {
+			for i, e := range entries {
+				cursor := int64(0)
+				if i < len(cursors) {
+					cursor = cursors[i]
+				}
+				s.notifier.NotifyUser(e.UserID, wsSync.NotificationEvent{
+					Type: wsSync.EventSyncDelta,
+					Payload: map[string]any{
+						"cursor":  cursor,
+						"file_id": fileID,
+						"action":  action,
+					},
+				})
+			}
+		}
+	} else if s.notifier != nil {
+		for rUID := range recipientSet {
+			s.notifier.NotifyUser(rUID, wsSync.NotificationEvent{
+				Type: wsSync.EventSyncDelta,
+				Payload: map[string]any{
+					"cursor":  0,
+					"file_id": fileID,
+					"action":  action,
+				},
+			})
+		}
 	}
 }
 
@@ -210,6 +261,12 @@ func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req
 	// Also guard the simple self-parent case.
 	if updated.ParentID != nil && *updated.ParentID == existing.ID {
 		return nil, fmt.Errorf("cannot move a folder into itself")
+	}
+
+	// Collision guard: ensure no active item with the target name exists in destination
+	clash, err := s.files.GetFileByNameAndParent(ctx, existing.UserID, updated.Name, updated.ParentID)
+	if err == nil && clash != nil && clash.ID != existing.ID {
+		return nil, fmt.Errorf("an item named %q already exists in the destination folder", updated.Name)
 	}
 
 	// 5. Persist.
@@ -348,6 +405,13 @@ func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string
 		return nil, fmt.Errorf("access denied: %s", user.Email)
 	}
 
+	var preResolvedRecipients []string
+	if s.perms != nil {
+		if collabs, err := s.perms.FindCollaboratorUserIDs(ctx, fileID); err == nil {
+			preResolvedRecipients = collabs
+		}
+	}
+
 	deletedCount, orphanHashes, err := s.files.DeleteRecursive(ctx, fileID, userID)
 	if err != nil {
 		return nil, fmt.Errorf("delete recursive: %w", err)
@@ -362,7 +426,7 @@ func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string
 		"file_id", fileID, "user_id", userID,
 		"deleted_count", deletedCount,
 		"orphaned_blocks", len(orphanHashes))
-	s.recordAndNotify(ctx, userID, fileID, domain.ActionFileDeleted, nil)
+	s.recordAndNotify(ctx, userID, fileID, domain.ActionFileDeleted, nil, preResolvedRecipients...)
 
 	return &DeleteResult{
 		Status:       "success",

@@ -149,25 +149,29 @@ func (s *Server) HandleGetPublicShare(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 		return
 	}
+	if file.DeletedAt != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file has been deleted"})
+		return
+	}
 
 	// Remove sensitive info
 	file.Role = link.AccessTier
 	file.UserID = ""
 
 	var children []*domain.File
-	if file.IsDirectory {
-		children, err = s.fileOps.ListDirectory(r.Context(), "public", &file.ID)
-		if err != nil {
-			// Actually we can't use ListDirectory as "public" unless we bypass owner checks.
-			// Let's create a special repo method or bypass.
-			// For simplicity, we just use GetSubtreeForItems or write a quick ListPublicDirectory in service.
-			// We'll leave children empty for now and fetch them later if needed.
+	if file.IsDirectory && s.files != nil {
+		children, err = s.files.ListDirectory(r.Context(), "", &file.ID)
+		if err == nil {
+			for _, child := range children {
+				child.Role = link.AccessTier
+				child.UserID = ""
+			}
 		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"file": file,
-		"children": children, // Will be handled if needed
+		"file":     file,
+		"children": children,
 	})
 }
 
@@ -180,6 +184,11 @@ func (s *Server) HandleVerifyPublicShare(w http.ResponseWriter, r *http.Request)
 	link, err := s.shares.GetByToken(r.Context(), token)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "link not found"})
+		return
+	}
+
+	if link.ExpiresAt != nil && time.Now().After(*link.ExpiresAt) {
+		writeJSON(w, http.StatusGone, map[string]string{"error": "link expired"})
 		return
 	}
 
@@ -222,6 +231,11 @@ func (s *Server) HandlePublicDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if link.ExpiresAt != nil && time.Now().After(*link.ExpiresAt) {
+		writeJSON(w, http.StatusGone, map[string]string{"error": "link expired"})
+		return
+	}
+
 	// Verify JWT
 	cookie, err := r.Cookie("share_session_" + token)
 	if link.PasswordHash != nil {
@@ -237,15 +251,15 @@ func (s *Server) HandlePublicDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Bypass Auth context, just download the file
-	// Since we are reusing HandleDownload, we can inject a mock context or just call zipOps stream directly.
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	// Because we can't easily hijack HandleDownload, we use zipOps
-	// Wait, we can just call zipOps.StreamItemsZip with the file owner's ID? 
-	// The problem is we need the file's owner ID to bypass checks.
 	file, err := s.fileOps.GetFile(r.Context(), link.FileID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		return
+	}
+	if file.DeletedAt != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file has been deleted"})
 		return
 	}
 	if file.Status == "QUARANTINED" {
@@ -270,6 +284,11 @@ func (s *Server) HandlePublicRecordView(w http.ResponseWriter, r *http.Request) 
 	link, err := s.shares.GetByToken(r.Context(), token)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "link not found"})
+		return
+	}
+
+	if link.ExpiresAt != nil && time.Now().After(*link.ExpiresAt) {
+		writeJSON(w, http.StatusGone, map[string]string{"error": "link expired"})
 		return
 	}
 

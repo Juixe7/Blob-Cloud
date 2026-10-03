@@ -155,4 +155,62 @@ func TestShareInvitationsWorkflow(t *testing.T) {
 	if !hasAccess {
 		t.Fatalf("expected ACCEPTED permission to confer access")
 	}
+
+	// 8. FindCollaboratorUserIDs: should return both owner and recipient!
+	collabs, err := perms.FindCollaboratorUserIDs(ctx, file.ID)
+	if err != nil {
+		t.Fatalf("FindCollaboratorUserIDs error: %v", err)
+	}
+	collabMap := make(map[string]bool)
+	for _, c := range collabs {
+		collabMap[c] = true
+	}
+	if !collabMap[owner.ID] {
+		t.Errorf("expected owner %s in collaborators list, got %v", owner.ID, collabs)
+	}
+	if !collabMap[recipient.ID] {
+		t.Errorf("expected recipient %s in collaborators list, got %v", recipient.ID, collabs)
+	}
+
+	// 9. Test folder inheritance: create folder shared with recipient, child file in folder
+	folder := &domain.File{
+		UserID:      owner.ID,
+		Name:        fmt.Sprintf("shared-folder-%d", suffix),
+		IsDirectory: true,
+		Status:      "ACTIVE",
+	}
+	if err := files.Create(ctx, folder); err != nil {
+		t.Fatalf("create folder error: %v", err)
+	}
+	if err := perms.GrantPermission(ctx, &domain.Permission{
+		FileID:       folder.ID,
+		GranteeEmail: recipientEmail,
+		Role:         domain.RoleEditor,
+		Status:       domain.PermissionStatusAccepted,
+	}); err != nil {
+		t.Fatalf("grant folder permission error: %v", err)
+	}
+
+	childFile := &domain.File{
+		UserID:      owner.ID,
+		ParentID:    &folder.ID,
+		Name:        fmt.Sprintf("child-%d.txt", suffix),
+		IsDirectory: false,
+		Status:      "ACTIVE",
+	}
+	if err := files.Create(ctx, childFile); err != nil {
+		t.Fatalf("create child file error: %v", err)
+	}
+
+	childCollabs, err := perms.FindCollaboratorUserIDs(ctx, childFile.ID)
+	if err != nil {
+		t.Fatalf("FindCollaboratorUserIDs for child error: %v", err)
+	}
+	childCollabMap := make(map[string]bool)
+	for _, c := range childCollabs {
+		childCollabMap[c] = true
+	}
+	if !childCollabMap[owner.ID] || !childCollabMap[recipient.ID] {
+		t.Errorf("expected both owner and recipient for child file via inherited folder perm, got %v", childCollabs)
+	}
 }

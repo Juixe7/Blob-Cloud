@@ -73,8 +73,6 @@ type UserRepository interface {
 	MarkResetTokenUsed(ctx context.Context, token string) error
 	// UpdatePassword updates user's password hash and revokes all active sessions.
 	UpdatePassword(ctx context.Context, userID, hashedPassword string) error
-	// DeleteRefreshToken revokes/deletes a specific refresh token session.
-	DeleteRefreshToken(ctx context.Context, refreshToken string) error
 }
 
 

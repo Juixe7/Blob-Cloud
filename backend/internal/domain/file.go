@@ -110,6 +110,8 @@ type FileRepository interface {
 	GetResolvedPermission(ctx context.Context, fileID string, userEmail string) (string, error)
 	// GetFolderByNameAndParent checks if a non-deleted directory with name and parentID exists for user.
 	GetFolderByNameAndParent(ctx context.Context, userID, name string, parentID *string) (*File, error)
+	// GetFileByNameAndParent checks if an active file or folder with name and parentID exists for user.
+	GetFileByNameAndParent(ctx context.Context, userID, name string, parentID *string) (*File, error)
 	// ListDirectory returns the immediate children of parentID for a user.
 	// A nil parentID lists the user's root (top-level) entries.
 	ListDirectory(ctx context.Context, userID string, parentID *string) ([]*File, error)

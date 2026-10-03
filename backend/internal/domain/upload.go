@@ -132,4 +132,6 @@ type PermissionRepository interface {
 	BlockUser(ctx context.Context, userID string, blockedEmail string) error
 	// IsBlocked checks whether userID has blocked senderEmail.
 	IsBlocked(ctx context.Context, userID string, senderEmail string) (bool, error)
+	// FindCollaboratorUserIDs resolves all users who have access to fileID (direct, inherited from ancestor folders, or owners).
+	FindCollaboratorUserIDs(ctx context.Context, fileID string) ([]string, error)
 }

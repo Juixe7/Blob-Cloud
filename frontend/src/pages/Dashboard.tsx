@@ -39,6 +39,7 @@ import { PublicShareModal } from '../components/PublicShareModal'
 import { UploadQueue } from '../components/UploadQueue'
 import { downloadEncryptedFile } from '../lib/download'
 import { VersionHistoryModal } from '../components/VersionHistoryModal'
+import { UploadConflictModal } from '../components/UploadConflictModal'
 import { GetInfoModal } from '../components/GetInfoModal'
 import { DetailPanel } from '../components/DetailPanel'
 import { PendingInvitationsBanner } from '../components/PendingInvitationsBanner'
@@ -175,6 +176,13 @@ export function Dashboard() {
   const [versionHistoryTarget, setVersionHistoryTarget] = useState<FileItem | null>(null)
   const [infoTarget, setInfoTarget] = useState<FileItem | null>(null)
   const [isDetailsOpen, setIsDetailsOpen] = useState(false)
+
+  // File Versioning & Conflict State
+  const [pendingConflicts, setPendingConflicts] = useState<
+    Array<{ file: File; parentId: string | null; passphrase?: string }>
+  >([])
+  const versionUploadTargetRef = useRef<FileItem | null>(null)
+  const versionFileInputRef = useRef<HTMLInputElement>(null)
 
   // Share Invitations & Safety Gate state (Option A)
   const [invitations, setInvitations] = useState<ShareInvitation[]>([])
@@ -677,6 +685,43 @@ export function Dashboard() {
                   break
                 }
 
+                case 'FILE_RENAMED': {
+                  const existingIdx = updated.findIndex((i) => i.id === entry.file_id)
+                  if (existingIdx >= 0) {
+                    updated[existingIdx] = {
+                      ...updated[existingIdx],
+                      name: entry.name,
+                      updated_at: entry.created_at,
+                    }
+                  }
+                  break
+                }
+
+                case 'FILE_TRASHED': {
+                  if (activeNavRef.current !== 'trash') {
+                    updated = updated.filter((i) => i.id !== entry.file_id)
+                  } else {
+                    const existingIdx = updated.findIndex((i) => i.id === entry.file_id)
+                    if (existingIdx < 0) {
+                      updated.push({
+                        id: entry.file_id,
+                        user_id: entry.user_id,
+                        name: entry.name,
+                        status: (entry.status as FileStatus) || 'ACTIVE',
+                        parent_id: entry.parent_id,
+                        is_directory: entry.is_directory,
+                        size_bytes: entry.size_bytes,
+                        mime_type: entry.mime_type,
+                        thumbnail_url: entry.thumbnail_url || fallbackThumb,
+                        created_at: entry.created_at,
+                        updated_at: entry.created_at,
+                        deleted_at: entry.created_at,
+                      })
+                    }
+                  }
+                  break
+                }
+
                 case 'FILE_DELETED': {
                   updated = updated.filter((i) => i.id !== entry.file_id)
                   break
@@ -924,6 +969,10 @@ export function Dashboard() {
       onCreateShortcut: (item) => setShortcutTarget(item),
       onSharePublic: (item) => setPublicShareTarget(item),
       onVersionHistory: (item) => setVersionHistoryTarget(item),
+      onUploadVersion: (item) => {
+        versionUploadTargetRef.current = item
+        versionFileInputRef.current?.click()
+      },
       onGetInfo: (item) => setInfoTarget(item),
     }),
     [handleDownload, handleRestore, navigateToFolder],
@@ -1143,19 +1192,96 @@ export function Dashboard() {
     }
   }, [isE2EEnabled])
 
+  const getAvailableFileName = (originalName: string, existingNames: Set<string>): string => {
+    const dotIndex = originalName.lastIndexOf('.')
+    const base = dotIndex !== -1 ? originalName.slice(0, dotIndex) : originalName
+    const ext = dotIndex !== -1 ? originalName.slice(dotIndex) : ''
+    let counter = 1
+    let candidate = `${base} (${counter})${ext}`
+    while (existingNames.has(candidate.toLowerCase())) {
+      counter++
+      candidate = `${base} (${counter})${ext}`
+    }
+    return candidate
+  }
+
+  const processUploadFiles = useCallback(
+    (files: File[], parentId: string | null, passphrase?: string) => {
+      const conflicts: Array<{ file: File; parentId: string | null; passphrase?: string }> = []
+      for (const file of files) {
+        const lowerName = file.name.toLowerCase()
+        const match = items.find((it) => it.name.toLowerCase() === lowerName)
+        if (match) {
+          if (match.is_directory) {
+            pushToast({
+              variant: 'error',
+              message: `Cannot upload "${file.name}": A folder with this name already exists.`,
+            })
+          } else {
+            conflicts.push({ file, parentId, passphrase })
+          }
+        } else {
+          uploadFile(file, parentId, undefined, passphrase)
+        }
+      }
+      if (conflicts.length > 0) {
+        setPendingConflicts((prev) => [...prev, ...conflicts])
+      }
+    },
+    [items, uploadFile, pushToast],
+  )
+
+  const handleResolveConflictUpdate = useCallback(() => {
+    const current = pendingConflicts[0]
+    if (current) {
+      uploadFile(current.file, current.parentId, undefined, current.passphrase)
+      pushToast({ message: `Updating version for ${current.file.name}...`, variant: 'info' })
+    }
+    setPendingConflicts((prev) => prev.slice(1))
+  }, [pendingConflicts, uploadFile, pushToast])
+
+  const handleResolveConflictKeepBoth = useCallback(() => {
+    const current = pendingConflicts[0]
+    if (current) {
+      const existingNames = new Set(items.map((i) => i.name.toLowerCase()))
+      const newName = getAvailableFileName(current.file.name, existingNames)
+      const renamed = new File([current.file], newName, { type: current.file.type })
+      uploadFile(renamed, current.parentId, undefined, current.passphrase)
+      pushToast({ message: `Uploading copy ${newName}...`, variant: 'info' })
+    }
+    setPendingConflicts((prev) => prev.slice(1))
+  }, [pendingConflicts, items, uploadFile, pushToast])
+
+  const handleResolveConflictCancel = useCallback(() => {
+    setPendingConflicts((prev) => prev.slice(1))
+  }, [])
+
+  const handleVersionFileChange = useCallback(
+    (e: ChangeEvent<HTMLInputElement>) => {
+      const selected = e.target.files?.[0]
+      const target = versionUploadTargetRef.current
+      if (selected && target) {
+        const versioned = new File([selected], target.name, { type: selected.type })
+        uploadFile(versioned, target.parent_id)
+        pushToast({ message: `Uploading new version for ${target.name}...`, variant: 'info' })
+      }
+      e.target.value = ''
+      versionUploadTargetRef.current = null
+    },
+    [uploadFile, pushToast],
+  )
+
   /** Handle one or more files selected from the picker. */
   const handleFileChange = useCallback(
     (e: ChangeEvent<HTMLInputElement>) => {
       const files = e.target.files
       if (files) {
-        for (const file of Array.from(files)) {
-          uploadFile(file, currentFolderId)
-        }
+        processUploadFiles(Array.from(files), currentFolderId)
       }
       // Reset so selecting the same file again still fires onChange.
       e.target.value = ''
     },
-    [uploadFile, currentFolderId],
+    [processUploadFiles, currentFolderId],
   )
 
   const handleEncryptedFileChange = useCallback(
@@ -1197,12 +1323,10 @@ export function Dashboard() {
       }
       const files = e.dataTransfer.files
       if (files) {
-        for (const file of Array.from(files)) {
-          uploadFile(file, currentFolderId)
-        }
+        processUploadFiles(Array.from(files), currentFolderId)
       }
     },
-    [uploadFile, currentFolderId, isInTrash, pushToast],
+    [processUploadFiles, currentFolderId, isInTrash, pushToast],
   )
 
   // Refresh the listing incrementally when any upload completes.
@@ -1283,6 +1407,16 @@ export function Dashboard() {
         multiple
         className="hidden"
         onChange={handleEncryptedFileChange}
+        aria-hidden="true"
+        tabIndex={-1}
+      />
+
+      {/* Hidden native file input for direct context-menu version upload */}
+      <input
+        ref={versionFileInputRef}
+        type="file"
+        className="hidden"
+        onChange={handleVersionFileChange}
         aria-hidden="true"
         tabIndex={-1}
       />
@@ -1546,9 +1680,7 @@ export function Dashboard() {
           if (pendingEncryptedUpload.isFolder) {
             void uploadFolder(pendingEncryptedUpload.files, currentFolderId, passphrase)
           } else {
-            for (const file of pendingEncryptedUpload.files) {
-              uploadFile(file, currentFolderId, undefined, passphrase)
-            }
+            processUploadFiles(pendingEncryptedUpload.files, currentFolderId, passphrase)
           }
           setPendingEncryptedUpload(null)
           pushToast({ message: 'Upload started with encryption.', variant: 'success' })
@@ -1557,6 +1689,15 @@ export function Dashboard() {
 
       {/* Floating upload queue overlay */}
       <UploadQueue />
+
+      {/* Upload Conflict Modal (Update Version vs Keep Both) */}
+      <UploadConflictModal
+        open={pendingConflicts.length > 0}
+        onClose={handleResolveConflictCancel}
+        fileName={pendingConflicts[0]?.file.name || ''}
+        onUpdateVersion={handleResolveConflictUpdate}
+        onKeepBoth={handleResolveConflictKeepBoth}
+      />
 
       {/* Phase 12: File Versioning Modal */}
       <VersionHistoryModal

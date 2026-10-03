@@ -126,7 +126,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const res = await axios.post<AuthResponse>('/api/auth/refresh', {
           refresh_token: refresh,
         })
-        applyTokens(res.data.token, refresh)
+        applyTokens(res.data.token, res.data.refresh_token || refresh)
       } catch {
         wipeSession()
       } finally {

@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { Modal } from './ui/Modal'
 import { Button } from './ui/Button'
 import { Spinner } from './ui/Spinner'
-import PasswordConfirmModal from './PasswordConfirmModal'
 import { formatDate } from '../lib/format'
 import { apiClient } from '../lib/api'
 import { useAuth } from '../hooks/useAuth'
@@ -35,24 +34,32 @@ export function ActiveSessionsModal({
   onRefreshSessions,
 }: ActiveSessionsModalProps) {
   const { logout } = useAuth()
-  const [revokeModalOpen, setRevokeModalOpen] = useState(false)
-  const [targetSessionId, setTargetSessionId] = useState<string | null>(null)
-  const [isRevokeAll, setIsRevokeAll] = useState(false)
+  const [revokingId, setRevokingId] = useState<string | null>(null)
+  const [revokingAll, setRevokingAll] = useState(false)
 
-  const handleConfirmRevoke = async (password: string) => {
-    if (isRevokeAll) {
-      await apiClient.post('/user/sessions/revoke-all', { password })
-      await onRefreshSessions()
-    } else if (targetSessionId) {
+  const handleRevokeSession = async (sessionId: string) => {
+    setRevokingId(sessionId)
+    try {
       const res = await apiClient.post<{ is_current_revoked: boolean }>('/user/sessions/revoke', {
-        session_id: targetSessionId,
-        password,
+        session_id: sessionId,
       })
       if (res.data.is_current_revoked) {
         logout()
       } else {
         await onRefreshSessions()
       }
+    } finally {
+      setRevokingId(null)
+    }
+  }
+
+  const handleRevokeAll = async () => {
+    setRevokingAll(true)
+    try {
+      await apiClient.post('/user/sessions/revoke-all')
+      await onRefreshSessions()
+    } finally {
+      setRevokingAll(false)
     }
   }
 
@@ -75,13 +82,10 @@ export function ActiveSessionsModal({
               <Button
                 variant="secondary"
                 className="py-1 px-3 text-xs text-rose-600 hover:bg-rose-500/10 dark:text-rose-400"
-                onClick={() => {
-                  setIsRevokeAll(true)
-                  setTargetSessionId(null)
-                  setRevokeModalOpen(true)
-                }}
+                onClick={handleRevokeAll}
+                disabled={revokingAll}
               >
-                Sign Out All Other Devices
+                {revokingAll ? 'Signing Out...' : 'Sign Out All Other Devices'}
               </Button>
             )}
           </div>
@@ -131,13 +135,10 @@ export function ActiveSessionsModal({
                       <Button
                         variant="secondary"
                         className="py-1 px-2.5 text-xs text-rose-600 hover:bg-rose-500/10 dark:text-rose-400"
-                        onClick={() => {
-                          setIsRevokeAll(false)
-                          setTargetSessionId(sess.id)
-                          setRevokeModalOpen(true)
-                        }}
+                        onClick={() => handleRevokeSession(sess.id)}
+                        disabled={revokingId === sess.id}
                       >
-                        Revoke
+                        {revokingId === sess.id ? 'Revoking...' : 'Revoke'}
                       </Button>
                     )}
                   </div>
@@ -153,23 +154,6 @@ export function ActiveSessionsModal({
           </div>
         </div>
       </Modal>
-
-      <PasswordConfirmModal
-        isOpen={revokeModalOpen}
-        onClose={() => {
-          setRevokeModalOpen(false)
-          setTargetSessionId(null)
-          setIsRevokeAll(false)
-        }}
-        onConfirm={handleConfirmRevoke}
-        title={isRevokeAll ? 'Sign Out All Other Devices' : 'Sign Out Device Session'}
-        description={
-          isRevokeAll
-            ? 'Enter your account password to confirm signing out all other logged-in device sessions.'
-            : 'Enter your account password to confirm revoking access for this device session.'
-        }
-        confirmButtonText={isRevokeAll ? 'Sign Out All Others' : 'Revoke Access'}
-      />
     </>
   )
 }
