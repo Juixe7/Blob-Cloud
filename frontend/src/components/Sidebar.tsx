@@ -363,7 +363,7 @@ export function Sidebar({
         <div className="mx-3 mb-4 rounded border border-zinc-800 bg-zinc-900 p-2.5 shadow-sm">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={cn(isE2EEnabled ? 'text-violet-500' : 'text-zinc-500')}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={cn(isE2EEnabled ? 'text-amber-500' : 'text-zinc-500')}>
                 <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
                 <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
               </svg>
@@ -376,7 +376,7 @@ export function Sidebar({
               onClick={onToggleE2E}
               className={cn(
                 'relative inline-flex h-4 w-7 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none',
-                isE2EEnabled ? 'bg-violet-500' : 'bg-zinc-700'
+                isE2EEnabled ? 'bg-amber-500' : 'bg-zinc-700'
               )}
             >
               <span

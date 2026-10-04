@@ -114,8 +114,8 @@ export function SandboxedPreviewModal({
 
         {/* AI Summary if present */}
         {invitation.summary && (
-          <div className="rounded-lg border border-purple-500/20 bg-purple-500/5 p-3 text-xs">
-            <div className="flex items-center gap-1.5 font-medium text-purple-300">
+          <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 text-xs">
+            <div className="flex items-center gap-1.5 font-medium text-amber-300">
               <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <path d="M12 2v4m0 12v4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83M2 12h4m12 0h4M4.93 19.07l2.83-2.83m8.48-8.48l2.83-2.83" />
               </svg>

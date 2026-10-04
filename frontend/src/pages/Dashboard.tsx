@@ -824,7 +824,7 @@ export function Dashboard() {
           // Adaptive smart polling for background worker results (AI summary & thumbnails)
           if (payload.file_id) {
             const fileId = payload.file_id
-            const pollDelays = [3000, 4000, 5000] // adaptive checks at 3s, 7s, 12s
+            const pollDelays = [3000, 4000, 5000, 6000] // adaptive checks at 3s, 7s, 12s, 18s
             let attempt = 0
             const pollForUpdates = () => {
               apiClient
@@ -838,8 +838,8 @@ export function Dashboard() {
                     setInfoTarget((prev) =>
                       prev && prev.id === fileId ? { ...prev, ...updatedFile } : prev
                     )
-                    // If AI summary or active status is ready, terminate polling early
-                    if (updatedFile.summary || (updatedFile.status && updatedFile.status !== 'PROCESSING')) {
+                    // If AI summary or AI tags are ready, terminate polling early
+                    if (updatedFile.summary || updatedFile.tags) {
                       return
                     }
                   }
@@ -1552,8 +1552,8 @@ export function Dashboard() {
         {/* Drag overlay */}
         {isDragging && !isInTrash && activeNav === 'drive' && (
           <div className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center bg-zinc-950/80 backdrop-blur-sm animate-fade-in">
-            <div className="flex flex-col items-center gap-3 rounded-2xl border-2 border-dashed border-violet-500/60 px-12 py-10">
-              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-violet-400" aria-hidden="true">
+            <div className="flex flex-col items-center gap-3 rounded-2xl border-2 border-dashed border-amber-500/60 px-12 py-10">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" className="text-amber-400" aria-hidden="true">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
                 <polyline points="17,8 12,3 7,8" />
                 <line x1="12" y1="3" x2="12" y2="15" />

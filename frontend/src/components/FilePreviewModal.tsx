@@ -215,7 +215,7 @@ export function FilePreviewModal({ open, onClose, file, onDownload, publicToken 
 
             {/* Text & Code Preview */}
             {isTextCode && textContent !== null && (
-              <div className="h-full w-full overflow-auto p-4 text-left font-mono text-xs text-zinc-200 bg-zinc-900/90 leading-relaxed selection:bg-violet-500 selection:text-white">
+              <div className="h-full w-full overflow-auto p-4 text-left font-mono text-xs text-zinc-200 bg-zinc-900/90 leading-relaxed selection:bg-amber-500/40 selection:text-white">
                 <pre className="whitespace-pre-wrap break-words">{textContent}</pre>
               </div>
             )}

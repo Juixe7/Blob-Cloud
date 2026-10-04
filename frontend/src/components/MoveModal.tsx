@@ -206,7 +206,7 @@ export function MoveModal({ open, onClose, file, files, onMoved }: MoveModalProp
       <div className="min-h-[200px] max-h-[320px] overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950/30">
         {loading ? (
           <div className="flex h-[200px] items-center justify-center">
-            <Spinner size={18} className="text-violet-500" />
+            <Spinner size={18} className="text-amber-500" />
           </div>
         ) : folders.length === 0 ? (
           <div className="flex h-[200px] flex-col items-center justify-center gap-2 px-4 text-center">

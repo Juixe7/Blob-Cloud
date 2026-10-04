@@ -207,7 +207,7 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
           type="button"
           onClick={onClose}
           aria-label="Close share dialog"
-          className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500/60"
+          className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/60"
         >
           <XIcon size={18} />
         </button>
@@ -239,7 +239,7 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
             onChange={(e) => setRole(e.target.value as Exclude<CollaboratorRole, 'OWNER'>)}
             disabled={inviting}
             aria-label="Role"
-            className="rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2.5 text-sm text-zinc-200 transition-colors hover:border-zinc-700 focus:border-violet-500/60 focus:outline-none focus:ring-2 focus:ring-violet-500/20"
+            className="rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2.5 text-sm text-zinc-200 transition-colors hover:border-zinc-700 focus:border-amber-500/60 focus:outline-none focus:ring-2 focus:ring-amber-500/20"
           >
             {ASSIGNABLE_ROLES.map((r) => (
               <option key={r} value={r}>
@@ -285,7 +285,7 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
 
         {loadingList ? (
           <div className="flex items-center justify-center py-8 text-zinc-500">
-            <Spinner size={18} className="text-violet-500" />
+            <Spinner size={18} className="text-amber-500" />
           </div>
         ) : listError ? (
           <Alert variant="error">{listError}</Alert>
@@ -347,7 +347,7 @@ export function ShareModal({ open, onClose, file }: ShareModalProps) {
                     <select
                       value={c.role}
                       onChange={(e) => handleUpdateRole(c.grantee_email, e.target.value as CollaboratorRole)}
-                      className="rounded bg-transparent py-1 pl-2 pr-6 text-xs text-zinc-300 hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-violet-500/40"
+                      className="rounded bg-transparent py-1 pl-2 pr-6 text-xs text-zinc-300 hover:bg-zinc-800 focus:outline-none focus:ring-2 focus:ring-amber-500/40"
                     >
                       <option value="VIEWER">Viewer</option>
                       <option value="EDITOR">Editor</option>

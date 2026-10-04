@@ -182,7 +182,7 @@ export function ShortcutModal({ open, onClose, file, onCreated }: ShortcutModalP
       <div className="relative min-h-[160px] max-h-[240px] overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-950/20 px-1 py-1">
         {loading ? (
           <div className="absolute inset-0 flex items-center justify-center">
-            <Spinner size={24} className="text-violet-500" />
+            <Spinner size={24} className="text-amber-500" />
           </div>
         ) : error ? (
           <div className="absolute inset-0 flex items-center justify-center p-4">
@@ -204,7 +204,7 @@ export function ShortcutModal({ open, onClose, file, onCreated }: ShortcutModalP
                 onClick={() => enterFolder(f)}
                 className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm text-zinc-300 transition-colors hover:bg-zinc-900/60 hover:text-zinc-50"
               >
-                <FolderIcon size={16} className="text-violet-500/80 flex-shrink-0" />
+                <FolderIcon size={16} className="text-amber-500/80 flex-shrink-0" />
                 <span className="truncate">{f.name}</span>
                 <ChevronRightIcon size={14} className="ml-auto text-zinc-600 flex-shrink-0" />
               </button>

@@ -151,7 +151,7 @@ export function PendingInvitationsBanner({
                     {/* AI Summary Snippet */}
                     {inv.summary && (
                       <p className="text-xs text-zinc-400 line-clamp-1 flex items-center gap-1">
-                        <span className="text-purple-400 font-medium">AI Insights:</span>
+                        <span className="text-amber-400 font-medium">AI Insights:</span>
                         <span>{inv.summary}</span>
                       </p>
                     )}

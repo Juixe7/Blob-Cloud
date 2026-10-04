@@ -34,7 +34,7 @@ export function FullPageSpinner() {
       className="flex min-h-screen items-center justify-center bg-zinc-950"
     >
       <div className="flex flex-col items-center gap-4">
-        <Spinner size={28} className="text-violet-500" />
+        <Spinner size={28} className="text-amber-500" />
         <p className="text-sm text-zinc-500">Loading Blob-Cloud…</p>
       </div>
     </div>

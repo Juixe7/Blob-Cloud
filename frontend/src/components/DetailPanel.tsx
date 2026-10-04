@@ -180,7 +180,7 @@ export function DetailPanel({ item, isOpen, onClose, onItemUpdated }: DetailPane
               {item.tags && (
                 <div className="space-y-2">
                   <h4 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-violet-500">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-slate-400">
                       <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"></path>
                       <line x1="7" y1="7" x2="7.01" y2="7"></line>
                     </svg>
@@ -193,7 +193,7 @@ export function DetailPanel({ item, isOpen, onClose, onItemUpdated }: DetailPane
                       return (
                         <span
                           key={t}
-                          className="px-2 py-0.5 text-[11px] font-medium rounded-full bg-violet-950/30 text-violet-400 border border-violet-800/30"
+                          className="px-2.5 py-0.5 text-[11px] font-medium rounded-md bg-[#1e2430] text-slate-300 border border-slate-700/60 hover:border-slate-500 hover:text-white transition-colors"
                         >
                           {t}
                         </span>

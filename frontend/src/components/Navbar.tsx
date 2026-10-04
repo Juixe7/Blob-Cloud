@@ -147,7 +147,7 @@ export function Navbar({
           className={cn(
             'flex h-7 w-7 items-center justify-center rounded transition-colors',
             isDetailsOpen
-              ? 'bg-violet-500/10 text-violet-500 shadow-xs ring-1 ring-violet-500/30'
+              ? 'bg-amber-500/10 text-amber-500 shadow-xs ring-1 ring-amber-500/30'
               : 'text-zinc-500 hover:text-zinc-300 hover:bg-arch-850',
           )}
           aria-label="Toggle details panel"
