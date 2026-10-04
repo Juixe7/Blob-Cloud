@@ -127,8 +127,8 @@ func Load() (Config, error) {
 		StorageProvider:    firstEnvStrWithDefault("STORAGE_PROVIDER", "local", "STORAGE_PROVIDER"),
 		AWSRegion:          resolveStorageRegion(),
 		AWSS3Bucket:        firstEnvStr("AWS_S3_BUCKET", "R2_BUCKET", "R2_BUCKET_NAME"),
-		AWSAccessKeyID:     firstEnvStr("AWS_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"),
-		AWSSecretAccessKey: firstEnvStr("AWS_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"),
+		AWSAccessKeyID:     firstEnvStr("R2_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"),
+		AWSSecretAccessKey: firstEnvStr("R2_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"),
 		AWSS3Endpoint:      cleanURL(firstEnvStr("AWS_S3_ENDPOINT", "R2_ENDPOINT")),
 		CloudFrontDomain:   strings.TrimRight(cleanURL(envStr("CLOUDFRONT_DOMAIN", "")), "/"),
 

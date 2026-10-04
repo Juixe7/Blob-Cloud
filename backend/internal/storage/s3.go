@@ -80,6 +80,9 @@ func NewS3Storage(ctx context.Context, cfg appcfg.Config, log *slog.Logger) (*S3
 			if strings.Contains(cfg.AWSS3Endpoint, "r2.cloudflarestorage.com") {
 				o.Region = "auto"
 			}
+			if cfg.AWSAccessKeyID != "" && cfg.AWSSecretAccessKey != "" {
+				o.Credentials = credentials.NewStaticCredentialsProvider(cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey, "")
+			}
 		})
 	}
 
