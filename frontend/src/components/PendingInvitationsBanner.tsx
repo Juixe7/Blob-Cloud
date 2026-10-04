@@ -48,7 +48,7 @@ export function PendingInvitationsBanner({
   if (invitations.length === 0) return null
 
   return (
-    <div className="mb-6 overflow-hidden rounded-xl border border-indigo-500/30 bg-gradient-to-r from-indigo-950/40 via-zinc-900/60 to-purple-950/30 shadow-lg shadow-indigo-950/20 backdrop-blur-sm">
+    <div className="mb-6 overflow-hidden rounded-xl border border-indigo-500/30 bg-gradient-to-r from-indigo-950/40 via-zinc-900/60 to-zinc-950/40 shadow-lg shadow-indigo-950/20 backdrop-blur-sm">
       {/* Header Banner */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-indigo-500/20 bg-indigo-950/30">
         <div className="flex items-center gap-2.5">

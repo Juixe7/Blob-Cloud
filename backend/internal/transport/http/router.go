@@ -163,6 +163,7 @@ func NewRouter(s *Server, rl RateLimiters) http.Handler {
 		// --- Phase 6: real-time notifications (WebSocket) ---
 		if s.hub != nil {
 			r.Get("/api/ws", s.HandleWSConnection)
+			r.Get("/ws", s.HandleWSConnection)
 		}
 	})
 
