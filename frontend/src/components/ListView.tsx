@@ -6,6 +6,7 @@ import type { FileItem } from '../types/file'
 import { formatFileSize, formatDate, cn } from '../lib/format'
 import { FileIcon } from './FileIcon'
 import { useResizeObserver } from '../hooks/useResizeObserver'
+import { markThumbnailFailed, isThumbnailFailed } from '../lib/thumbnailCache'
 
 interface ListViewProps {
   items: FileItem[]
@@ -45,7 +46,7 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
   const isSelected = selectedIds?.has(item.id) ?? false
   const isShortcut = item.mime_type === 'application/vnd.google-apps.shortcut'
   const isBrokenShortcut = isShortcut && item.shortcut_target_id === null
-  const [imgError, setImgError] = useState(false)
+  const [imgError, setImgError] = useState(() => isThumbnailFailed(item.id))
   
   const token = getAccessToken() ?? ''
   const base = apiClient.defaults.baseURL ?? '/api'
@@ -135,7 +136,10 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
               src={thumbUrl} 
               alt={item.name} 
               className={cn("h-6 w-6 md:h-4 md:w-4 object-cover rounded-[2px]", item.status === 'QUARANTINED' && 'grayscale opacity-50')} 
-              onError={() => setImgError(true)}
+              onError={() => {
+                markThumbnailFailed(item.id)
+                setImgError(true)
+              }}
             />
           ) : (
             <div className={cn(item.status === 'QUARANTINED' && 'grayscale opacity-50')}>

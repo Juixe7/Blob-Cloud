@@ -6,6 +6,7 @@ import type { FileItem } from '../types/file'
 import { cn } from '../lib/format'
 import { FileIcon } from './FileIcon'
 import { useResizeObserver } from '../hooks/useResizeObserver'
+import { markThumbnailFailed, isThumbnailFailed } from '../lib/thumbnailCache'
 
 interface GridViewProps {
   items: FileItem[]
@@ -26,78 +27,6 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
   return result
 }
 
-export function GridView({
-  items,
-  selectedIds,
-  onToggleSelect,
-  onSingleSelect,
-  onSelectRange,
-  onOpenFolder,
-  onOpenFile,
-  onContextMenu,
-}: GridViewProps) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const { width, height } = useResizeObserver(containerRef)
-
-  const columnCount = useMemo(() => {
-    if (width === 0) return 6
-    if (width < 768) return 2
-    if (width < 1024) return 4
-    return 6
-  }, [width])
-
-  const chunkedRows = useMemo(() => chunkArray(items, columnCount), [items, columnCount])
-
-  if (items.length === 0) {
-    return (
-      <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 h-full">
-        <p>No items in this view.</p>
-      </div>
-    )
-  }
-
-  const Row = ({ index, style }: { index: number; style: React.CSSProperties }) => {
-    const rowItems = chunkedRows[index]
-
-    return (
-      <div style={style} className="flex gap-4 w-full px-4 pt-4">
-        {rowItems.map((item) => (
-          <div key={item.id} style={{ width: `calc((100% - ${(columnCount - 1) * 16}px) / ${columnCount})` }}>
-            <Card
-              item={item}
-              isSelected={selectedIds?.has(item.id) ?? false}
-              onToggleSelect={onToggleSelect}
-              onSingleSelect={onSingleSelect}
-              onSelectRange={onSelectRange}
-              onOpenFolder={onOpenFolder}
-              onOpenFile={onOpenFile}
-              onContextMenu={onContextMenu}
-            />
-          </div>
-        ))}
-      </div>
-    )
-  }
-
-  return (
-    <div className="flex-1 overflow-hidden select-none" ref={containerRef}>
-      {height > 0 && width > 0 && (() => {
-        const VirtualList = List as any
-        return (
-          <VirtualList
-            height={height}
-            rowCount={chunkedRows.length}
-            rowHeight={220} // Fixed height for cards + padding
-            width="100%"
-            rowProps={{ chunkedRows, selectedIds }}
-            rowComponent={Row as any}
-          />
-        )
-      })()}
-    </div>
-  )
-}
-
 interface CardProps {
   item: FileItem
   isSelected: boolean
@@ -109,7 +38,7 @@ interface CardProps {
   onContextMenu: (item: FileItem, e: MouseEvent) => void
 }
 
-function Card({
+const Card = React.memo(function Card({
   item,
   isSelected,
   onToggleSelect,
@@ -121,8 +50,9 @@ function Card({
 }: CardProps) {
   const isShortcut = item.mime_type === 'application/vnd.google-apps.shortcut'
   const isBrokenShortcut = isShortcut && item.shortcut_target_id === null
-  const [imgError, setImgError] = useState(false)
-  
+  const [imgLoaded, setImgLoaded] = useState(false)
+  const [imgError, setImgError] = useState(() => isThumbnailFailed(item.id))
+
   const token = getAccessToken() ?? ''
   const base = apiClient.defaults.baseURL ?? '/api'
   const thumbUrl = item.thumbnail_url || `${base}/files/${item.id}/thumbnail?token=${encodeURIComponent(token)}`
@@ -130,22 +60,11 @@ function Card({
   const isVideo = item.mime_type?.startsWith('video/') || /\.(mp4|webm|mov|mkv)$/i.test(item.name)
   const isPdf = item.mime_type === 'application/pdf' || item.name.toLowerCase().endsWith('.pdf')
   const canHaveThumbnail = !item.is_directory && (isImage || isVideo || isPdf || Boolean(item.thumbnail_url))
-  const showThumbnail = canHaveThumbnail && !imgError
-  
+
   return (
     <div
       onClick={(e) => {
         e.stopPropagation()
-        if (e.detail === 2) {
-          if (isBrokenShortcut || item.status === 'QUARANTINED') return
-          if (item.is_directory) {
-            onOpenFolder(item)
-            return
-          } else if (onOpenFile) {
-            onOpenFile(item)
-            return
-          }
-        }
         if (e.shiftKey && onSelectRange) {
           onSelectRange(item.id)
         } else if ((e.ctrlKey || e.metaKey) && onToggleSelect) {
@@ -208,14 +127,34 @@ function Card({
           }
         }}
       >
-        {showThumbnail ? (
+        {/* Base Layer: FileIcon is always present, preventing layout shifts or blank cards */}
+        <div className={cn("transition-opacity duration-200", imgLoaded ? "opacity-0" : "opacity-100", item.status === 'QUARANTINED' && 'grayscale opacity-50')}>
+          <FileIcon filename={item.name} isDirectory={item.is_directory} size={32} isShortcut={isShortcut} isBrokenShortcut={isBrokenShortcut} />
+        </div>
+
+        {/* Thumbnail Layer: Fades in smoothly once onLoad confirms valid pixels */}
+        {canHaveThumbnail && !imgError && (
+          <img 
+            src={thumbUrl} 
+            alt={item.name} 
+            loading="lazy"
+            onLoad={() => setImgLoaded(true)}
+            onError={() => {
+              markThumbnailFailed(item.id)
+              setImgError(true)
+              setImgLoaded(false)
+            }}
+            className={cn(
+              "absolute inset-0 h-full w-full object-cover transition-opacity duration-200",
+              imgLoaded ? "opacity-100" : "opacity-0 pointer-events-none",
+              item.status === 'QUARANTINED' && 'grayscale opacity-50'
+            )} 
+          />
+        )}
+
+        {/* Badge Layer: Only shown when the thumbnail image has successfully loaded */}
+        {imgLoaded && (
           <>
-            <img 
-              src={thumbUrl} 
-              alt={item.name} 
-              className={cn("h-full w-full object-cover", item.status === 'QUARANTINED' && 'grayscale opacity-50')} 
-              onError={() => setImgError(true)}
-            />
             {isVideo && (
               <div className="absolute bottom-2 right-2 flex items-center gap-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-semibold text-white shadow-sm backdrop-blur-sm pointer-events-none">
                 <svg className="h-2.5 w-2.5 fill-current text-amber-400" viewBox="0 0 24 24">
@@ -230,11 +169,8 @@ function Card({
               </div>
             )}
           </>
-        ) : (
-          <div className={cn(item.status === 'QUARANTINED' && 'grayscale opacity-50')}>
-            <FileIcon filename={item.name} isDirectory={item.is_directory} size={32} isShortcut={isShortcut} isBrokenShortcut={isBrokenShortcut} />
-          </div>
         )}
+
         {item.status === 'QUARANTINED' && (
           <div className="absolute top-2 right-2 bg-red-500 rounded-full w-6 h-6 flex items-center justify-center shadow-[0_0_10px_rgba(239,68,68,0.5)]">
             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
@@ -277,6 +213,119 @@ function Card({
           </button>
         )}
       </div>
+    </div>
+  )
+})
+
+type GridRowProps = {
+  index: number
+  style: React.CSSProperties
+  data: {
+    chunkedRows: FileItem[][]
+    columnCount: number
+    selectedIds?: Set<string>
+    onToggleSelect?: (id: string) => void
+    onSingleSelect?: (id: string) => void
+    onSelectRange?: (id: string) => void
+    onOpenFolder: (item: FileItem) => void
+    onOpenFile?: (item: FileItem) => void
+    onContextMenu: (item: FileItem, e: MouseEvent) => void
+  }
+}
+
+const GridRow = React.memo(function GridRow({ index, style, data }: GridRowProps) {
+  const {
+    chunkedRows,
+    columnCount,
+    selectedIds,
+    onToggleSelect,
+    onSingleSelect,
+    onSelectRange,
+    onOpenFolder,
+    onOpenFile,
+    onContextMenu,
+  } = data
+
+  const rowItems = chunkedRows[index]
+  if (!rowItems) return null
+
+  return (
+    <div style={style} className="flex gap-4 w-full px-4 pt-4">
+      {rowItems.map((item) => (
+        <div key={item.id} style={{ width: `calc((100% - ${(columnCount - 1) * 16}px) / ${columnCount})` }}>
+          <Card
+            item={item}
+            isSelected={selectedIds?.has(item.id) ?? false}
+            onToggleSelect={onToggleSelect}
+            onSingleSelect={onSingleSelect}
+            onSelectRange={onSelectRange}
+            onOpenFolder={onOpenFolder}
+            onOpenFile={onOpenFile}
+            onContextMenu={onContextMenu}
+          />
+        </div>
+      ))}
+    </div>
+  )
+})
+
+export function GridView({
+  items,
+  selectedIds,
+  onToggleSelect,
+  onSingleSelect,
+  onSelectRange,
+  onOpenFolder,
+  onOpenFile,
+  onContextMenu,
+}: GridViewProps) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const { width, height } = useResizeObserver(containerRef)
+
+  const columnCount = useMemo(() => {
+    if (width === 0) return 6
+    if (width < 768) return 2
+    if (width < 1024) return 4
+    return 6
+  }, [width])
+
+  const chunkedRows = useMemo(() => chunkArray(items, columnCount), [items, columnCount])
+
+  const rowData = useMemo(() => ({
+    chunkedRows,
+    columnCount,
+    selectedIds,
+    onToggleSelect,
+    onSingleSelect,
+    onSelectRange,
+    onOpenFolder,
+    onOpenFile,
+    onContextMenu,
+  }), [chunkedRows, columnCount, selectedIds, onToggleSelect, onSingleSelect, onSelectRange, onOpenFolder, onOpenFile, onContextMenu])
+
+  if (items.length === 0) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center text-zinc-500 h-full">
+        <p>No items in this view.</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex-1 overflow-hidden select-none" ref={containerRef}>
+      {height > 0 && width > 0 && (() => {
+        const VirtualList = List as any
+        return (
+          <VirtualList
+            height={height}
+            rowCount={chunkedRows.length}
+            rowHeight={220} // Fixed height for cards + padding
+            width="100%"
+            rowProps={rowData}
+            rowComponent={GridRow as any}
+          />
+        )
+      })()}
     </div>
   )
 }
