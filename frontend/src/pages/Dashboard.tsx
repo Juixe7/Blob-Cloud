@@ -820,6 +820,43 @@ export function Dashboard() {
           void applyDeltaSync()
           const name = filenameForId(payload.file_id)
           triggerBatchUploadToast(name)
+
+          // Adaptive smart polling for background worker results (AI summary & thumbnails)
+          if (payload.file_id) {
+            const fileId = payload.file_id
+            const pollDelays = [3000, 4000, 5000] // adaptive checks at 3s, 7s, 12s
+            let attempt = 0
+            const pollForUpdates = () => {
+              apiClient
+                .get<FileItem>(`/files/${fileId}`)
+                .then((res) => {
+                  if (res.data) {
+                    const updatedFile = res.data
+                    setItems((prev) =>
+                      prev.map((it) => (it.id === fileId ? { ...it, ...updatedFile } : it))
+                    )
+                    setInfoTarget((prev) =>
+                      prev && prev.id === fileId ? { ...prev, ...updatedFile } : prev
+                    )
+                    // If AI summary or active status is ready, terminate polling early
+                    if (updatedFile.summary || (updatedFile.status && updatedFile.status !== 'PROCESSING')) {
+                      return
+                    }
+                  }
+                  attempt++
+                  if (attempt < pollDelays.length) {
+                    setTimeout(pollForUpdates, pollDelays[attempt])
+                  }
+                })
+                .catch(() => {
+                  attempt++
+                  if (attempt < pollDelays.length) {
+                    setTimeout(pollForUpdates, pollDelays[attempt])
+                  }
+                })
+            }
+            setTimeout(pollForUpdates, pollDelays[0])
+          }
           break
         }
         case 'THUMBNAIL_READY': {

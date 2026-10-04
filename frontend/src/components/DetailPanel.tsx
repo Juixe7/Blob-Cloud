@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { cn, formatFileSize } from '../lib/format'
 import type { FileItem } from '../types/file'
 import { FileIcon } from './FileIcon'
@@ -40,6 +40,16 @@ export function DetailPanel({ item, isOpen, onClose, onItemUpdated }: DetailPane
   const isImage = item?.mime_type?.startsWith('image/') || (item?.name ? /\.(jpg|jpeg|png|webp|gif)$/i.test(item.name) : false)
   const isDoc = item?.name ? /\.(txt|md|pdf)$/i.test(item.name) : false
   const canGenerateAI = Boolean(item && !item.is_directory && (isImage || isDoc))
+
+  useEffect(() => {
+    if (isOpen && item && !item.is_directory && (isDoc || isImage) && !item.summary) {
+      apiClient.get<FileItem>(`/files/${item.id}`).then((res) => {
+        if (res.data && (res.data.summary || res.data.tags)) {
+          onItemUpdated?.({ ...item, ...res.data })
+        }
+      }).catch(() => {})
+    }
+  }, [isOpen, item?.id, isDoc, isImage, item?.summary, onItemUpdated])
 
   const handleGenerateAI = async () => {
     if (!item) return

@@ -50,6 +50,7 @@ func (c *GeminiClient) GetTextEmbedding(ctx context.Context, text string) ([]flo
 				{"text": text},
 			},
 		},
+		"outputDimensionality": 768,
 	})
 
 	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(reqBody))
@@ -78,7 +79,11 @@ func (c *GeminiClient) GetTextEmbedding(ctx context.Context, text string) ([]flo
 		return nil, fmt.Errorf("decode embeddings: %w", err)
 	}
 
-	return result.Embedding.Values, nil
+	vals := result.Embedding.Values
+	if len(vals) > 768 {
+		vals = vals[:768]
+	}
+	return vals, nil
 }
 
 // GenerateDocumentSummary uses gemini-1.5-flash to generate a summary and tags.
