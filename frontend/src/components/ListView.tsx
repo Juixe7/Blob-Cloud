@@ -1,4 +1,4 @@
-import React, { type MouseEvent, useRef, useState } from 'react'
+import React, { type MouseEvent, useRef, useState, useEffect } from 'react'
 import { List } from 'react-window'
 import { getAccessToken } from '../lib/token'
 import { apiClient } from '../lib/api'
@@ -47,6 +47,10 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
   const isShortcut = item.mime_type === 'application/vnd.google-apps.shortcut'
   const isBrokenShortcut = isShortcut && item.shortcut_target_id === null
   const [imgError, setImgError] = useState(() => isThumbnailFailed(item.id))
+  
+  useEffect(() => {
+    setImgError(isThumbnailFailed(item.id))
+  }, [item.id, item.thumbnail_url])
   
   const token = getAccessToken() ?? ''
   const base = apiClient.defaults.baseURL ?? '/api'

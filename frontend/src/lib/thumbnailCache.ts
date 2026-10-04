@@ -26,8 +26,18 @@ export function isThumbnailFailed(fileId: string): boolean {
 }
 
 /**
+ * Remove a file from the failed cache when a new thumbnail has been uploaded.
+ */
+export function removeThumbnailFailed(fileId: string): void {
+  if (fileId) {
+    failedThumbnailIds.delete(fileId)
+  }
+}
+
+/**
  * Reset the cache (e.g. after fresh batch uploads).
  */
 export function clearThumbnailFailureCache(): void {
   failedThumbnailIds.clear()
 }
+

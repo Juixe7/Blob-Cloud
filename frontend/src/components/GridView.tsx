@@ -1,4 +1,4 @@
-import React, { type MouseEvent, useRef, useMemo, useState } from 'react'
+import React, { type MouseEvent, useRef, useMemo, useState, useEffect } from 'react'
 import { List } from 'react-window'
 import { getAccessToken } from '../lib/token'
 import { apiClient } from '../lib/api'
@@ -52,6 +52,11 @@ const Card = React.memo(function Card({
   const isBrokenShortcut = isShortcut && item.shortcut_target_id === null
   const [imgLoaded, setImgLoaded] = useState(false)
   const [imgError, setImgError] = useState(() => isThumbnailFailed(item.id))
+
+  useEffect(() => {
+    setImgError(isThumbnailFailed(item.id))
+    setImgLoaded(false)
+  }, [item.id, item.thumbnail_url])
 
   const token = getAccessToken() ?? ''
   const base = apiClient.defaults.baseURL ?? '/api'

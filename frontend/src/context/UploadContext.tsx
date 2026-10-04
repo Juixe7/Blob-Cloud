@@ -21,6 +21,7 @@ import type { FastCDCChunkResult, FastCDCWorkerResponse } from '../workers/fastc
 import { deriveKeyPBKDF2, encryptChunkPayload } from '../lib/crypto'
 import { AIMDConcurrencyController } from '../lib/uploadConcurrency'
 import { extractMediaThumbnail } from '../lib/thumbnailExtractor'
+import { removeThumbnailFailed } from '../lib/thumbnailCache'
 
 /** Custom event dispatched on window when an upload finishes, so the file
  *  listing in Dashboard can refresh. */
@@ -387,6 +388,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
               await apiClient.put(`/files/${fileId}/thumbnail`, thumbBlob, {
                 headers: { 'Content-Type': 'image/png' },
               })
+              removeThumbnailFailed(fileId)
               // eslint-disable-next-line no-console
               console.info('[upload] media thumbnail uploaded for file:', fileId)
             }

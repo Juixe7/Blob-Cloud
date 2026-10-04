@@ -9,10 +9,16 @@
  */
 
 import * as pdfjsLib from 'pdfjs-dist'
-import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker&inline'
 
-// Configure PDF.js worker using Vite's static asset URL resolver
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
+// Configure PDF.js worker using inlined Web Worker to bypass Nginx MIME-type restrictions on .mjs
+if (typeof window !== 'undefined') {
+  try {
+    pdfjsLib.GlobalWorkerOptions.workerPort = new PdfWorker()
+  } catch {
+    // Falls back to main thread fake worker if Worker constructor is restricted
+  }
+}
 
 const THUMBNAIL_MAX_DIMENSION = 320
 
@@ -52,8 +58,14 @@ export async function extractVideoThumbnail(file: File): Promise<Blob | null> {
 
     video.onloadedmetadata = () => {
       // Seek to 1s mark, or midpoint if video is shorter than 1s
-      const seekTime = video.duration > 1 ? 1 : Math.max(0.1, video.duration / 2)
-      video.currentTime = seekTime
+      const dur = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 1
+      const seekTime = dur > 1 ? 1 : Math.min(Math.max(0.01, dur / 2), dur)
+      try {
+        video.currentTime = seekTime
+      } catch {
+        // Fallback: draw whatever is loaded if seek fails
+        video.dispatchEvent(new Event('seeked'))
+      }
     }
 
     video.onseeked = () => {

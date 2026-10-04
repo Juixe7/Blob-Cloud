@@ -19,6 +19,7 @@ import (
 	"go-drive-clone/internal/auth"
 	"go-drive-clone/internal/domain"
 	"go-drive-clone/internal/service"
+	wsSync "go-drive-clone/internal/sync"
 )
 
 // ---------------------------------------------------------------------------
@@ -379,7 +380,9 @@ func (s *Server) HandleGetThumbnail(w http.ResponseWriter, r *http.Request) {
 	thumbKey := fmt.Sprintf("thumbnails/%s.png", fileID)
 	rc, err := s.storage.GetObject(r.Context(), thumbKey)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "thumbnail not found"})
+		// 204 No Content indicates the resource exists but has no thumbnail asset yet.
+		// Prevents browser DevTools from logging noisy red 404 errors for media files without thumbnails.
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	defer rc.Close()
@@ -447,6 +450,16 @@ func (s *Server) HandleUploadThumbnail(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("failed to store thumbnail", "file_id", fileID, "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save thumbnail"})
 		return
+	}
+
+	if s.hub != nil {
+		s.hub.NotifyUser(userID, wsSync.NotificationEvent{
+			Type: wsSync.EventThumbnailReady,
+			Payload: map[string]any{
+				"file_id":       fileID,
+				"thumbnail_url": fmt.Sprintf("/api/files/%s/thumbnail", fileID),
+			},
+		})
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
