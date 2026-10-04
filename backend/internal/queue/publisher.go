@@ -94,9 +94,11 @@ var _ Publisher = NoopPublisher{}
 // Note: Cloudflare R2 tokens (32-character hex) are strictly filtered out to prevent InvalidClientTokenId.
 func NewSQSClient(cfg appcfg.Config) *sqs.Client {
 	var opts []func(*awscfg.LoadOptions) error
-	if cfg.AWSRegion != "" {
-		opts = append(opts, awscfg.WithRegion(cfg.AWSRegion))
+	sqsRegion := cfg.SQSRegion
+	if sqsRegion == "" || sqsRegion == "auto" {
+		sqsRegion = "ap-south-1"
 	}
+	opts = append(opts, awscfg.WithRegion(sqsRegion))
 
 	if cfg.SQSAccessKeyID != "" && cfg.SQSSecretAccessKey != "" {
 		opts = append(opts, awscfg.WithCredentialsProvider(
@@ -114,7 +116,7 @@ func NewSQSClient(cfg appcfg.Config) *sqs.Client {
 
 	awsCfg, err := awscfg.LoadDefaultConfig(context.Background(), opts...)
 	if err != nil {
-		awsCfg = aws.Config{Region: cfg.AWSRegion}
+		awsCfg = aws.Config{Region: sqsRegion}
 	}
 
 	return sqs.NewFromConfig(awsCfg)

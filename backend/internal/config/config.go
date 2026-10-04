@@ -48,6 +48,8 @@ type Config struct {
 	// --- SQS (event-driven thumbnail processing) ---
 	// SQSQueueURL is the URL of the SQS queue that carries thumbnail jobs.
 	SQSQueueURL string
+	// SQSRegion is the dedicated AWS region for SQS operations (e.g. ap-south-1).
+	SQSRegion string
 	// SQSNumWorkers is the number of concurrent worker goroutines consuming
 	// from the queue.
 	SQSNumWorkers int
@@ -134,6 +136,7 @@ func Load() (Config, error) {
 
 		// --- SQS (event-driven thumbnail processing) ---
 		SQSQueueURL:        envStr("SQS_QUEUE_URL", ""),
+		SQSRegion:          resolveSQSRegion(envStr("SQS_QUEUE_URL", "")),
 		SQSNumWorkers:      sqsWorkers,
 		SQSPollTimeoutSec:  sqsPollTimeout,
 		SQSAccessKeyID:     firstEnvStr("SQS_AWS_ACCESS_KEY_ID", "AWS_SQS_ACCESS_KEY_ID"),
@@ -151,6 +154,31 @@ func Load() (Config, error) {
 		RateLimitUploadPerMin: mustEnvInt("RL_UPLOAD_RPM", 30),
 		RateLimitAPIPerMin:    mustEnvInt("RL_API_RPM", 120),
 	}, nil
+}
+
+func resolveSQSRegion(queueURL string) string {
+	if reg := envStr("SQS_REGION", ""); reg != "" && reg != "auto" {
+		return reg
+	}
+	if reg := envStr("AWS_DEFAULT_REGION", ""); reg != "" && reg != "auto" {
+		return reg
+	}
+	if reg := envStr("AWS_REGION", ""); reg != "" && reg != "auto" {
+		return reg
+	}
+	// Extract region from SQS queue URL (e.g. https://sqs.ap-south-1.amazonaws.com/...)
+	if strings.Contains(queueURL, "sqs.") {
+		parts := strings.Split(queueURL, ".")
+		for i, p := range parts {
+			if strings.HasSuffix(p, "sqs") && i+1 < len(parts) {
+				candidate := parts[i+1]
+				if candidate != "amazonaws" && candidate != "com" {
+					return candidate
+				}
+			}
+		}
+	}
+	return "ap-south-1"
 }
 
 func resolveStorageRegion() string {
