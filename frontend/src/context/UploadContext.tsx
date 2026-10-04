@@ -19,6 +19,7 @@ import type {
 } from '../types/file'
 import type { FastCDCChunkResult, FastCDCWorkerResponse } from '../workers/fastcdc.worker'
 import { deriveKeyPBKDF2, encryptChunkPayload } from '../lib/crypto'
+import { AIMDConcurrencyController } from '../lib/uploadConcurrency'
 
 /** Custom event dispatched on window when an upload finishes, so the file
  *  listing in Dashboard can refresh. */
@@ -246,17 +247,29 @@ export function UploadProvider({ children }: { children: ReactNode }) {
           cryptoKey = derived.key
         }
 
-        // Upload missing chunks with bounded concurrency (limit = 3) and exponential backoff retry.
-        // This avoids saturating browser network connections and tripping upload rate limits.
-        const CHUNK_UPLOAD_CONCURRENCY = 3
+        // Upload missing chunks using an AIMD adaptive concurrency controller.
+        // Concurrency is not fixed — it self-tunes between 1 and 8 streams at runtime
+        // by measuring per-chunk throughput and applying TCP-style AIMD:
+        //   Additive Increase  → 2 consecutive throughput improvements → +1 stream
+        //   Multiplicative Decrease → error or timeout signal → floor(concurrency / 2)
         const MAX_RETRIES = 3
 
-        const uploadChunkWithRetry = async (chunk: typeof missing[0]) => {
+        // One controller per file. Cold-start reads navigator.connection so the
+        // initial concurrency reflects the user's actual network type (4G, 3G, etc.)
+        const controller = new AIMDConcurrencyController()
+
+        /**
+         * Upload a single chunk with exponential-backoff retry.
+         * Returns the wall-clock duration of the *successful* PUT in milliseconds
+         * (backoff waits are excluded so the AIMD controller measures only real
+         * network latency, not artificial delays).
+         */
+        const uploadChunkWithRetry = async (chunk: typeof missing[0]): Promise<number> => {
           const chunkMeta = chunks[chunk.sequence_number]
           const offset = chunkMeta ? chunkMeta.offset : chunk.sequence_number * CHUNK_SIZE
           const plainSize = chunkMeta ? chunkMeta.plaintext_size : chunk.size_bytes
           const blobSlice = file.slice(offset, offset + plainSize)
-          
+
           let uploadPayload: Blob | ArrayBuffer = blobSlice
           if (cryptoKey && encryptionSalt) {
             const arrayBuffer = await blobSlice.arrayBuffer()
@@ -266,6 +279,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
           let attempt = 0
           while (attempt < MAX_RETRIES) {
             try {
+              const putStart = performance.now()
               await axios.put(chunk.upload_url as string, uploadPayload, {
                 headers: { 'Content-Type': 'application/octet-stream' },
                 onUploadProgress: (evt) => {
@@ -274,28 +288,73 @@ export function UploadProvider({ children }: { children: ReactNode }) {
                   recomputeProgress()
                 },
               })
-              return
+              // Return the PUT-only duration (excludes backoff) for accurate throughput measurement.
+              return performance.now() - putStart
             } catch (err) {
               attempt++
-              if (attempt >= MAX_RETRIES) {
-                throw err
-              }
-              // Exponential backoff before retry (e.g. 500ms, 1000ms)
+              if (attempt >= MAX_RETRIES) throw err
+              // Exponential backoff: 500ms, 1000ms, 1500ms…
               await new Promise((resolve) => setTimeout(resolve, attempt * 500))
             }
           }
+          return 0 // unreachable; satisfies TypeScript
         }
 
-        let chunkCursor = 0
-        const workerCount = Math.min(CHUNK_UPLOAD_CONCURRENCY, missing.length)
-        if (workerCount > 0) {
-          const pool = Array.from({ length: workerCount }, async () => {
-            while (chunkCursor < missing.length) {
-              const currentChunk = missing[chunkCursor++]
-              await uploadChunkWithRetry(currentChunk)
+        /**
+         * Self-replenishing AIMD dispatcher.
+         *
+         * Unlike a fixed-size Promise pool, this loop re-evaluates controller.getConcurrency()
+         * after every chunk completion. If the AIMD controller raises the ceiling mid-upload,
+         * tryDispatch() immediately spawns additional concurrent streams to fill the new slots.
+         * If it lowers the ceiling (congestion), no new chunks are dispatched until active
+         * slots naturally drain below the new limit.
+         */
+        if (missing.length > 0) {
+          await new Promise<void>((resolve, reject) => {
+            let activeSlots = 0
+            let chunkCursor = 0
+            let settled = false
+
+            const tryDispatch = () => {
+              if (settled) return
+
+              while (!settled && chunkCursor < missing.length && activeSlots < controller.getConcurrency()) {
+                const chunk = missing[chunkCursor++]
+                activeSlots++
+
+                uploadChunkWithRetry(chunk)
+                  .then((putDurationMs) => {
+                    if (settled) return
+                    // Feed measurement into the AIMD controller BEFORE dispatching next
+                    // chunk so getConcurrency() already reflects any AI/MD adjustment.
+                    controller.onChunkComplete(chunk.size_bytes, putDurationMs)
+                    activeSlots--
+                    tryDispatch()
+                    // All chunks dispatched and all active slots drained → done.
+                    if (activeSlots === 0 && chunkCursor >= missing.length) {
+                      settled = true
+                      resolve()
+                    }
+                  })
+                  .catch((err) => {
+                    if (settled) return
+                    settled = true
+                    // Hard failure after all retries: apply MD before propagating.
+                    controller.onChunkError()
+                    reject(err as Error)
+                  })
+              }
+
+              // Edge-case: all chunks already dispatched before any .then() fires
+              // (e.g. single-chunk file, concurrency > 1).
+              if (!settled && activeSlots === 0 && chunkCursor >= missing.length) {
+                settled = true
+                resolve()
+              }
             }
+
+            tryDispatch()
           })
-          await Promise.all(pool)
         }
 
 
