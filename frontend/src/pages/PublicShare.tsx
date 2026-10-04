@@ -11,6 +11,8 @@ import { formatFileSize, formatDate } from '../lib/format'
 import { DownloadIcon, FolderIcon } from '../components/icons'
 import { FileIcon } from '../components/FileIcon'
 import { FilePreviewModal } from '../components/FilePreviewModal'
+import { PassphraseModal } from '../components/PassphraseModal'
+import { downloadEncryptedFile } from '../lib/download'
 import { UPLOAD_COMPLETE_EVENT } from '../context/UploadContext'
 import { Dashboard } from './Dashboard'
 
@@ -29,6 +31,8 @@ export function PublicShare() {
   const [file, setFile] = useState<FileItem | null>(null)
   const [children, setChildren] = useState<FileItem[]>([])
   const [previewOpen, setPreviewOpen] = useState(false)
+  const [decryptModalOpen, setDecryptModalOpen] = useState(false)
+  const [decrypting, setDecrypting] = useState(false)
 
   const fetchShare = async () => {
     setLoading(true)
@@ -98,8 +102,27 @@ export function PublicShare() {
   }
 
   const handleDownload = () => {
+    if (file?.is_encrypted) {
+      setDecryptModalOpen(true)
+      return
+    }
     const base = apiClient.defaults.baseURL ?? '/api'
     window.location.href = `${base}/public/shares/${token}/download`
+  }
+
+  const handleDecryptDownload = async (passphrase: string) => {
+    if (!file || !token) return
+    setDecrypting(true)
+    try {
+      const base = apiClient.defaults.baseURL ?? '/api'
+      const customUrl = `${base}/public/shares/${token}/download`
+      await downloadEncryptedFile(file.id, file.name, passphrase, customUrl)
+      setDecryptModalOpen(false)
+    } catch (err: any) {
+      alert(err.message || 'Decryption failed. Please check your passphrase.')
+    } finally {
+      setDecrypting(false)
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -476,6 +499,15 @@ export function PublicShare() {
         file={file}
         onDownload={handleDownload}
         publicToken={token}
+      />
+
+      <PassphraseModal
+        open={decryptModalOpen}
+        onClose={() => setDecryptModalOpen(false)}
+        title="Decrypt Shared File"
+        description="This shared file is end-to-end encrypted. Enter the passphrase to decrypt it locally."
+        actionLabel={decrypting ? 'Decrypting...' : 'Download & Decrypt'}
+        onSubmit={handleDecryptDownload}
       />
     </div>
   )

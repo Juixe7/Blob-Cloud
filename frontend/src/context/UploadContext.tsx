@@ -20,6 +20,7 @@ import type {
 import type { FastCDCChunkResult, FastCDCWorkerResponse } from '../workers/fastcdc.worker'
 import { deriveKeyPBKDF2, encryptChunkPayload } from '../lib/crypto'
 import { AIMDConcurrencyController } from '../lib/uploadConcurrency'
+import { extractMediaThumbnail } from '../lib/thumbnailExtractor'
 
 /** Custom event dispatched on window when an upload finishes, so the file
  *  listing in Dashboard can refresh. */
@@ -137,6 +138,9 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       let activeSessionId: string | null = null
 
       try {
+        // Asynchronously extract video/PDF frame preview in background while FastCDC runs
+        const thumbnailPromise = extractMediaThumbnail(file).catch(() => null)
+
         /* ---- 1. HASHING (FastCDC Rolling Gear Hash with Dual Masks) ---- */
         const { chunks, encryptionSalt } = await new Promise<{ chunks: FastCDCChunkResult[], encryptionSalt?: string }>((resolve, reject) => {
           worker.onmessage = (e: MessageEvent<FastCDCWorkerResponse>) => {
@@ -373,6 +377,24 @@ export function UploadProvider({ children }: { children: ReactNode }) {
         )
         // eslint-disable-next-line no-console
         console.info('[upload] completed, file_id:', completeRes.data.file_id)
+
+        // Upload client-side extracted thumbnail for video/PDF if available
+        const fileId = completeRes.data.file_id
+        if (fileId) {
+          try {
+            const thumbBlob = await thumbnailPromise
+            if (thumbBlob) {
+              await apiClient.put(`/files/${fileId}/thumbnail`, thumbBlob, {
+                headers: { 'Content-Type': 'image/png' },
+              })
+              // eslint-disable-next-line no-console
+              console.info('[upload] media thumbnail uploaded for file:', fileId)
+            }
+          } catch (thumbErr) {
+            // eslint-disable-next-line no-console
+            console.warn('[upload] media thumbnail upload skipped/failed:', thumbErr)
+          }
+        }
 
         /* ---- 5. FINALIZE ---- */
         localStorage.removeItem(toctouKey)

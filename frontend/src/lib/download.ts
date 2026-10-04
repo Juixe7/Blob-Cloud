@@ -6,19 +6,15 @@ const CHUNK_SIZE = 4 * 1024 * 1024
 const ENCRYPTED_CHUNK_OVERHEAD = 44 // 12 (IV) + 16 (Salt) + 16 (Auth tag)
 const ENCRYPTED_CHUNK_SIZE = CHUNK_SIZE + ENCRYPTED_CHUNK_OVERHEAD
 
-export async function downloadEncryptedFile(fileId: string, filename: string, passphrase: string) {
-  const base = apiClient.defaults.baseURL ?? '/api'
-  const token = getAccessToken() ?? ''
-  const url = `${base}/files/${fileId}/download?token=${encodeURIComponent(token)}`
-
-  const response = await fetch(url)
-  if (!response.ok) {
-    throw new Error('Failed to download encrypted file')
-  }
-
-  const encryptedBuffer = await response.arrayBuffer()
+/**
+ * Decrypts an authenticated encrypted stream buffer into an array of plaintext chunk ArrayBuffers.
+ * Handles both length-prefixed framing and un-framed fallback streams.
+ */
+export async function decryptEncryptedStream(
+  encryptedBuffer: ArrayBuffer,
+  passphrase: string
+): Promise<ArrayBuffer[]> {
   const decryptedChunks: ArrayBuffer[] = []
-
   const view = new DataView(encryptedBuffer)
   let offset = 0
   let cachedKey: CryptoKey | undefined
@@ -64,6 +60,27 @@ export async function downloadEncryptedFile(fileId: string, filename: string, pa
       offset = nextOffset
     }
   }
+
+  return decryptedChunks
+}
+
+export async function downloadEncryptedFile(
+  fileId: string,
+  filename: string,
+  passphrase: string,
+  customUrl?: string
+) {
+  const base = apiClient.defaults.baseURL ?? '/api'
+  const token = getAccessToken() ?? ''
+  const url = customUrl || `${base}/files/${fileId}/download?token=${encodeURIComponent(token)}`
+
+  const response = await fetch(url)
+  if (!response.ok) {
+    throw new Error('Failed to download encrypted file')
+  }
+
+  const encryptedBuffer = await response.arrayBuffer()
+  const decryptedChunks = await decryptEncryptedStream(encryptedBuffer, passphrase)
 
   const blob = new Blob(decryptedChunks, { type: 'application/octet-stream' })
   const objectUrl = URL.createObjectURL(blob)

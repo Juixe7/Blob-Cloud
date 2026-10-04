@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -388,6 +389,71 @@ func (s *Server) HandleGetThumbnail(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, rc); err != nil {
 		s.log.Error("failed to stream thumbnail", "file_id", fileID, "err", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/files/{id}/thumbnail
+// ---------------------------------------------------------------------------
+
+// HandleUploadThumbnail implements PUT /api/files/{id}/thumbnail.
+// Allows client-side generated thumbnails (e.g. from Video canvas or PDF.js)
+// to be directly stored in Cloudflare R2 / S3.
+func (s *Server) HandleUploadThumbnail(w http.ResponseWriter, r *http.Request) {
+	if s.fileOps == nil || s.storage == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "service unavailable",
+		})
+		return
+	}
+
+	userID, code, msg := s.userFromBearer(r)
+	if code != 0 {
+		writeJSON(w, code, map[string]string{"error": msg})
+		return
+	}
+
+	fileID := chi.URLParam(r, "id")
+	if fileID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file id"})
+		return
+	}
+
+	// Verify caller has write permissions (EDITOR or OWNER)
+	if err := s.fileOps.AuthoriseWrite(r.Context(), userID, fileID); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
+		return
+	}
+
+	// Limit thumbnail payload to 2 MB to prevent abuse
+	r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid thumbnail payload or exceeds 2MB"})
+		return
+	}
+	if len(bodyBytes) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty thumbnail body"})
+		return
+	}
+
+	contentType := http.DetectContentType(bodyBytes)
+	if !strings.HasPrefix(contentType, "image/") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "thumbnail must be a valid image"})
+		return
+	}
+
+	thumbKey := fmt.Sprintf("thumbnails/%s.png", fileID)
+	if err := s.storage.PutObject(r.Context(), thumbKey, bytes.NewReader(bodyBytes), int64(len(bodyBytes)), contentType); err != nil {
+		s.log.Error("failed to store thumbnail", "file_id", fileID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save thumbnail"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"file_id":       fileID,
+		"status":        "thumbnail uploaded",
+		"thumbnail_url": fmt.Sprintf("/api/files/%s/thumbnail", fileID),
+	})
 }
 
 // ---------------------------------------------------------------------------

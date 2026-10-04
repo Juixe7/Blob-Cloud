@@ -50,8 +50,11 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
   const token = getAccessToken() ?? ''
   const base = apiClient.defaults.baseURL ?? '/api'
   const thumbUrl = item.thumbnail_url || `${base}/files/${item.id}/thumbnail?token=${encodeURIComponent(token)}`
-  const isImage = item.mime_type?.startsWith('image/') || false
-  const showThumbnail = isImage && !imgError
+  const isImage = item.mime_type?.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)$/i.test(item.name)
+  const isVideo = item.mime_type?.startsWith('video/') || /\.(mp4|webm|mov|mkv)$/i.test(item.name)
+  const isPdf = item.mime_type === 'application/pdf' || item.name.toLowerCase().endsWith('.pdf')
+  const canHaveThumbnail = !item.is_directory && (isImage || isVideo || isPdf || Boolean(item.thumbnail_url))
+  const showThumbnail = canHaveThumbnail && !imgError
   
   return (
     <div

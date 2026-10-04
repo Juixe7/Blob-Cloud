@@ -263,8 +263,13 @@ export function Dashboard() {
 
       const token = getAccessToken() || ''
       const sorted = rawData.map(item => {
-        const isImage = /\.(jpg|jpeg|png|webp|gif)$/i.test(item.name)
-        if (isImage && !item.thumbnail_url) {
+        const isSupportedMedia = !item.is_directory && (
+          /\.(jpg|jpeg|png|webp|gif|mp4|webm|mov|mkv|pdf)$/i.test(item.name) ||
+          item.mime_type?.startsWith('image/') ||
+          item.mime_type?.startsWith('video/') ||
+          item.mime_type === 'application/pdf'
+        )
+        if (isSupportedMedia && !item.thumbnail_url) {
           return {
              ...item,
              thumbnail_url: `${apiClient.defaults.baseURL}/files/${item.id}/thumbnail?token=${token}`
@@ -598,8 +603,13 @@ export function Dashboard() {
             const isDriveHierarchy = activeNavRef.current === 'drive' && searchQueryRef.current.trim() === ''
 
             for (const entry of entries) {
-              const isImage = /\.(jpg|jpeg|png|webp|gif)$/i.test(entry.name)
-              const fallbackThumb = isImage
+              const isSupportedMedia = !entry.is_directory && (
+                /\.(jpg|jpeg|png|webp|gif|mp4|webm|mov|mkv|pdf)$/i.test(entry.name) ||
+                entry.mime_type?.startsWith('image/') ||
+                entry.mime_type?.startsWith('video/') ||
+                entry.mime_type === 'application/pdf'
+              )
+              const fallbackThumb = isSupportedMedia
                 ? `${apiClient.defaults.baseURL}/files/${entry.file_id}/thumbnail?token=${token}`
                 : undefined
               const entryParent = entry.parent_id ?? null

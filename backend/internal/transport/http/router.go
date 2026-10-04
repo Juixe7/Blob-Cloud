@@ -140,6 +140,7 @@ func NewRouter(s *Server, rl RateLimiters) http.Handler {
 			r.Delete("/{id}/permanent", s.HandlePermanentDelete)
 			r.Get("/{id}/download", s.HandleDownload)
 			r.Get("/{id}/thumbnail", s.HandleGetThumbnail)
+			r.Put("/{id}/thumbnail", s.HandleUploadThumbnail)
 			r.Post("/{id}/ai-insights", s.HandleGenerateAIInsights)
 			r.Get("/{id}/versions", s.HandleListFileVersions)
 			r.Post("/{id}/versions/{version_id}/restore", s.HandleRestoreFileVersion)

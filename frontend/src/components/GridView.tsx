@@ -126,8 +126,11 @@ function Card({
   const token = getAccessToken() ?? ''
   const base = apiClient.defaults.baseURL ?? '/api'
   const thumbUrl = item.thumbnail_url || `${base}/files/${item.id}/thumbnail?token=${encodeURIComponent(token)}`
-  const isImage = item.mime_type?.startsWith('image/') || false
-  const showThumbnail = isImage && !imgError
+  const isImage = item.mime_type?.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)$/i.test(item.name)
+  const isVideo = item.mime_type?.startsWith('video/') || /\.(mp4|webm|mov|mkv)$/i.test(item.name)
+  const isPdf = item.mime_type === 'application/pdf' || item.name.toLowerCase().endsWith('.pdf')
+  const canHaveThumbnail = !item.is_directory && (isImage || isVideo || isPdf || Boolean(item.thumbnail_url))
+  const showThumbnail = canHaveThumbnail && !imgError
   
   return (
     <div
@@ -206,12 +209,27 @@ function Card({
         }}
       >
         {showThumbnail ? (
-          <img 
-            src={thumbUrl} 
-            alt={item.name} 
-            className={cn("h-full w-full object-cover", item.status === 'QUARANTINED' && 'grayscale opacity-50')} 
-            onError={() => setImgError(true)}
-          />
+          <>
+            <img 
+              src={thumbUrl} 
+              alt={item.name} 
+              className={cn("h-full w-full object-cover", item.status === 'QUARANTINED' && 'grayscale opacity-50')} 
+              onError={() => setImgError(true)}
+            />
+            {isVideo && (
+              <div className="absolute bottom-2 right-2 flex items-center gap-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-semibold text-white shadow-sm backdrop-blur-sm pointer-events-none">
+                <svg className="h-2.5 w-2.5 fill-current text-amber-400" viewBox="0 0 24 24">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                <span>VIDEO</span>
+              </div>
+            )}
+            {isPdf && (
+              <div className="absolute bottom-2 right-2 rounded bg-red-600/85 px-1.5 py-0.5 text-[9px] font-bold text-white shadow-sm backdrop-blur-sm pointer-events-none">
+                PDF
+              </div>
+            )}
+          </>
         ) : (
           <div className={cn(item.status === 'QUARANTINED' && 'grayscale opacity-50')}>
             <FileIcon filename={item.name} isDirectory={item.is_directory} size={32} isShortcut={isShortcut} isBrokenShortcut={isBrokenShortcut} />

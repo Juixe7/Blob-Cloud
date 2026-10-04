@@ -184,6 +184,48 @@ func TestDownloadRangeRequest(t *testing.T) {
 			break
 		}
 	}
+
+	// Test 3: Encrypted file should ignore Range header, return 200 OK with total ciphertext size
+	encFile := &domain.File{
+		UserID:      user.ID,
+		Name:        "secret_vault.bin",
+		IsDirectory: false,
+		SizeBytes:   8388608,
+		IsEncrypted: true,
+	}
+	if err := files.Create(ctx, encFile); err != nil {
+		t.Fatalf("failed to create encrypted file: %v", err)
+	}
+	err = blocks.LinkBlocksToFile(ctx, encFile.ID, []domain.BlockSequence{
+		{BlockID: b1.ID, SequenceNumber: 0},
+		{BlockID: b2.ID, SequenceNumber: 1},
+	})
+	if err != nil {
+		t.Fatalf("failed to link blocks to encrypted file: %v", err)
+	}
+
+	reqEncRange := httptest.NewRequest("GET", fmt.Sprintf("/api/files/%s/download?token=%s", encFile.ID, token), nil)
+	reqEncRange.Header.Set("Range", "bytes=5000000-")
+	rctxEnc := chi.NewRouteContext()
+	rctxEnc.URLParams.Add("id", encFile.ID)
+	reqEncRange = reqEncRange.WithContext(context.WithValue(reqEncRange.Context(), chi.RouteCtxKey, rctxEnc))
+	wEncRange := httptest.NewRecorder()
+	srv.HandleDownload(wEncRange, reqEncRange)
+
+	respEnc := wEncRange.Result()
+	if respEnc.StatusCode != http.StatusOK {
+		t.Errorf("encrypted download with Range: expected 200 OK, got %d", respEnc.StatusCode)
+	}
+	if respEnc.Header.Get("Accept-Ranges") != "none" {
+		t.Errorf("encrypted download: expected Accept-Ranges 'none', got %q", respEnc.Header.Get("Accept-Ranges"))
+	}
+	if respEnc.Header.Get("Content-Type") != "application/octet-stream" {
+		t.Errorf("encrypted download: expected Content-Type 'application/octet-stream', got %q", respEnc.Header.Get("Content-Type"))
+	}
+	bodyEnc, _ := io.ReadAll(respEnc.Body)
+	if len(bodyEnc) != 8388608 {
+		t.Errorf("encrypted download: expected 8388608 bytes (full ciphertext), got %d", len(bodyEnc))
+	}
 }
 
 func TestCalculateDynamicRangeBlockOffset(t *testing.T) {
