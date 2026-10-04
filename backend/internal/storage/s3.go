@@ -77,6 +77,9 @@ func NewS3Storage(ctx context.Context, cfg appcfg.Config, log *slog.Logger) (*S3
 			o.BaseEndpoint = aws.String(cfg.AWSS3Endpoint)
 			// R2 uses path-style addressing.
 			o.UsePathStyle = true
+			if strings.Contains(cfg.AWSS3Endpoint, "r2.cloudflarestorage.com") {
+				o.Region = "auto"
+			}
 		})
 	}
 

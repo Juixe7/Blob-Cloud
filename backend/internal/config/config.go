@@ -125,7 +125,7 @@ func Load() (Config, error) {
 		DBConnMaxLifetime: lifetime,
 
 		StorageProvider:    firstEnvStrWithDefault("STORAGE_PROVIDER", "local", "STORAGE_PROVIDER"),
-		AWSRegion:          firstEnvStrWithDefault("AWS_REGION", "us-east-1", "AWS_REGION"),
+		AWSRegion:          resolveStorageRegion(),
 		AWSS3Bucket:        firstEnvStr("AWS_S3_BUCKET", "R2_BUCKET", "R2_BUCKET_NAME"),
 		AWSAccessKeyID:     firstEnvStr("AWS_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"),
 		AWSSecretAccessKey: firstEnvStr("AWS_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"),
@@ -151,6 +151,17 @@ func Load() (Config, error) {
 		RateLimitUploadPerMin: mustEnvInt("RL_UPLOAD_RPM", 30),
 		RateLimitAPIPerMin:    mustEnvInt("RL_API_RPM", 120),
 	}, nil
+}
+
+func resolveStorageRegion() string {
+	if r2Reg := envStr("R2_REGION", ""); r2Reg != "" {
+		return r2Reg
+	}
+	endpoint := envStr("AWS_S3_ENDPOINT", "")
+	if strings.Contains(endpoint, "r2.cloudflarestorage.com") {
+		return "auto"
+	}
+	return envStr("AWS_REGION", "us-east-1")
 }
 
 // envStr returns the value of the environment variable named by key, or the
