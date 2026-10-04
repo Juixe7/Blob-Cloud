@@ -136,12 +136,87 @@ export async function decryptChunkPayload(
   return plaintext
 }
 
-function bufferToHex(buffer: ArrayBuffer | Uint8Array): string {
+export function bufferToHex(buffer: ArrayBuffer | Uint8Array): string {
   const bytes = new Uint8Array(buffer)
   let hex = ''
   for (let i = 0; i < bytes.length; i++) {
     hex += bytes[i].toString(16).padStart(2, '0')
   }
   return hex
+}
+
+/**
+ * Derives a deterministic 16-byte salt (32 hex characters) from the user's passphrase
+ * and the plaintext file's content hash using HMAC-SHA256.
+ *
+ * This ensures Convergent Encryption: the exact same file content encrypted with the
+ * exact same passphrase produces the exact same salt, key, IVs, and ciphertext chunks,
+ * achieving 100% deduplication in S3 and the blocks table.
+ *
+ * Security: Uses HMAC-SHA256 keyed with the user's passphrase and domain-separated
+ * data "blobcloud-salt-v1:<contentHashHex>". An adversary without the passphrase cannot
+ * precompute or verify candidate salts (preventing offline confirmation attacks).
+ */
+export async function deriveDeterministicSalt(
+  passphrase: string,
+  contentHashHex: string
+): Promise<string> {
+  const enc = new TextEncoder()
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(passphrase),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+
+  const signature = await crypto.subtle.sign(
+    'HMAC',
+    keyMaterial,
+    enc.encode(`blobcloud-salt-v1:${contentHashHex}`)
+  )
+
+  const salt16 = new Uint8Array(signature).slice(0, 16)
+  return bufferToHex(salt16)
+}
+
+/**
+ * Computes a deterministic SHA-256 content hash of a Blob/File using streaming
+ * 8 MiB slices. This bounds worker RAM usage to ~8 MiB regardless of file size (e.g. 10 GB),
+ * preventing browser out-of-memory crashes.
+ */
+export async function computeFilePlaintextHash(blob: Blob): Promise<string> {
+  if (blob.size === 0) {
+    const emptyDigest = await crypto.subtle.digest('SHA-256', new Uint8Array(0))
+    return bufferToHex(emptyDigest)
+  }
+
+  const SLICE_SIZE = 8 * 1024 * 1024 // 8 MiB bounded window
+  if (blob.size <= SLICE_SIZE) {
+    const buf = await blob.arrayBuffer()
+    const digest = await crypto.subtle.digest('SHA-256', buf)
+    return bufferToHex(digest)
+  }
+
+  const sliceDigests: Uint8Array[] = []
+  let offset = 0
+  while (offset < blob.size) {
+    const nextOffset = Math.min(offset + SLICE_SIZE, blob.size)
+    const sliceBuf = await blob.slice(offset, nextOffset).arrayBuffer()
+    const digest = await crypto.subtle.digest('SHA-256', sliceBuf)
+    sliceDigests.push(new Uint8Array(digest))
+    offset = nextOffset
+  }
+
+  const totalBytes = sliceDigests.reduce((sum, d) => sum + d.byteLength, 0)
+  const combined = new Uint8Array(totalBytes)
+  let pos = 0
+  for (const d of sliceDigests) {
+    combined.set(d, pos)
+    pos += d.byteLength
+  }
+
+  const rootDigest = await crypto.subtle.digest('SHA-256', combined)
+  return bufferToHex(rootDigest)
 }
 

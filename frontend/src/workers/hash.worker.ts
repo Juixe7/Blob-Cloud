@@ -1,5 +1,10 @@
 /// <reference lib="webworker" />
-import { deriveKeyPBKDF2, encryptChunkPayload } from '../lib/crypto'
+import {
+  deriveDeterministicSalt,
+  computeFilePlaintextHash,
+  deriveKeyPBKDF2,
+  encryptChunkPayload,
+} from '../lib/crypto'
 
 /**
  * Web Worker: Bounded concurrency (limit = 3) file slicing + SHA-256 & MD5 hashing.
@@ -150,9 +155,10 @@ async function hashFileBounded(file: File, passphrase?: string): Promise<{ chunk
   let encryptionSalt: string | undefined
 
   if (passphrase) {
-    const derived = await deriveKeyPBKDF2(passphrase)
+    const contentHash = await computeFilePlaintextHash(file)
+    encryptionSalt = await deriveDeterministicSalt(passphrase, contentHash)
+    const derived = await deriveKeyPBKDF2(passphrase, encryptionSalt)
     cryptoKey = derived.key
-    encryptionSalt = derived.salt
   }
 
   return new Promise<{ chunks: ChunkHashResult[], salt?: string }>((resolve, reject) => {

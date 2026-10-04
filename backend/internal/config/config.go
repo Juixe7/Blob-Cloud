@@ -55,6 +55,10 @@ type Config struct {
 	// (default 20) minimises empty ReceiveMessage calls, which matters on the
 	// AWS Free Tier (1M requests/month).
 	SQSPollTimeoutSec int
+	// SQSAccessKeyID is the optional dedicated AWS IAM access key for SQS.
+	SQSAccessKeyID string
+	// SQSSecretAccessKey is the optional dedicated AWS IAM secret key for SQS.
+	SQSSecretAccessKey string
 
 	// --- Auth / realtime (Phase 6) ---
 	// JWTSecret signs and validates the JWTs used to authenticate WebSocket
@@ -120,18 +124,20 @@ func Load() (Config, error) {
 		DBMaxIdleConns:    maxIdle,
 		DBConnMaxLifetime: lifetime,
 
-		StorageProvider:    envStr("STORAGE_PROVIDER", "local"),
-		AWSRegion:          envStr("AWS_REGION", "us-east-1"),
-		AWSS3Bucket:        envStr("AWS_S3_BUCKET", ""),
-		AWSAccessKeyID:     envStr("AWS_ACCESS_KEY_ID", ""),
-		AWSSecretAccessKey: envStr("AWS_SECRET_ACCESS_KEY", ""),
-		AWSS3Endpoint:      envStr("AWS_S3_ENDPOINT", ""),
-		CloudFrontDomain:   strings.TrimRight(envStr("CLOUDFRONT_DOMAIN", ""), "/"),
+		StorageProvider:    firstEnvStrWithDefault("STORAGE_PROVIDER", "local", "STORAGE_PROVIDER"),
+		AWSRegion:          firstEnvStrWithDefault("AWS_REGION", "us-east-1", "AWS_REGION"),
+		AWSS3Bucket:        firstEnvStr("AWS_S3_BUCKET", "R2_BUCKET", "R2_BUCKET_NAME"),
+		AWSAccessKeyID:     firstEnvStr("AWS_ACCESS_KEY_ID", "R2_ACCESS_KEY_ID"),
+		AWSSecretAccessKey: firstEnvStr("AWS_SECRET_ACCESS_KEY", "R2_SECRET_ACCESS_KEY"),
+		AWSS3Endpoint:      cleanURL(firstEnvStr("AWS_S3_ENDPOINT", "R2_ENDPOINT")),
+		CloudFrontDomain:   strings.TrimRight(cleanURL(envStr("CLOUDFRONT_DOMAIN", "")), "/"),
 
 		// --- SQS (event-driven thumbnail processing) ---
-		SQSQueueURL:      envStr("SQS_QUEUE_URL", ""),
-		SQSNumWorkers:    sqsWorkers,
-		SQSPollTimeoutSec: sqsPollTimeout,
+		SQSQueueURL:        envStr("SQS_QUEUE_URL", ""),
+		SQSNumWorkers:      sqsWorkers,
+		SQSPollTimeoutSec:  sqsPollTimeout,
+		SQSAccessKeyID:     firstEnvStr("SQS_AWS_ACCESS_KEY_ID", "AWS_SQS_ACCESS_KEY_ID"),
+		SQSSecretAccessKey: firstEnvStr("SQS_AWS_SECRET_ACCESS_KEY", "AWS_SQS_SECRET_ACCESS_KEY"),
 
 		// --- Auth / realtime (Phase 6) ---
 		JWTSecret:     envStr("JWT_SECRET", ""),
@@ -154,6 +160,37 @@ func envStr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// firstEnvStr returns the first non-empty value among the given environment variable keys.
+func firstEnvStr(keys ...string) string {
+	for _, key := range keys {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// firstEnvStrWithDefault returns the first non-empty value among keys, or the fallback if all are empty.
+func firstEnvStrWithDefault(fallback string, keys ...string) string {
+	if v := firstEnvStr(keys...); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// cleanURL strips accidental markdown brackets/parentheses e.g. [url](url) from pasted URLs.
+func cleanURL(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "[") && strings.Contains(s, "](") {
+		idx := strings.Index(s, "](")
+		endIdx := strings.LastIndex(s, ")")
+		if idx != -1 && endIdx != -1 && endIdx > idx+2 {
+			s = s[idx+2 : endIdx]
+		}
+	}
+	return strings.Trim(s, "[]() \t\r\n")
 }
 
 // envInt parses the environment variable named by key as an int, returning the

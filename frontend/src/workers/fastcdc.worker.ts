@@ -1,5 +1,10 @@
 /// <reference lib="webworker" />
-import { deriveKeyPBKDF2, encryptChunkPayload } from '../lib/crypto'
+import {
+  deriveDeterministicSalt,
+  computeFilePlaintextHash,
+  deriveKeyPBKDF2,
+  encryptChunkPayload,
+} from '../lib/crypto'
 
 /**
  * Web Worker: FastCDC (Fast Content-Defined Chunking) Rolling Gear Hash.
@@ -215,9 +220,10 @@ async function chunkFileFastCDC(
   let encryptionSalt: string | undefined
 
   if (passphrase) {
-    const derived = await deriveKeyPBKDF2(passphrase)
+    const contentHash = await computeFilePlaintextHash(file)
+    encryptionSalt = await deriveDeterministicSalt(passphrase, contentHash)
+    const derived = await deriveKeyPBKDF2(passphrase, encryptionSalt)
     cryptoKey = derived.key
-    encryptionSalt = derived.salt
   }
 
   const chunks: FastCDCChunkResult[] = []

@@ -8,8 +8,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 
@@ -84,17 +86,40 @@ func (p *SQSPublisher) PublishThumbnailJob(ctx context.Context, msg ThumbnailMes
 var _ Publisher = (*SQSPublisher)(nil)
 var _ Publisher = NoopPublisher{}
 
-// NewSQSClient creates an SQS client from the application config, sharing the
-// same AWS credential chain and region as the S3 client.
+// NewSQSClient creates an SQS client from the application config.
+// Credential resolution order:
+// 1. Dedicated SQS IAM static credentials (SQSAccessKeyID / SQSSecretAccessKey).
+// 2. Standard AWS IAM credentials (AWSAccessKeyID starting with AKIA or ASIA).
+// 3. AWS default credential chain (EC2 IAM Instance Profile Role / environment / metadata).
+// Note: Cloudflare R2 tokens (32-character hex) are strictly filtered out to prevent InvalidClientTokenId.
 func NewSQSClient(cfg appcfg.Config) *sqs.Client {
-	awsCfg := aws.Config{Region: cfg.AWSRegion}
+	var opts []func(*awscfg.LoadOptions) error
+	if cfg.AWSRegion != "" {
+		opts = append(opts, awscfg.WithRegion(cfg.AWSRegion))
+	}
 
-	// Static credentials override the default chain (same logic as S3 driver).
-	if cfg.AWSAccessKeyID != "" && cfg.AWSSecretAccessKey != "" {
-		awsCfg.Credentials = credentials.NewStaticCredentialsProvider(
-			cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey, "",
-		)
+	if cfg.SQSAccessKeyID != "" && cfg.SQSSecretAccessKey != "" {
+		opts = append(opts, awscfg.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(
+				cfg.SQSAccessKeyID, cfg.SQSSecretAccessKey, "",
+			),
+		))
+	} else if cfg.AWSAccessKeyID != "" && cfg.AWSSecretAccessKey != "" && isAWSKey(cfg.AWSAccessKeyID) {
+		opts = append(opts, awscfg.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(
+				cfg.AWSAccessKeyID, cfg.AWSSecretAccessKey, "",
+			),
+		))
+	}
+
+	awsCfg, err := awscfg.LoadDefaultConfig(context.Background(), opts...)
+	if err != nil {
+		awsCfg = aws.Config{Region: cfg.AWSRegion}
 	}
 
 	return sqs.NewFromConfig(awsCfg)
+}
+
+func isAWSKey(k string) bool {
+	return strings.HasPrefix(k, "AKIA") || strings.HasPrefix(k, "ASIA")
 }
