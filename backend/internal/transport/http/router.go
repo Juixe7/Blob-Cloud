@@ -127,6 +127,7 @@ func NewRouter(s *Server, rl RateLimiters) http.Handler {
 			r.Post("/shortcut", s.HandleCreateShortcut)
 			r.Delete("/bulk/permanent", s.HandleBulkHardDelete)
 
+			r.Get("/{id}", s.HandleGetFile)
 			r.Post("/{id}/share", s.HandleShare)
 			r.Patch("/{id}/share/{email}", s.HandleUpdateShare)
 			r.Delete("/{id}/share/{email}", s.HandleRevokeShare)

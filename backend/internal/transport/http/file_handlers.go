@@ -99,6 +99,51 @@ func (s *Server) userFromBearer(r *http.Request) (string, int, string) {
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/files/{id}  —  Fetch single file metadata
+// ---------------------------------------------------------------------------
+
+// HandleGetFile implements GET /api/files/{id}.
+//
+// Returns the full metadata record for a single file or folder. The caller
+// must hold VIEWER, EDITOR, or OWNER permission on the resource. Used by the
+// frontend DetailPanel to refresh summary and tags after Lambda processing.
+func (s *Server) HandleGetFile(w http.ResponseWriter, r *http.Request) {
+	if s.fileOps == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "file operations unavailable (database not configured)",
+		})
+		return
+	}
+
+	fileID := chi.URLParam(r, "id")
+	if fileID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file id"})
+		return
+	}
+
+	userID, code, msg := s.userFromBearer(r)
+	if code != 0 {
+		writeJSON(w, code, map[string]string{"error": msg})
+		return
+	}
+
+	// Enforce read permission before exposing any metadata.
+	if err := s.fileOps.AuthoriseRead(r.Context(), userID, fileID); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
+		return
+	}
+
+	file, err := s.fileOps.GetFile(r.Context(), fileID)
+	if err != nil {
+		s.log.Warn("HandleGetFile: not found", "file_id", fileID, "user_id", userID, "err", err)
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, file)
+}
+
+// ---------------------------------------------------------------------------
 // PATCH /api/files/{id}  —  Rename / Move
 // ---------------------------------------------------------------------------
 
@@ -546,48 +591,67 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 	}
 
 	sanitised := service.SanitiseFilename(file.Name)
+
+	var totalStreamSize int64
+	for _, b := range blocks {
+		totalStreamSize += int64(b.SizeBytes)
+	}
+
 	contentType := "application/octet-stream"
-	ext := strings.ToLower(filepath.Ext(file.Name))
-	switch ext {
-	case ".pdf":
-		contentType = "application/pdf"
-	case ".png":
-		contentType = "image/png"
-	case ".jpg", ".jpeg":
-		contentType = "image/jpeg"
-	case ".webp":
-		contentType = "image/webp"
-	case ".gif":
-		contentType = "image/gif"
-	case ".svg":
-		contentType = "image/svg+xml"
-	case ".mp4":
-		contentType = "video/mp4"
-	case ".webm":
-		contentType = "video/webm"
-	case ".mp3":
-		contentType = "audio/mpeg"
-	case ".wav":
-		contentType = "audio/wav"
-	case ".txt", ".md", ".json", ".js", ".ts", ".go", ".py", ".html", ".css":
-		contentType = "text/plain; charset=utf-8"
+	if !file.IsEncrypted {
+		ext := strings.ToLower(filepath.Ext(file.Name))
+		switch ext {
+		case ".pdf":
+			contentType = "application/pdf"
+		case ".png":
+			contentType = "image/png"
+		case ".jpg", ".jpeg":
+			contentType = "image/jpeg"
+		case ".webp":
+			contentType = "image/webp"
+		case ".gif":
+			contentType = "image/gif"
+		case ".svg":
+			contentType = "image/svg+xml"
+		case ".mp4":
+			contentType = "video/mp4"
+		case ".webm":
+			contentType = "video/webm"
+		case ".mp3":
+			contentType = "audio/mpeg"
+		case ".wav":
+			contentType = "audio/wav"
+		case ".txt", ".md", ".json", ".js", ".ts", ".go", ".py", ".html", ".css":
+			contentType = "text/plain; charset=utf-8"
+		}
 	}
 
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Accept-Ranges", "bytes")
-	if r.URL.Query().Get("inline") == "true" {
+
+	if !file.IsEncrypted && r.URL.Query().Get("inline") == "true" {
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, sanitised))
 	} else {
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitised))
 	}
 	w.Header().Set("X-Accel-Buffering", "no")
 
-	// Check if range request is requested
+	// Range requests:
+	// For encrypted files, Range requests are forbidden because slicing into AES-GCM
+	// framed ciphertext strips the IV and GMAC authentication tag, making authenticated
+	// decryption impossible. Per RFC 7233 Section 3.1, when range requests are not
+	// supported for a resource, the server ignores the Range header and returns 200 OK
+	// with the complete representation.
 	var isRange bool
 	var rangeStart, rangeEnd int64
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		rangeStart, rangeEnd, isRange = parseRangeHeader(rangeHeader, file.SizeBytes)
+	if !file.IsEncrypted {
+		w.Header().Set("Accept-Ranges", "bytes")
+		rangeHeader := r.Header.Get("Range")
+		if rangeHeader != "" {
+			rangeStart, rangeEnd, isRange = parseRangeHeader(rangeHeader, file.SizeBytes)
+		}
+	} else {
+		w.Header().Set("Accept-Ranges", "none")
+		isRange = false
 	}
 
 	var startBlockIndex int
@@ -601,12 +665,21 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", remainingBytes))
 		w.WriteHeader(http.StatusPartialContent)
 	} else {
-		remainingBytes = file.SizeBytes
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", file.SizeBytes))
+		if file.IsEncrypted {
+			remainingBytes = totalStreamSize
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", totalStreamSize))
+		} else {
+			remainingBytes = file.SizeBytes
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", file.SizeBytes))
+		}
 		w.WriteHeader(http.StatusOK)
 	}
 
-	logCtx := s.log.With("file_id", file.ID, "blocks", len(blocks), "size_bytes", file.SizeBytes, "is_range", isRange, "range_start", rangeStart, "range_end", rangeEnd)
+	effectiveSize := file.SizeBytes
+	if file.IsEncrypted {
+		effectiveSize = totalStreamSize
+	}
+	logCtx := s.log.With("file_id", file.ID, "blocks", len(blocks), "size_bytes", effectiveSize, "is_range", isRange, "range_start", rangeStart, "range_end", rangeEnd, "is_encrypted", file.IsEncrypted)
 	logCtx.Info("download started")
 
 	for idx := startBlockIndex; idx < len(blocks); idx++ {
