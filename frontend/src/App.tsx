@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { PrivateRoute, GuestRoute } from './routes/PrivateRoute'
 import { Login } from './pages/Login'
 import { Register } from './pages/Register'
@@ -19,27 +20,29 @@ import { PublicShare } from './pages/PublicShare'
 export function App() {
   return (
     <BrowserRouter>
-      <Routes>
-        {/* Guest routes */}
-        <Route element={<GuestRoute />}>
-          <Route path="/login" element={<Login />} />
-          <Route path="/register" element={<Register />} />
-          <Route path="/verify" element={<Verify />} />
-          <Route path="/forgot-password" element={<ForgotPassword />} />
-          <Route path="/reset-password" element={<ResetPassword />} />
-        </Route>
+      <ErrorBoundary>
+        <Routes>
+          {/* Guest routes */}
+          <Route element={<GuestRoute />}>
+            <Route path="/login" element={<Login />} />
+            <Route path="/register" element={<Register />} />
+            <Route path="/verify" element={<Verify />} />
+            <Route path="/forgot-password" element={<ForgotPassword />} />
+            <Route path="/reset-password" element={<ResetPassword />} />
+          </Route>
 
-        {/* Protected routes */}
-        <Route element={<PrivateRoute />}>
-          <Route path="/dashboard" element={<Dashboard />} />
-        </Route>
+          {/* Protected routes */}
+          <Route element={<PrivateRoute />}>
+            <Route path="/dashboard" element={<Dashboard />} />
+          </Route>
 
-        {/* Public Routes */}
-        <Route path="/share/:token" element={<PublicShare />} />
+          {/* Public Routes */}
+          <Route path="/share/:token" element={<PublicShare />} />
 
-        {/* Catch-all redirect */}
-        <Route path="*" element={<Navigate to="/dashboard" replace />} />
-      </Routes>
+          {/* Catch-all redirect */}
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
+        </Routes>
+      </ErrorBoundary>
     </BrowserRouter>
   )
 }

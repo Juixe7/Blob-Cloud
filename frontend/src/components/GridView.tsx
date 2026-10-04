@@ -217,35 +217,36 @@ const Card = React.memo(function Card({
   )
 })
 
+type GridRowPropsType = {
+  chunkedRows: FileItem[][]
+  columnCount: number
+  selectedIds?: Set<string>
+  onToggleSelect?: (id: string) => void
+  onSingleSelect?: (id: string) => void
+  onSelectRange?: (id: string) => void
+  onOpenFolder: (item: FileItem) => void
+  onOpenFile?: (item: FileItem) => void
+  onContextMenu: (item: FileItem, e: MouseEvent) => void
+}
+
 type GridRowProps = {
   index: number
   style: React.CSSProperties
-  data: {
-    chunkedRows: FileItem[][]
-    columnCount: number
-    selectedIds?: Set<string>
-    onToggleSelect?: (id: string) => void
-    onSingleSelect?: (id: string) => void
-    onSelectRange?: (id: string) => void
-    onOpenFolder: (item: FileItem) => void
-    onOpenFile?: (item: FileItem) => void
-    onContextMenu: (item: FileItem, e: MouseEvent) => void
-  }
-}
+} & GridRowPropsType
 
-const GridRow = React.memo(function GridRow({ index, style, data }: GridRowProps) {
-  const {
-    chunkedRows,
-    columnCount,
-    selectedIds,
-    onToggleSelect,
-    onSingleSelect,
-    onSelectRange,
-    onOpenFolder,
-    onOpenFile,
-    onContextMenu,
-  } = data
-
+const GridRow = React.memo(function GridRow({
+  index,
+  style,
+  chunkedRows,
+  columnCount,
+  selectedIds,
+  onToggleSelect,
+  onSingleSelect,
+  onSelectRange,
+  onOpenFolder,
+  onOpenFile,
+  onContextMenu,
+}: GridRowProps) {
   const rowItems = chunkedRows[index]
   if (!rowItems) return null
 
