@@ -27,6 +27,9 @@ export function PublicShare() {
   const [passwordRequired, setPasswordRequired] = useState(false)
   const [password, setPassword] = useState('')
   const [verifying, setVerifying] = useState(false)
+  const [verifiedToken, setVerifiedToken] = useState<string | null>(() => {
+    return token ? sessionStorage.getItem(`share_token_${token}`) : null
+  })
 
   const [file, setFile] = useState<FileItem | null>(null)
   const [children, setChildren] = useState<FileItem[]>([])
@@ -34,12 +37,14 @@ export function PublicShare() {
   const [decryptModalOpen, setDecryptModalOpen] = useState(false)
   const [decrypting, setDecrypting] = useState(false)
 
-  const fetchShare = async () => {
+  const fetchShare = async (explicitToken?: string) => {
     setLoading(true)
     setError(null)
     setPasswordRequired(false)
+    const activeToken = explicitToken ?? verifiedToken
+    const query = activeToken ? `?share_token=${encodeURIComponent(activeToken)}` : ''
     try {
-      const res = await apiClient.get<{ file: FileItem; children?: FileItem[] }>(`/public/shares/${token}`)
+      const res = await apiClient.get<{ file: FileItem; children?: FileItem[] }>(`/public/shares/${token}${query}`)
       setFile(res.data.file)
       setChildren(res.data.children || [])
     } catch (err: any) {
@@ -68,8 +73,14 @@ export function PublicShare() {
     setVerifying(true)
     setError(null)
     try {
-      await apiClient.post(`/public/shares/${token}/verify`, { password })
-      await fetchShare()
+      const res = await apiClient.post<{ message: string; token?: string }>(`/public/shares/${token}/verify`, { password })
+      if (res.data?.token) {
+        setVerifiedToken(res.data.token)
+        if (token) {
+          sessionStorage.setItem(`share_token_${token}`, res.data.token)
+        }
+      }
+      await fetchShare(res.data?.token)
     } catch (err: any) {
       setError(err.response?.data?.error || 'Invalid password.')
     } finally {
@@ -89,7 +100,11 @@ export function PublicShare() {
 
     setSaving(true)
     try {
-      await apiClient.post(`/public/shares/${token}/save`)
+      const headers: Record<string, string> = {}
+      if (verifiedToken) {
+        headers['X-Share-Token'] = verifiedToken
+      }
+      await apiClient.post(`/public/shares/${token}/save`, {}, { headers })
       setSaveSuccess(true)
       // Notify background drive view to refresh storage / files
       window.dispatchEvent(new Event(UPLOAD_COMPLETE_EVENT))
@@ -107,7 +122,8 @@ export function PublicShare() {
       return
     }
     const base = apiClient.defaults.baseURL ?? '/api'
-    window.location.href = `${base}/public/shares/${token}/download`
+    const query = verifiedToken ? `?share_token=${encodeURIComponent(verifiedToken)}` : ''
+    window.location.href = `${base}/public/shares/${token}/download${query}`
   }
 
   const handleDecryptDownload = async (passphrase: string) => {
@@ -115,7 +131,8 @@ export function PublicShare() {
     setDecrypting(true)
     try {
       const base = apiClient.defaults.baseURL ?? '/api'
-      const customUrl = `${base}/public/shares/${token}/download`
+      const query = verifiedToken ? `?share_token=${encodeURIComponent(verifiedToken)}` : ''
+      const customUrl = `${base}/public/shares/${token}/download${query}`
       await downloadEncryptedFile(file.id, file.name, passphrase, customUrl)
       setDecryptModalOpen(false)
     } catch (err: any) {
@@ -499,6 +516,7 @@ export function PublicShare() {
         file={file}
         onDownload={handleDownload}
         publicToken={token}
+        shareSessionToken={verifiedToken}
       />
 
       <PassphraseModal

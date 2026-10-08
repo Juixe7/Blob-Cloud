@@ -6,6 +6,7 @@ interface MobileNavProps {
   onOpenSettings: () => void
   onUploadFile: () => void
   disableNew?: boolean
+  pendingInvitationsCount?: number
 }
 
 export function MobileNav({
@@ -14,10 +15,12 @@ export function MobileNav({
   onOpenSettings,
   onUploadFile,
   disableNew,
+  pendingInvitationsCount = 0,
 }: MobileNavProps) {
   const items = [
     { id: 'drive', label: 'Drive', icon: <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" /> },
     { id: 'shared', label: 'Shared', icon: <><path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M22 21v-2a4 4 0 00-3-3.87" /><path d="M16 3.13a4 4 0 010 7.75" /></> },
+    { id: 'notifications', label: 'Alerts', icon: <><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.73 21a2 2 0 0 1-3.46 0" /></> },
     { id: 'trash', label: 'Trash', icon: <><path d="M3 6h18" /><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" /><line x1="10" y1="11" x2="10" y2="17" /><line x1="14" y1="11" x2="14" y2="17" /></> },
     { id: 'settings', label: 'Settings', icon: <><circle cx="12" cy="12" r="3" /><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72l1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" /></> },
   ]
@@ -51,12 +54,15 @@ export function MobileNav({
               className="flex flex-col items-center justify-center w-16 h-12 gap-1 text-zinc-500 transition-colors hover:text-zinc-300"
             >
               <div className={cn(
-                'flex items-center justify-center h-8 w-14 rounded-full transition-colors',
+                'relative flex items-center justify-center h-8 w-14 rounded-full transition-colors',
                 isActive ? 'bg-amber-500/20 text-amber-400' : ''
               )}>
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                   {item.icon}
                 </svg>
+                {item.id === 'notifications' && pendingInvitationsCount > 0 && (
+                  <span className="absolute top-0.5 right-2 h-2 w-2 rounded-full bg-amber-500 ring-2 ring-arch-950 animate-pulse" />
+                )}
               </div>
               <span className={cn('text-[10px] font-medium', isActive ? 'text-amber-400' : '')}>
                 {item.label}

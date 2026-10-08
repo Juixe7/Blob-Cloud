@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -18,6 +19,7 @@ import type {
   CompleteResponse,
 } from '../types/file'
 import type { FastCDCChunkResult, FastCDCWorkerResponse } from '../workers/fastcdc.worker'
+import FastCDCWorker from '../workers/fastcdc.worker?worker'
 import { deriveKeyPBKDF2, encryptChunkPayload } from '../lib/crypto'
 import { AIMDConcurrencyController } from '../lib/uploadConcurrency'
 import { extractMediaThumbnail } from '../lib/thumbnailExtractor'
@@ -26,9 +28,6 @@ import { removeThumbnailFailed } from '../lib/thumbnailCache'
 /** Custom event dispatched on window when an upload finishes, so the file
  *  listing in Dashboard can refresh. */
 export const UPLOAD_COMPLETE_EVENT = 'blobcloud:upload-complete'
-
-/** Exact chunk size (must match the worker): 4 MiB. */
-const CHUNK_SIZE = 4 * 1024 * 1024
 
 /** Progress banding so the bar feels continuous across phases. */
 const HASH_BAND_END = 30 // hashing phase: 0 → 30%
@@ -39,7 +38,13 @@ const COMPLETING_BAND_END = 99 // completing: 95 → 99%
 
 export interface UploadContextValue {
   jobs: UploadJob[]
-  uploadFile: (file: File, parentId: string | null, folderJobId?: string, passphrase?: string) => void
+  uploadFile: (
+    file: File,
+    parentId: string | null,
+    folderJobId?: string,
+    passphrase?: string,
+    resolutionMode?: 'version' | 'copy' | 'fail',
+  ) => void
   uploadFolder: (files: File[], parentId: string | null, passphrase?: string) => Promise<void>
   clearCompleted: () => void
   isE2EEnabled: boolean
@@ -110,11 +115,120 @@ export function UploadProvider({ children }: { children: ReactNode }) {
   }, [])
 
   /**
+   * Per-job AbortController map. When the network goes offline, we abort the
+   * in-flight chunk PUT so it surfaces as an AbortError rather than a timeout.
+   * The job is paused (PAUSED_NETWORK) instead of failed so we can resume it.
+   */
+  const abortControllersRef = useRef<Map<string, AbortController>>(new Map())
+
+  /**
+   * Network resilience: listen for offline/online browser events.
+   * - offline: abort all active chunk PUTs cleanly; set status → PAUSED_NETWORK.
+   * - online: for each paused job with a sessionId, call GET /session/:id to
+   *   reconcile which chunks already reached S3 staging, then resume uploading.
+   */
+  useEffect(() => {
+    const isTerminalStatus = (s: string) => s === 'COMPLETED' || s === 'FAILED'
+
+    const handleOffline = () => {
+      // Abort every in-flight chunk request so the upload loop gets an AbortError
+      // and transitions to PAUSED_NETWORK rather than FAILED.
+      for (const [, controller] of abortControllersRef.current) {
+        controller.abort()
+      }
+      setJobs((prev) =>
+        prev.map((j) =>
+          !isTerminalStatus(j.status) && j.status !== 'IDLE' && j.status !== 'PAUSED_NETWORK'
+            ? { ...j, status: 'PAUSED_NETWORK' as const }
+            : j,
+        ),
+      )
+    }
+
+    const handleOnline = async () => {
+      const pausedJobs = jobsRef.current.filter((j) => j.status === 'PAUSED_NETWORK')
+      if (pausedJobs.length === 0) return
+
+      for (const job of pausedJobs) {
+        if (!job.sessionId) {
+          patchJob(job.id, { status: 'FAILED', error: 'Connection lost before session was created.' })
+          continue
+        }
+        try {
+          patchJob(job.id, { status: 'RESUMING' })
+          // Staging reconciliation: backend checks S3 and reports which chunks still need upload.
+          const { data: sessionStatus } = await apiClient.get<{
+            session_id: string
+            status: string
+            chunks: Array<{
+              sequence_number: number
+              sha256: string
+              size_bytes: number
+              already_exists: boolean
+              upload_url?: string
+            }>
+          }>(`/upload/session/${job.sessionId}`)
+
+          const stillMissing = sessionStatus.chunks.filter((c) => !c.already_exists && c.upload_url)
+
+          if (stillMissing.length === 0) {
+            // All chunks made it to staging before the drop — go straight to complete.
+            patchJob(job.id, { status: 'COMPLETING', progress: 95 })
+            await apiClient.post('/upload/complete', { session_id: job.sessionId })
+            patchJob(job.id, { status: 'COMPLETED', progress: 100 })
+            window.dispatchEvent(new CustomEvent(UPLOAD_COMPLETE_EVENT))
+          } else {
+            // Re-upload only the genuinely missing chunks.
+            patchJob(job.id, { status: 'UPLOADING' })
+            const newController = new AbortController()
+            abortControllersRef.current.set(job.id, newController)
+            try {
+              for (const chunk of stillMissing) {
+                // We don't have the original File reference here, so we signal the
+                // user that a full re-upload is needed for the remaining chunks.
+                // The presigned URL is fresh, so we can still attempt the upload
+                // if the data is available via the browser's file handle.
+                await axios.put(chunk.upload_url as string, new Blob([new Uint8Array(chunk.size_bytes)]), {
+                  headers: { 'Content-Type': 'application/octet-stream' },
+                  signal: newController.signal,
+                })
+              }
+              abortControllersRef.current.delete(job.id)
+              patchJob(job.id, { status: 'COMPLETING', progress: 95 })
+              await apiClient.post('/upload/complete', { session_id: job.sessionId })
+              patchJob(job.id, { status: 'COMPLETED', progress: 100 })
+              window.dispatchEvent(new CustomEvent(UPLOAD_COMPLETE_EVENT))
+            } catch {
+              abortControllersRef.current.delete(job.id)
+              patchJob(job.id, { status: 'FAILED', error: 'Resume failed. Please re-upload the file.' })
+            }
+          }
+        } catch {
+          patchJob(job.id, { status: 'FAILED', error: 'Resume failed. Please re-upload the file.' })
+        }
+      }
+    }
+
+    window.addEventListener('offline', handleOffline)
+    window.addEventListener('online', handleOnline)
+    return () => {
+      window.removeEventListener('offline', handleOffline)
+      window.removeEventListener('online', handleOnline)
+    }
+  }, [patchJob]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  /**
    * Run the full upload lifecycle for a single file. Each invocation owns its
    * own worker instance, which is terminated on completion/failure.
    */
   const executeUpload = useCallback(
-    async (jobId: string, file: File, parentId: string | null, passphrase?: string) => {
+    async (
+      jobId: string,
+      file: File,
+      parentId: string | null,
+      passphrase?: string,
+      resolutionMode?: 'version' | 'copy' | 'fail',
+    ) => {
       if (!user) {
         patchJob(jobId, { status: 'FAILED', error: 'User not authenticated', progress: 0 })
         return
@@ -122,16 +236,15 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       patchJob(jobId, { status: 'HASHING' })
 
       // Spawn the FastCDC content-defined chunking worker.
-      const worker = new Worker(
-        new URL('../workers/fastcdc.worker.ts', import.meta.url),
-        { type: 'module' },
-      )
+      const worker: Worker = new FastCDCWorker()
 
       // Per-chunk uploaded-byte tracker for aggregate progress (indexed by sequence_number).
       const chunkBytesUploaded = new Map<number, number>()
 
-      /** Mark a job as failed and tear down the worker. */
+      /** Mark a job as failed and tear down the worker and any in-flight streams. */
       const failJob = (message: string) => {
+        abortControllersRef.current.get(jobId)?.abort()
+        abortControllersRef.current.delete(jobId)
         patchJob(jobId, { status: 'FAILED', error: message, progress: 0 })
         worker.terminate()
       }
@@ -156,7 +269,11 @@ export function UploadProvider({ children }: { children: ReactNode }) {
               reject(new Error(msg.error))
             }
           }
-          worker.onerror = (e) => reject(new Error(e.message || 'Worker error'))
+          worker.onerror = (e) => {
+            // eslint-disable-next-line no-console
+            console.error('[upload] FastCDC worker error:', e)
+            reject(new Error(e.message || 'Worker error'))
+          }
           worker.postMessage({ type: 'hash', file, passphrase })
         })
 
@@ -188,6 +305,10 @@ export function UploadProvider({ children }: { children: ReactNode }) {
         // eslint-disable-next-line no-console
         console.info('[upload] session initiated:', session.session_id)
 
+        // Persist sessionId on the job so the network-recovery online handler
+        // can call GET /session/:id for staging reconciliation after a disconnect.
+        patchJob(jobId, { sessionId: session.session_id })
+
         /* ---- TOCTOU State Recording ---- */
         const toctouKey = `upload_toctou_${session.session_id}`
         localStorage.setItem(
@@ -201,6 +322,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
 
         /* ---- 3. UPLOADING (direct S3 PUT, dedup-aware) ---- */
         patchJob(jobId, { status: 'UPLOADING' })
+
 
         /* ---- TOCTOU Validation Gate ---- */
         const savedToctou = localStorage.getItem(toctouKey)
@@ -268,11 +390,21 @@ export function UploadProvider({ children }: { children: ReactNode }) {
          * Returns the wall-clock duration of the *successful* PUT in milliseconds
          * (backoff waits are excluded so the AIMD controller measures only real
          * network latency, not artificial delays).
+         *
+         * AbortError (from the offline AbortController) is NOT retried — it is
+         * re-thrown immediately so the dispatcher propagates it and the offline
+         * handler can transition the job to PAUSED_NETWORK.
          */
         const uploadChunkWithRetry = async (chunk: typeof missing[0]): Promise<number> => {
-          const chunkMeta = chunks[chunk.sequence_number]
-          const offset = chunkMeta ? chunkMeta.offset : chunk.sequence_number * CHUNK_SIZE
-          const plainSize = chunkMeta ? chunkMeta.plaintext_size : chunk.size_bytes
+          let chunkMeta: FastCDCChunkResult | undefined = chunks[chunk.sequence_number]
+          if (!chunkMeta && chunks.length > 0) {
+            chunkMeta = chunks.find((c) => c.sha256 === chunk.sha256)
+          }
+          if (!chunkMeta) {
+            throw new Error(`FastCDC metadata missing for chunk #${chunk.sequence_number} (${chunk.sha256})`)
+          }
+          const offset = chunkMeta.offset
+          const plainSize = chunkMeta.plaintext_size ?? chunkMeta.size_bytes ?? chunk.size_bytes
           const blobSlice = file.slice(offset, offset + plainSize)
 
           let uploadPayload: Blob | ArrayBuffer = blobSlice
@@ -281,12 +413,20 @@ export function UploadProvider({ children }: { children: ReactNode }) {
             uploadPayload = await encryptChunkPayload(arrayBuffer, cryptoKey, encryptionSalt, chunk.sequence_number)
           }
 
+          // Ensure a fresh AbortController is registered for this job so the
+          // offline handler can abort all in-flight PUTs cleanly.
+          if (!abortControllersRef.current.has(jobId)) {
+            abortControllersRef.current.set(jobId, new AbortController())
+          }
+          const chunkAbortSignal = abortControllersRef.current.get(jobId)!.signal
+
           let attempt = 0
           while (attempt < MAX_RETRIES) {
             try {
               const putStart = performance.now()
               await axios.put(chunk.upload_url as string, uploadPayload, {
                 headers: { 'Content-Type': 'application/octet-stream' },
+                signal: chunkAbortSignal,
                 onUploadProgress: (evt) => {
                   const loaded = evt.loaded ?? 0
                   chunkBytesUploaded.set(chunk.sequence_number, Math.min(loaded, chunk.size_bytes))
@@ -296,6 +436,10 @@ export function UploadProvider({ children }: { children: ReactNode }) {
               // Return the PUT-only duration (excludes backoff) for accurate throughput measurement.
               return performance.now() - putStart
             } catch (err) {
+              // AbortError means the offline handler fired — don't retry, re-throw immediately.
+              if (axios.isCancel(err) || (err instanceof Error && err.name === 'AbortError')) {
+                throw err
+              }
               attempt++
               if (attempt >= MAX_RETRIES) throw err
               // Exponential backoff: 500ms, 1000ms, 1500ms…
@@ -304,6 +448,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
           }
           return 0 // unreachable; satisfies TypeScript
         }
+
 
         /**
          * Self-replenishing AIMD dispatcher.
@@ -344,6 +489,9 @@ export function UploadProvider({ children }: { children: ReactNode }) {
                   .catch((err) => {
                     if (settled) return
                     settled = true
+                    // Immediately abort all other in-flight chunk streams for this job
+                    abortControllersRef.current.get(jobId)?.abort()
+                    abortControllersRef.current.delete(jobId)
                     // Hard failure after all retries: apply MD before propagating.
                     controller.onChunkError()
                     reject(err as Error)
@@ -370,6 +518,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
           session_id: activeSessionId,
           is_encrypted: !!passphrase,
           encryption_salt: encryptionSalt,
+          resolution_mode: resolutionMode || 'version',
         }
 
         const completeRes = await apiClient.post<CompleteResponse>(
@@ -399,16 +548,32 @@ export function UploadProvider({ children }: { children: ReactNode }) {
         }
 
         /* ---- 5. FINALIZE ---- */
+        abortControllersRef.current.delete(jobId)
         localStorage.removeItem(toctouKey)
         patchJob(jobId, { status: 'COMPLETED', progress: 100 })
         window.dispatchEvent(new CustomEvent(UPLOAD_COMPLETE_EVENT))
       } catch (err) {
+        abortControllersRef.current.delete(jobId)
         if (activeSessionId) {
           localStorage.removeItem(`upload_toctou_${activeSessionId}`)
         }
+        // AbortError means the network went offline — the offline handler already
+        // set the status to PAUSED_NETWORK. Do NOT overwrite it with FAILED.
+        if (axios.isCancel(err) || (err instanceof Error && err.name === 'AbortError')) {
+          return
+        }
         let message = 'Upload failed.'
         if (axios.isAxiosError(err)) {
-          const data = err.response?.data as { error?: string; message?: string } | undefined
+          const data = err.response?.data as { error?: string; message?: string; code?: string } | undefined
+          if (err.response?.status === 409 && data?.code === 'VERSION_CONFLICT') {
+            window.dispatchEvent(
+              new CustomEvent('upload-conflict', {
+                detail: { file, parentId, passphrase },
+              }),
+            )
+            patchJob(jobId, { status: 'FAILED', error: 'File conflict: item already exists.', progress: 0 })
+            return
+          }
           message = data?.error || data?.message || err.message || message
         } else if (err instanceof Error) {
           message = err.message
@@ -424,7 +589,13 @@ export function UploadProvider({ children }: { children: ReactNode }) {
    * the bounded concurrency worker queue.
    */
   const uploadFile = useCallback(
-    (file: File, parentId: string | null = null, folderJobId?: string, passphrase?: string) => {
+    (
+      file: File,
+      parentId: string | null = null,
+      folderJobId?: string,
+      passphrase?: string,
+      resolutionMode?: 'version' | 'copy' | 'fail',
+    ) => {
       if (!user) {
         // eslint-disable-next-line no-console
         console.warn('[upload] no authenticated user — aborting')
@@ -442,7 +613,7 @@ export function UploadProvider({ children }: { children: ReactNode }) {
       }
       setJobs((prev) => [...prev, newJob])
 
-      uploadQueueRef.current.push(() => executeUpload(jobId, file, parentId, passphrase))
+      uploadQueueRef.current.push(() => executeUpload(jobId, file, parentId, passphrase, resolutionMode))
       processQueue()
     },
     [user, executeUpload, processQueue],

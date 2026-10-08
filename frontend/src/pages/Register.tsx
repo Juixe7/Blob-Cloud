@@ -80,54 +80,78 @@ export function Register() {
 
   return (
     <main className="min-h-screen grid grid-cols-1 md:grid-cols-12 bg-arch-950 text-zinc-100 font-sans select-none">
-      {/* LEFT COLUMN: Asymmetrical Brand & Technical Specs (40% / 5 cols) */}
-      <div className="hidden md:flex md:col-span-5 flex-col justify-between border-r border-arch-border bg-arch-950 p-10 relative bg-arch-grid">
+      {/* LEFT COLUMN: Brand & Product Highlights (40% / 5 cols) */}
+      <div className="hidden md:flex md:col-span-5 flex-col justify-between border-r border-arch-border bg-arch-950 p-8 lg:p-10 relative bg-arch-grid">
         <div>
           <div className="flex items-center gap-3">
             <div className="flex h-9 w-9 items-center justify-center rounded bg-amber-500 text-arch-950 font-display font-black text-lg shadow-sharp">
               B
             </div>
             <span className="font-display text-xl font-bold tracking-tight text-white">Blob-Cloud</span>
-            <span className="font-mono text-[10px] font-semibold text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded px-2 py-0.5 ml-auto">
-              NEW OPERATOR
-            </span>
           </div>
 
-          <div className="mt-16">
-            <h1 className="font-display text-3xl font-extrabold tracking-tight text-white leading-tight">
-              Create Your <br />
-              Secure Workspace
+          <div className="mt-10 lg:mt-12">
+            <h1 className="font-display text-2xl lg:text-3xl font-extrabold tracking-tight text-white leading-tight">
+              Cloud storage <br />
+              built for speed and simplicity.
             </h1>
-            <p className="mt-4 text-xs leading-relaxed text-zinc-400 font-sans max-w-sm">
-              Provision an encrypted cloud drive featuring instant block deduplication, background workers, and real-time tab sync.
+            <p className="mt-3 text-xs leading-relaxed text-zinc-400 font-sans max-w-sm">
+              Get your private cloud drive up and running in seconds with generous storage, real-time sync, and seamless sharing.
             </p>
           </div>
         </div>
 
-        {/* Technical Features Ticker (JetBrains Mono) */}
-        <div className="border-t border-arch-border pt-6 font-mono text-[11px] space-y-2 text-zinc-500">
-          <div className="flex items-center justify-between">
-            <span className="text-zinc-400">STORAGE DEPLOYMENT</span>
-            <span className="text-amber-400 font-semibold">AUTOMATED</span>
+        {/* Feature Highlights */}
+        <div className="border-t border-arch-border pt-5 space-y-3">
+          <div className="flex items-start gap-2.5">
+            <div className="mt-0.5 text-amber-400/90 shrink-0">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z" />
+                <path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z" />
+              </svg>
+            </div>
+            <div>
+              <p className="text-xs font-medium text-zinc-300">Zero Setup</p>
+              <p className="text-[11px] text-zinc-500 leading-snug">Create your account and start uploading files in seconds.</p>
+            </div>
           </div>
-          <div className="flex items-center justify-between">
-            <span className="text-zinc-400">SESSION BLACKLISTING</span>
-            <span className="text-zinc-300">ACTIVE</span>
+
+          <div className="flex items-start gap-2.5">
+            <div className="mt-0.5 text-amber-400/90 shrink-0">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                <circle cx="9" cy="7" r="4" />
+                <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+                <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+              </svg>
+            </div>
+            <div>
+              <p className="text-xs font-medium text-zinc-300">Seamless Collaboration</p>
+              <p className="text-[11px] text-zinc-500 leading-snug">Granular viewer/editor permissions and secure public links.</p>
+            </div>
           </div>
-          <div className="flex items-center justify-between">
-            <span className="text-zinc-400">CONCURRENCY SECTOR</span>
-            <span className="text-zinc-300">BOUNDED (3x)</span>
+
+          <div className="flex items-start gap-2.5">
+            <div className="mt-0.5 text-amber-400/90 shrink-0">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67" />
+              </svg>
+            </div>
+            <div>
+              <p className="text-xs font-medium text-zinc-300">Real-Time Sync</p>
+              <p className="text-[11px] text-zinc-500 leading-snug">Instant updates and delta sync across all your tabs and devices.</p>
+            </div>
           </div>
         </div>
       </div>
 
-      {/* RIGHT COLUMN: Registration Form Engine (60% / 7 cols) */}
+      {/* RIGHT COLUMN: Registration Form (60% / 7 cols) */}
       <div className="md:col-span-7 flex flex-col justify-center items-center p-6 md:p-16 bg-arch-900">
         <div className="w-full max-w-sm">
           {/* Header */}
           <div className="mb-8">
-            <h2 className="font-display text-xl font-bold text-white tracking-tight">Register Account</h2>
-            <p className="mt-1 font-mono text-xs text-zinc-500">Set up your credentials to deploy your workspace.</p>
+            <h2 className="font-display text-2xl font-bold text-white tracking-tight">Create your account</h2>
+            <p className="mt-1 text-sm text-zinc-400">Start storing and organizing your files today.</p>
           </div>
 
           {/* Server error */}
@@ -151,21 +175,21 @@ export function Register() {
             <div className="absolute inset-0 flex items-center">
               <div className="w-full border-t border-arch-border" />
             </div>
-            <span className="relative bg-arch-900 px-3 font-mono text-[10px] uppercase tracking-widest text-zinc-500">
-              OR REGISTER WITH EMAIL
+            <span className="relative bg-arch-900 px-3 text-xs text-zinc-400">
+              or register with email
             </span>
           </div>
 
           <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
             <div>
-              <label htmlFor="reg-email" className="mb-1 block font-mono text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
-                EMAIL ADDRESS
+              <label htmlFor="reg-email" className="mb-1.5 block text-xs font-medium text-zinc-300">
+                Email address
               </label>
               <Input
                 id="reg-email"
                 type="email"
                 autoComplete="email"
-                placeholder="operator@blobcloud.dev"
+                placeholder="name@example.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 error={fieldErrors.email}
@@ -174,8 +198,8 @@ export function Register() {
             </div>
 
             <div>
-              <label htmlFor="reg-password" className="mb-1 block font-mono text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
-                PASSWORD
+              <label htmlFor="reg-password" className="mb-1.5 block text-xs font-medium text-zinc-300">
+                Password
               </label>
               <Input
                 id="reg-password"
@@ -190,8 +214,8 @@ export function Register() {
             </div>
 
             <div>
-              <label htmlFor="reg-confirm" className="mb-1 block font-mono text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
-                CONFIRM PASSWORD
+              <label htmlFor="reg-confirm" className="mb-1.5 block text-xs font-medium text-zinc-300">
+                Confirm password
               </label>
               <Input
                 id="reg-confirm"
@@ -206,17 +230,17 @@ export function Register() {
             </div>
 
             <Button type="submit" loading={loading} className="mt-3">
-              Register Account
+              Create Account
             </Button>
           </form>
 
-          <p className="mt-8 text-center text-xs text-zinc-500 font-mono">
-            Already registered?{' '}
+          <p className="mt-8 text-center text-xs text-zinc-400">
+            Already have an account?{' '}
             <Link
               to="/login"
-              className="text-amber-400 hover:text-amber-300 font-semibold transition-colors underline underline-offset-4"
+              className="text-amber-400 hover:text-amber-300 font-medium transition-colors hover:underline"
             >
-              Sign In
+              Sign in
             </Link>
           </p>
         </div>

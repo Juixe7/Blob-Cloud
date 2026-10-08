@@ -9,9 +9,10 @@ import (
 
 // DeltaSyncResponse is the JSON response payload for GET /api/sync/delta.
 type DeltaSyncResponse struct {
-	Entries    []*domain.JournalEntry `json:"entries"`
-	NextCursor int64                  `json:"next_cursor"`
-	HasMore    bool                   `json:"has_more"`
+	Entries     []*domain.JournalEntry `json:"entries"`
+	NextCursor  int64                  `json:"next_cursor"`
+	HasMore     bool                   `json:"has_more"`
+	ResetCursor bool                   `json:"reset_cursor,omitempty"`
 }
 
 // HandleSyncDelta retrieves incremental journal changes since a given cursor.
@@ -42,6 +43,18 @@ func (s *Server) HandleSyncDelta(w http.ResponseWriter, r *http.Request) {
 		if val, err := strconv.Atoi(limitStr); err == nil && val > 0 {
 			limit = val
 		}
+	}
+
+	// Detect client cursor drift (e.g. database rollback, pruned records, or stale local cache ahead of DB)
+	latestCursor, err := s.journal.GetLatestCursor(r.Context(), userID)
+	if err == nil && since > latestCursor {
+		writeJSON(w, http.StatusOK, DeltaSyncResponse{
+			Entries:     []*domain.JournalEntry{},
+			NextCursor:  latestCursor,
+			HasMore:     false,
+			ResetCursor: true,
+		})
+		return
 	}
 
 	entries, nextCursor, hasMore, err := s.journal.ListSince(r.Context(), userID, since, limit)

@@ -318,11 +318,20 @@ func (s *UploadService) GetSession(ctx context.Context, id string, userID string
 		// Only pending chunks need a URL; completed/aborted sessions return as-is.
 		if session.Status == domain.SessionStatusInitiated && !b.IsUploaded {
 			stagingKey := fmt.Sprintf("staging/%s/%d", session.ID, b.SequenceNumber)
-			url, err := s.storage.GenerateStagingUploadURL(ctx, stagingKey, 30*time.Minute)
-			if err != nil {
-				return nil, fmt.Errorf("regenerate staging upload url: %w", err)
+			// Staging reconciliation: check if this chunk already landed in S3 staging
+			// (e.g. the client uploaded it before a network drop). If so, skip re-upload.
+			if meta, headErr := s.storage.HeadObject(ctx, stagingKey); headErr == nil &&
+				meta.ContentLength == int64(b.SizeBytes) {
+				// Chunk is already safely quarantined in staging — no re-upload needed.
+				rc.AlreadyExists = true
+			} else {
+				// Chunk is genuinely missing — issue a fresh presigned PUT URL.
+				url, err := s.storage.GenerateStagingUploadURL(ctx, stagingKey, 30*time.Minute)
+				if err != nil {
+					return nil, fmt.Errorf("regenerate staging upload url: %w", err)
+				}
+				rc.UploadURL = url
 			}
-			rc.UploadURL = url
 		}
 		resp.Chunks = append(resp.Chunks, rc)
 	}
@@ -330,11 +339,21 @@ func (s *UploadService) GetSession(ctx context.Context, id string, userID string
 }
 
 // CompleteRequest is the body of POST /api/upload/complete.
+// ResolutionMode specifies conflict behavior when an active file with the same
+// name exists in the target destination:
+//   - "" or "version": Archives previous state to file_versions and updates the file (default).
+//   - "copy": Auto-generates a unique filename (e.g. "report (1).pdf") and creates a separate file.
+//   - "fail": Aborts and returns ErrFileConflict (mapped to HTTP 409 Conflict).
 type CompleteRequest struct {
 	SessionID      string `json:"session_id"`
 	IsEncrypted    bool   `json:"is_encrypted"`
 	EncryptionSalt string `json:"encryption_salt,omitempty"`
+	ResolutionMode string `json:"resolution_mode,omitempty"`
 }
+
+// ErrFileConflict is returned when an upload complete request has ResolutionMode "fail"
+// and an active file with the same name already exists in the target destination.
+var ErrFileConflict = errors.New("file conflict: an active file with this name already exists in this destination")
 
 // CompleteResponse confirms a finished upload and returns the new file id.
 type CompleteResponse struct {
@@ -492,7 +511,18 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 			})
 		}
 
-		// 4. Handle File Versioning / Collision
+		// 4. Handle File Versioning / Collision with Transaction Advisory Locking
+		// Serializes concurrent uploads of the same filename to the same parent folder,
+		// preventing duplicate key collisions and version number races.
+		parentLockStr := "root"
+		if session.ParentID != nil {
+			parentLockStr = *session.ParentID
+		}
+		uploadLockKey := fmt.Sprintf("upload_file_%s_%s_%s", session.UserID, parentLockStr, session.Filename)
+		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", uploadLockKey); err != nil {
+			return fmt.Errorf("acquire upload completion lock: %w", err)
+		}
+
 		existingFile, err := files.GetFileByNameAndParent(ctx, session.UserID, session.Filename, session.ParentID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("check existing file: %w", err)
@@ -502,49 +532,107 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 			return fmt.Errorf("a folder named %q already exists in this destination", session.Filename)
 		}
 
+		isVersionUpdate := false
 		if existingFile != nil && !existingFile.IsDirectory {
-			// Collision exists: backup old state to file_versions
-			oldBlocks, err := blocks.ListFileBlockHashes(ctx, existingFile.ID)
-			if err != nil {
-				return fmt.Errorf("list old blocks: %w", err)
+			if req.ResolutionMode == "fail" {
+				return ErrFileConflict
 			}
-			
-			// Count existing versions to increment
-			versions, err := files.GetFileVersions(ctx, existingFile.ID)
-			if err != nil {
-				return fmt.Errorf("list versions: %w", err)
-			}
-			nextVersion := len(versions) + 1
-			
-			fileVersion := &domain.FileVersion{
-				FileID:        existingFile.ID,
-				VersionNumber: nextVersion,
-				SizeBytes:     existingFile.SizeBytes,
-				ChunkHashes:   oldBlocks,
-			}
-			if err := files.CreateFileVersion(ctx, fileVersion); err != nil {
-				return fmt.Errorf("create file version: %w", err)
-			}
-			
-			// Update the active file record
-			existingFile.SizeBytes = session.TotalSize
-			existingFile.MimeType = detectMimeType(session.Filename)
-			existingFile.Status = "ACTIVE"
-			existingFile.IsEncrypted = req.IsEncrypted
-			if req.EncryptionSalt != "" {
-				existingFile.EncryptionSalt = &req.EncryptionSalt
+
+			if req.ResolutionMode == "copy" {
+				// Keep Both: Auto-generate an available clash-free filename
+				ext := filepath.Ext(session.Filename)
+				base := strings.TrimSuffix(session.Filename, ext)
+				targetName := ""
+				for i := 1; i <= 1000; i++ {
+					candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
+					f, err := files.GetFileByNameAndParent(ctx, session.UserID, candidate, session.ParentID)
+					if errors.Is(err, sql.ErrNoRows) || f == nil {
+						targetName = candidate
+						break
+					}
+				}
+				if targetName == "" {
+					targetName = fmt.Sprintf("%s (%d)%s", base, time.Now().Unix(), ext)
+				}
+
+				file := &domain.File{
+					UserID:      session.UserID,
+					Name:        targetName,
+					ParentID:    session.ParentID,
+					SizeBytes:   session.TotalSize,
+					MimeType:    detectMimeType(targetName),
+					Status:      "ACTIVE",
+					IsEncrypted: req.IsEncrypted,
+				}
+				if req.EncryptionSalt != "" {
+					file.EncryptionSalt = &req.EncryptionSalt
+				}
+				if err := files.Create(ctx, file); err != nil {
+					return err
+				}
+				result.FileID = file.ID
+
+				if err := blocks.LinkBlocksToFile(ctx, file.ID, seqs); err != nil {
+					return err
+				}
+
+				uploader, err := users.GetByID(ctx, session.UserID)
+				if err != nil {
+					return fmt.Errorf("resolve uploader for owner perm: %w", err)
+				}
+				if err := perms.GrantPermission(ctx, &domain.Permission{
+					FileID:       file.ID,
+					GranteeEmail: uploader.Email,
+					Role:         domain.RoleOwner,
+				}); err != nil {
+					return err
+				}
 			} else {
-				existingFile.EncryptionSalt = nil
-			}
-			if err := files.Update(ctx, existingFile); err != nil {
-				return fmt.Errorf("update existing file metadata: %w", err)
-			}
-			
-			result.FileID = existingFile.ID
-			
-			// Replace blocks
-			if err := blocks.ReplaceBlocksForFile(ctx, existingFile.ID, seqs); err != nil {
-				return err
+				// Collision exists: backup old state to file_versions (version mode)
+				isVersionUpdate = true
+				oldBlocks, err := blocks.ListFileBlockHashes(ctx, existingFile.ID)
+				if err != nil {
+					return fmt.Errorf("list old blocks: %w", err)
+				}
+				
+				// Atomically resolve next version number from DB to eliminate gaps and race conditions
+				var maxVersion int
+				err = tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version_number), 0) FROM file_versions WHERE file_id = $1", existingFile.ID).Scan(&maxVersion)
+				if err != nil {
+					return fmt.Errorf("resolve next version number: %w", err)
+				}
+				nextVersion := maxVersion + 1
+				
+				fileVersion := &domain.FileVersion{
+					FileID:        existingFile.ID,
+					VersionNumber: nextVersion,
+					SizeBytes:     existingFile.SizeBytes,
+					ChunkHashes:   oldBlocks,
+				}
+				if err := files.CreateFileVersion(ctx, fileVersion); err != nil {
+					return fmt.Errorf("create file version: %w", err)
+				}
+				
+				// Update the active file record
+				existingFile.SizeBytes = session.TotalSize
+				existingFile.MimeType = detectMimeType(session.Filename)
+				existingFile.Status = "ACTIVE"
+				existingFile.IsEncrypted = req.IsEncrypted
+				if req.EncryptionSalt != "" {
+					existingFile.EncryptionSalt = &req.EncryptionSalt
+				} else {
+					existingFile.EncryptionSalt = nil
+				}
+				if err := files.Update(ctx, existingFile); err != nil {
+					return fmt.Errorf("update existing file metadata: %w", err)
+				}
+				
+				result.FileID = existingFile.ID
+				
+				// Replace blocks
+				if err := blocks.ReplaceBlocksForFile(ctx, existingFile.ID, seqs); err != nil {
+					return err
+				}
 			}
 		} else {
 			// No collision, create new file
@@ -592,7 +680,7 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 		// 8. Record in Journal for Delta Synchronization (Fan-out to all collaborators)
 		if s.journal != nil {
 			action := domain.ActionFileCreated
-			if existingFile != nil && !existingFile.IsDirectory {
+			if isVersionUpdate {
 				action = domain.ActionFileUpdated
 			}
 			recordedAction = action

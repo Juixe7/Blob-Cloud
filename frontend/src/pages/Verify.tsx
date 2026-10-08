@@ -85,51 +85,52 @@ export function Verify() {
 
   return (
     <main className="min-h-screen grid grid-cols-1 md:grid-cols-12 bg-arch-950 text-zinc-100 font-sans select-none">
-      {/* LEFT COLUMN: Asymmetrical Brand & Technical Specs (40% / 5 cols) */}
-      <div className="hidden md:flex md:col-span-5 flex-col justify-between border-r border-arch-border bg-arch-950 p-10 relative bg-arch-grid">
+      {/* LEFT COLUMN: Brand & Product Highlights (40% / 5 cols) */}
+      <div className="hidden md:flex md:col-span-5 flex-col justify-between border-r border-arch-border bg-arch-950 p-8 lg:p-10 relative bg-arch-grid">
         <div>
           <div className="flex items-center gap-3">
             <div className="flex h-9 w-9 items-center justify-center rounded bg-amber-500 text-arch-950 font-display font-black text-lg shadow-sharp">
               B
             </div>
             <span className="font-display text-xl font-bold tracking-tight text-white">Blob-Cloud</span>
-            <span className="font-mono text-[10px] font-semibold text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded px-2 py-0.5 ml-auto">
-              EMAIL VERIFY
-            </span>
           </div>
 
-          <div className="mt-16">
-            <h1 className="font-display text-3xl font-extrabold tracking-tight text-white leading-tight">
-              Multi-Factor <br />
-              Activation Gate
+          <div className="mt-10 lg:mt-12">
+            <h1 className="font-display text-2xl lg:text-3xl font-extrabold tracking-tight text-white leading-tight">
+              Verify your <br />
+              email address.
             </h1>
-            <p className="mt-4 text-xs leading-relaxed text-zinc-400 font-sans max-w-sm">
-              Cryptographically generated 6-digit verification token dispatched to your inbox to activate your workspace.
+            <p className="mt-3 text-xs leading-relaxed text-zinc-400 font-sans max-w-sm">
+              Enter the 6-digit confirmation code sent to your email to activate your account and start storing files.
             </p>
           </div>
         </div>
 
-        {/* Technical Features Ticker (JetBrains Mono) */}
-        <div className="border-t border-arch-border pt-6 font-mono text-[11px] space-y-2 text-zinc-500">
-          <div className="flex items-center justify-between">
-            <span className="text-zinc-400">ACTIVATION CODE</span>
-            <span className="text-amber-400 font-semibold">6-DIGIT NUMERIC</span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-zinc-400">EXPIRATION TTL</span>
-            <span className="text-zinc-300">15 MINUTES</span>
+        {/* Feature Highlights */}
+        <div className="border-t border-arch-border pt-5 space-y-3">
+          <div className="flex items-start gap-2.5">
+            <div className="mt-0.5 text-amber-400/90 shrink-0">
+              <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect width="20" height="16" x="2" y="4" rx="2" />
+                <path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7" />
+              </svg>
+            </div>
+            <div>
+              <p className="text-xs font-medium text-zinc-300">One-Time Code</p>
+              <p className="text-[11px] text-zinc-500 leading-snug">Your code is valid for 15 minutes. Check your spam folder if you don't see it.</p>
+            </div>
           </div>
         </div>
       </div>
 
-      {/* RIGHT COLUMN: Verification Engine (60% / 7 cols) */}
+      {/* RIGHT COLUMN: Verification (60% / 7 cols) */}
       <div className="md:col-span-7 flex flex-col justify-center items-center p-6 md:p-16 bg-arch-900">
         <div className="w-full max-w-sm">
           {/* Header */}
           <div className="mb-8">
-            <h2 className="font-display text-xl font-bold text-white tracking-tight">Verify Your Email</h2>
-            <p className="mt-1 font-mono text-xs text-zinc-500">
-              Dispatched to: {email ? <span className="text-amber-400 font-semibold">{email}</span> : 'registered email'}
+            <h2 className="font-display text-2xl font-bold text-white tracking-tight">Verify your email</h2>
+            <p className="mt-1 text-sm text-zinc-400">
+              Sent to: {email ? <span className="text-amber-400 font-medium">{email}</span> : 'your registered email'}
             </p>
           </div>
 
@@ -138,8 +139,8 @@ export function Verify() {
 
           <form onSubmit={handleSubmit} className="flex flex-col gap-4" noValidate>
             <div>
-              <label htmlFor="code" className="block font-mono text-[10px] font-semibold uppercase tracking-wider text-zinc-400 mb-2">
-                VERIFICATION CODE
+              <label htmlFor="code" className="block text-xs font-medium text-zinc-300 mb-2">
+                Verification code
               </label>
               <input
                 id="code"
@@ -158,30 +159,30 @@ export function Verify() {
               disabled={submitting || code.length !== 6}
               className="mt-2"
             >
-              {submitting ? <Spinner size={16} className="mx-auto" /> : 'Complete Activation'}
+              {submitting ? <Spinner size={16} className="mx-auto" /> : 'Confirm & Continue'}
             </Button>
           </form>
 
           {/* Resend & Return controls */}
-          <div className="mt-6 pt-4 border-t border-arch-border flex flex-col items-center gap-3 font-mono text-xs text-zinc-500">
+          <div className="mt-6 pt-4 border-t border-arch-border flex flex-col items-center gap-3 text-xs text-zinc-400">
             <div className="flex items-center gap-1.5">
               <span>Didn&apos;t receive code?</span>
               <button
                 type="button"
                 onClick={handleResend}
                 disabled={cooldown > 0 || resending}
-                className="font-semibold text-amber-400 hover:text-amber-300 hover:underline disabled:opacity-50 disabled:no-underline transition-colors"
+                className="font-medium text-amber-400 hover:text-amber-300 hover:underline disabled:opacity-50 disabled:no-underline transition-colors cursor-pointer"
               >
                 {resending
                   ? 'Resending…'
                   : cooldown > 0
                   ? `Resend in ${cooldown}s`
-                  : 'Resend Code'}
+                  : 'Resend code'}
               </button>
             </div>
 
-            <Link to="/login" className="text-zinc-400 hover:text-zinc-200 transition-colors">
-              &larr; Return to Sign In
+            <Link to="/login" className="text-zinc-400 hover:text-zinc-200 transition-colors hover:underline">
+              &larr; Return to sign in
             </Link>
           </div>
         </div>

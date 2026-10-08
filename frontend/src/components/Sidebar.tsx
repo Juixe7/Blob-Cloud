@@ -150,6 +150,17 @@ export function Sidebar({
       ),
     },
     {
+      id: 'notifications',
+      label: 'Notifications',
+      active: activeNav === 'notifications',
+      icon: (
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
+          <path d="M13.73 21a2 2 0 0 1-3.46 0" />
+        </svg>
+      ),
+    },
+    {
       id: 'recent',
       label: 'Recent',
       active: activeNav === 'recent',
@@ -341,11 +352,11 @@ export function Sidebar({
             >
               <span className={cn(item.active ? 'text-amber-400' : 'text-zinc-400')}>{item.icon}</span>
               {!collapsed && <span>{item.label}</span>}
-              {item.id === 'shared' && pendingInvitationsCount > 0 && (
+              {item.id === 'notifications' && pendingInvitationsCount > 0 && (
                 collapsed ? (
-                  <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-indigo-500 ring-2 ring-arch-950 animate-pulse" />
+                  <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-amber-500 ring-2 ring-arch-950 animate-pulse" />
                 ) : (
-                  <span className="ml-auto inline-flex items-center justify-center rounded-full bg-indigo-600 px-1.5 py-0.5 text-[10px] font-semibold text-white animate-pulse">
+                  <span className="ml-auto inline-flex items-center justify-center rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] font-bold text-arch-950 shadow-xs">
                     {pendingInvitationsCount}
                   </span>
                 )

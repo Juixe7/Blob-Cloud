@@ -7,6 +7,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -160,8 +161,31 @@ func (s *FileService) recordAndNotify(ctx context.Context, userID, fileID, actio
 // RenameMoveRequest is the body of PATCH /api/files/{id}. Snake_case matches
 // the backend's JSON decoder.
 type RenameMoveRequest struct {
-	Name     string  `json:"name"`
-	ParentID *string `json:"parent_id"` // nil = unchanged, empty-string means root
+	Name      string  `json:"name"`
+	ParentID  *string `json:"parent_id"` // nil or empty-string means root when hasParent is true
+	hasParent bool    // true if "parent_id" was explicitly specified in the JSON body
+}
+
+// UnmarshalJSON detects whether "parent_id" was explicitly supplied in JSON,
+// distinguishing between rename-only (omitted) and move-to-root (null or "").
+func (r *RenameMoveRequest) UnmarshalJSON(data []byte) error {
+	type Alias RenameMoveRequest
+	aux := struct {
+		*Alias
+	}{
+		Alias: (*Alias)(r),
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if _, ok := raw["parent_id"]; ok {
+		r.hasParent = true
+	}
+	return nil
 }
 
 // GetFile exposes the file repository's GetByID method.
@@ -184,7 +208,7 @@ func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req
 		return nil, fmt.Errorf("user_id and file_id are required")
 	}
 
-	// 3. Build the update target. We load the existing row first so we have a
+	// 1. Build the update target. We load the existing row first so we have a
 	//    stable baseline and can apply partial changes.
 	existing, err := s.files.GetByID(ctx, fileID)
 	if err != nil {
@@ -208,14 +232,29 @@ func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req
 		}
 	}
 
-	isMove := req.ParentID != nil && ((existing.ParentID == nil && *req.ParentID != "") || (existing.ParentID != nil && *req.ParentID != *existing.ParentID))
+	// Determine whether a move was requested (explicit parent_id present in request)
+	var isMove bool
+	var newParentTarget *string
+	if req.hasParent || req.ParentID != nil {
+		if req.ParentID != nil && *req.ParentID != "" && *req.ParentID != "root" {
+			newParentTarget = req.ParentID
+		} else {
+			newParentTarget = nil
+		}
+
+		if (existing.ParentID == nil && newParentTarget != nil) ||
+			(existing.ParentID != nil && newParentTarget == nil) ||
+			(existing.ParentID != nil && newParentTarget != nil && *existing.ParentID != *newParentTarget) {
+			isMove = true
+		}
+	}
 
 	if isMove {
 		if role == domain.RoleViewer || (role == domain.RoleEditor && existing.IsDirectory) {
 			s.log.Info("golden rule fallback: creating shortcut instead of physical move", "file_id", fileID, "user_id", userID, "role", role)
 			shortcut, err := s.CreateShortcut(ctx, userID, CreateShortcutRequest{
 				FileID:   fileID,
-				ParentID: req.ParentID,
+				ParentID: newParentTarget,
 			})
 			return shortcut, err
 		}
@@ -231,17 +270,13 @@ func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req
 	if req.Name != "" {
 		updated.Name = req.Name
 	}
-	if req.ParentID != nil {
-		updated.ParentID = req.ParentID
-		// Normalise: empty string -> nil pointer (root).
-		if updated.ParentID != nil && *updated.ParentID == "" {
-			updated.ParentID = nil
-		}
+	if isMove {
+		updated.ParentID = newParentTarget
 	}
 
 	// 4. Cycle guard: if parent_id is changing, the new parent must not be the
 	//    file itself nor any of its own descendants (O(1) materialized path check).
-	if req.ParentID != nil && existing.IsDirectory {
+	if isMove && existing.IsDirectory {
 		if updated.ParentID != nil && *updated.ParentID != "" {
 			if *updated.ParentID == existing.ID {
 				return nil, fmt.Errorf("cannot move a folder into itself")
@@ -299,29 +334,37 @@ type DeleteResult struct {
 	GCBlocks int `json:"gc_blocks,omitempty"`
 }
 
-// SoftDelete soft-deletes a file/folder and all descendants (setting deleted_at = CURRENT_TIMESTAMP)
-// after verifying the requesting user holds OWNER permission.
+// SoftDelete soft-deletes a file/folder/shortcut and all descendants (setting deleted_at = CURRENT_TIMESTAMP).
+// If the requesting user owns the record (file.UserID == userID), permission is granted directly.
+// Otherwise, verifies that the requesting user holds OWNER or EDITOR permission on the shared file.
 func (s *FileService) SoftDelete(ctx context.Context, userID, fileID string) (*DeleteResult, error) {
 	if userID == "" || fileID == "" {
 		return nil, fmt.Errorf("user_id and file_id are required")
 	}
 
-	user, err := s.users.GetByID(ctx, userID)
+	file, err := s.files.GetByID(ctx, fileID)
 	if err != nil {
-		return nil, fmt.Errorf("resolve user: %w", err)
+		return nil, fmt.Errorf("file not found: %w", err)
 	}
 
-	// OWNER or EDITOR required for soft deletion.
-	allowed, err := s.perms.CheckUserPermission(ctx, fileID, user.Email,
-		[]string{domain.RoleOwner, domain.RoleEditor})
-	if err != nil {
-		return nil, fmt.Errorf("permission check: %w", err)
-	}
-	if !allowed {
-		return nil, fmt.Errorf("access denied: %s", user.Email)
+	// If requesting user does not own this record, check shared permissions
+	if file.UserID != userID {
+		user, err := s.users.GetByID(ctx, userID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve user: %w", err)
+		}
+
+		allowed, err := s.perms.CheckUserPermission(ctx, fileID, user.Email,
+			[]string{domain.RoleOwner, domain.RoleEditor})
+		if err != nil {
+			return nil, fmt.Errorf("permission check: %w", err)
+		}
+		if !allowed {
+			return nil, fmt.Errorf("access denied: %s", user.Email)
+		}
 	}
 
-	if err := s.files.SoftDelete(ctx, fileID, userID); err != nil {
+	if err := s.files.SoftDelete(ctx, fileID, file.UserID); err != nil {
 		return nil, fmt.Errorf("soft delete: %w", err)
 	}
 
@@ -334,29 +377,36 @@ func (s *FileService) SoftDelete(ctx context.Context, userID, fileID string) (*D
 	}, nil
 }
 
-// Restore restores a soft-deleted file/folder and all descendants (setting deleted_at = NULL)
-// after verifying the requesting user holds OWNER permission.
+// Restore restores a soft-deleted file/folder and all descendants (setting deleted_at = NULL).
+// If the requesting user owns the record (file.UserID == userID), permission is granted directly.
+// Otherwise, verifies that the requesting user holds OWNER or EDITOR permission on the shared file.
 func (s *FileService) Restore(ctx context.Context, userID, fileID string) (*DeleteResult, error) {
 	if userID == "" || fileID == "" {
 		return nil, fmt.Errorf("user_id and file_id are required")
 	}
 
-	user, err := s.users.GetByID(ctx, userID)
+	file, err := s.files.GetByID(ctx, fileID)
 	if err != nil {
-		return nil, fmt.Errorf("resolve user: %w", err)
+		return nil, fmt.Errorf("file not found: %w", err)
 	}
 
-	// OWNER or EDITOR required to restore.
-	allowed, err := s.perms.CheckUserPermission(ctx, fileID, user.Email,
-		[]string{domain.RoleOwner, domain.RoleEditor})
-	if err != nil {
-		return nil, fmt.Errorf("permission check: %w", err)
-	}
-	if !allowed {
-		return nil, fmt.Errorf("access denied: %s", user.Email)
+	if file.UserID != userID {
+		user, err := s.users.GetByID(ctx, userID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve user: %w", err)
+		}
+
+		allowed, err := s.perms.CheckUserPermission(ctx, fileID, user.Email,
+			[]string{domain.RoleOwner, domain.RoleEditor})
+		if err != nil {
+			return nil, fmt.Errorf("permission check: %w", err)
+		}
+		if !allowed {
+			return nil, fmt.Errorf("access denied: %s", user.Email)
+		}
 	}
 
-	if err := s.files.Restore(ctx, fileID, userID); err != nil {
+	if err := s.files.Restore(ctx, fileID, file.UserID); err != nil {
 		return nil, fmt.Errorf("restore file: %w", err)
 	}
 
@@ -384,25 +434,32 @@ func (s *FileService) Delete(ctx context.Context, userID, fileID string) (*Delet
 }
 
 // PermanentDelete recursively removes a file/folder and all descendants from DB and storage
-// after verifying the requesting user holds OWNER permission.
+// after verifying the requesting user holds OWNER permission (or directly owns the record).
 func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string) (*DeleteResult, error) {
 	if userID == "" || fileID == "" {
 		return nil, fmt.Errorf("user_id and file_id are required")
 	}
 
-	user, err := s.users.GetByID(ctx, userID)
+	file, err := s.files.GetByID(ctx, fileID)
 	if err != nil {
-		return nil, fmt.Errorf("resolve user: %w", err)
+		return nil, fmt.Errorf("file not found: %w", err)
 	}
 
-	// OWNER required for permanent deletion.
-	allowed, err := s.perms.CheckUserPermission(ctx, fileID, user.Email,
-		[]string{domain.RoleOwner})
-	if err != nil {
-		return nil, fmt.Errorf("permission check: %w", err)
-	}
-	if !allowed {
-		return nil, fmt.Errorf("access denied: %s", user.Email)
+	if file.UserID != userID {
+		user, err := s.users.GetByID(ctx, userID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve user: %w", err)
+		}
+
+		// OWNER required for permanent deletion.
+		allowed, err := s.perms.CheckUserPermission(ctx, fileID, user.Email,
+			[]string{domain.RoleOwner})
+		if err != nil {
+			return nil, fmt.Errorf("permission check: %w", err)
+		}
+		if !allowed {
+			return nil, fmt.Errorf("access denied: %s", user.Email)
+		}
 	}
 
 	var preResolvedRecipients []string
@@ -412,7 +469,7 @@ func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string
 		}
 	}
 
-	deletedCount, orphanHashes, err := s.files.DeleteRecursive(ctx, fileID, userID)
+	deletedCount, orphanHashes, err := s.files.DeleteRecursive(ctx, fileID, file.UserID)
 	if err != nil {
 		return nil, fmt.Errorf("delete recursive: %w", err)
 	}
@@ -515,8 +572,12 @@ func (s *FileService) ListDirectory(ctx context.Context, userID string, parentID
 	var targetParentID = parentID
 	if parentID != nil {
 		parent, err := s.files.GetByID(ctx, *parentID)
-		if err == nil && parent.TargetID != nil && *parent.TargetID != "" {
-			targetParentID = parent.TargetID
+		if err == nil {
+			if parent.TargetID != nil && *parent.TargetID != "" {
+				targetParentID = parent.TargetID
+			} else if parent.ShortcutTargetID != nil && *parent.ShortcutTargetID != "" {
+				targetParentID = parent.ShortcutTargetID
+			}
 		}
 	}
 
@@ -624,13 +685,19 @@ func (s *FileService) BulkSoftDelete(ctx context.Context, userID string, req dom
 		return fmt.Errorf("resolve user: %w", err)
 	}
 	for _, id := range req.IDs {
-		allowed, err := s.perms.CheckUserPermission(ctx, id, user.Email,
-			[]string{domain.RoleOwner, domain.RoleEditor})
+		file, err := s.files.GetByID(ctx, id)
 		if err != nil {
-			return fmt.Errorf("permission check: %w", err)
+			return fmt.Errorf("file not found: %w", err)
 		}
-		if !allowed {
-			return fmt.Errorf("access denied: %s", user.Email)
+		if file.UserID != userID {
+			allowed, err := s.perms.CheckUserPermission(ctx, id, user.Email,
+				[]string{domain.RoleOwner, domain.RoleEditor})
+			if err != nil {
+				return fmt.Errorf("permission check: %w", err)
+			}
+			if !allowed {
+				return fmt.Errorf("access denied: %s", user.Email)
+			}
 		}
 	}
 	return s.files.BulkSoftDelete(ctx, req.IDs, userID)
@@ -646,13 +713,19 @@ func (s *FileService) BulkRestore(ctx context.Context, userID string, req domain
 		return fmt.Errorf("resolve user: %w", err)
 	}
 	for _, id := range req.IDs {
-		allowed, err := s.perms.CheckUserPermission(ctx, id, user.Email,
-			[]string{domain.RoleOwner, domain.RoleEditor})
+		file, err := s.files.GetByID(ctx, id)
 		if err != nil {
-			return fmt.Errorf("permission check: %w", err)
+			return fmt.Errorf("file not found: %w", err)
 		}
-		if !allowed {
-			return fmt.Errorf("access denied: %s", user.Email)
+		if file.UserID != userID {
+			allowed, err := s.perms.CheckUserPermission(ctx, id, user.Email,
+				[]string{domain.RoleOwner, domain.RoleEditor})
+			if err != nil {
+				return fmt.Errorf("permission check: %w", err)
+			}
+			if !allowed {
+				return fmt.Errorf("access denied: %s", user.Email)
+			}
 		}
 	}
 	return s.files.BulkRestore(ctx, req.IDs, userID)
@@ -695,10 +768,19 @@ func logNilStr(s *string) string {
 
 // AuthoriseRead checks that userID holds VIEWER, EDITOR, or OWNER on fileID (directly or via parent inheritance).
 func (s *FileService) AuthoriseRead(ctx context.Context, userID, fileID string) error {
-	// 1. If file is owned directly by the user, bypass check and grant access.
 	file, err := s.files.GetByID(ctx, fileID)
-	if err == nil && file.UserID == userID {
-		return nil
+	if err == nil {
+		// If file is a shortcut, recursively authorize read access on the underlying target
+		if file.TargetID != nil && *file.TargetID != "" && *file.TargetID != fileID {
+			return s.AuthoriseRead(ctx, userID, *file.TargetID)
+		}
+		if file.ShortcutTargetID != nil && *file.ShortcutTargetID != "" && *file.ShortcutTargetID != fileID {
+			return s.AuthoriseRead(ctx, userID, *file.ShortcutTargetID)
+		}
+		// 1. If file is owned directly by the user, bypass check and grant access.
+		if file.UserID == userID {
+			return nil
+		}
 	}
 
 	user, err := s.users.GetByID(ctx, userID)
@@ -777,29 +859,30 @@ func (s *FileService) CreateShortcut(ctx context.Context, userID string, req Cre
 		return nil, fmt.Errorf("user_id and file_id are required")
 	}
 
-	// 1. Resolve user to get their email
-	user, err := s.users.GetByID(ctx, userID)
-	if err != nil {
-		return nil, fmt.Errorf("resolve user: %w", err)
-	}
-
-	// 2. Authorize: USER must have at least VIEWER permission on the target file
-	allowed, err := s.perms.CheckUserPermission(ctx, req.FileID, user.Email,
-		[]string{domain.RoleOwner, domain.RoleEditor, domain.RoleViewer})
-	if err != nil {
-		return nil, fmt.Errorf("permission check: %w", err)
-	}
-	if !allowed {
-		return nil, fmt.Errorf("access denied: %s", user.Email)
-	}
-
-	// 3. Get target file metadata
+	// 1. Get target file metadata first
 	target, err := s.files.GetByID(ctx, req.FileID)
 	if err != nil {
 		return nil, fmt.Errorf("get target file: %w", err)
 	}
 
-	// 4. If target is already a shortcut, use the target's target_id instead
+	// 2. Authorize: If not owned by requesting user, must have at least VIEWER permission
+	if target.UserID != userID {
+		user, err := s.users.GetByID(ctx, userID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve user: %w", err)
+		}
+
+		allowed, err := s.perms.CheckUserPermission(ctx, req.FileID, user.Email,
+			[]string{domain.RoleOwner, domain.RoleEditor, domain.RoleViewer})
+		if err != nil {
+			return nil, fmt.Errorf("permission check: %w", err)
+		}
+		if !allowed {
+			return nil, fmt.Errorf("access denied: %s", user.Email)
+		}
+	}
+
+	// 3. If target is already a shortcut, use the target's target_id instead
 	var realTargetID string
 	if target.TargetID != nil && *target.TargetID != "" {
 		realTargetID = *target.TargetID
@@ -807,7 +890,7 @@ func (s *FileService) CreateShortcut(ctx context.Context, userID string, req Cre
 		realTargetID = target.ID
 	}
 
-	// 5. Create new File entity
+	// 4. Create new File entity
 	shortcut := &domain.File{
 		UserID:           userID,
 		Name:             target.Name,
@@ -824,7 +907,7 @@ func (s *FileService) CreateShortcut(ctx context.Context, userID string, req Cre
 		shortcut.ParentID = nil
 	}
 
-	// 6. Persist
+	// 5. Persist
 	if err := s.files.Create(ctx, shortcut); err != nil {
 		return nil, fmt.Errorf("create shortcut: %w", err)
 	}

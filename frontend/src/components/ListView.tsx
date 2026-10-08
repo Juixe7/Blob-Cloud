@@ -7,6 +7,8 @@ import { formatFileSize, formatDate, cn } from '../lib/format'
 import { FileIcon } from './FileIcon'
 import { useResizeObserver } from '../hooks/useResizeObserver'
 import { markThumbnailFailed, isThumbnailFailed } from '../lib/thumbnailCache'
+import { ContactCardPopover } from './ContactCardPopover'
+import type { SortField, SortDirection } from './FilterChipsBar'
 
 interface ListViewProps {
   items: FileItem[]
@@ -20,6 +22,10 @@ interface ListViewProps {
   onOpenFolder: (item: FileItem) => void
   onOpenFile?: (item: FileItem) => void
   onContextMenu: (item: FileItem, e: MouseEvent) => void
+  onFilterBySender?: (email: string) => void
+  sortField?: SortField
+  sortDirection?: SortDirection
+  onSortChange?: (field: SortField) => void
 }
 
 
@@ -34,6 +40,7 @@ type RowPropsType = {
   onOpenFolder: (folder: FileItem) => void
   onOpenFile?: (file: FileItem) => void
   onContextMenu: (item: FileItem, e: MouseEvent) => void
+  onFilterBySender?: (email: string) => void
 }
 
 type RowComponentProps = {
@@ -41,7 +48,7 @@ type RowComponentProps = {
   style: React.CSSProperties
 } & RowPropsType
 
-const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, onToggleSelect, onSingleSelect, onSelectRange, onOpenFolder, onOpenFile, onContextMenu }: RowComponentProps) => {
+const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, onToggleSelect, onSingleSelect, onSelectRange, onOpenFolder, onOpenFile, onContextMenu, onFilterBySender }: RowComponentProps) => {
   const item = items[index]
   const isSelected = selectedIds?.has(item.id) ?? false
   const isShortcut = item.mime_type === 'application/vnd.google-apps.shortcut'
@@ -174,8 +181,12 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
           >
             {item.name}
           </span>
-          <span className="md:hidden truncate text-zinc-500 font-mono text-[9px] mt-0.5">
-            {isTrash ? formatDate(item.deleted_at || '') : isShared ? 'Unknown' : formatDate(item.updated_at || item.created_at)}
+          <span className="sm:hidden truncate text-zinc-500 font-mono text-[9px] mt-0.5">
+            {isTrash
+              ? formatDate(item.deleted_at || '')
+              : isShared
+              ? `${item.shared_by_email || item.owner_email ? `${item.shared_by_email || item.owner_email} • ` : ''}${formatDate(item.shared_at || item.created_at)}`
+              : formatDate(item.updated_at || item.created_at)}
             {!item.is_directory && ` • ${formatFileSize(item.size_bytes)}`}
             {isTrash && item.is_directory && ` • ${item.item_count ?? 0} items`}
           </span>
@@ -183,13 +194,29 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
       </div>
 
       {isTrash && (
-        <div className="hidden md:block w-[20%] px-4 py-2 truncate text-zinc-400">
+        <div className="hidden sm:block w-[20%] px-4 py-2 truncate text-zinc-400">
           {item.original_location || 'My Drive'}
         </div>
       )}
+
+      {isShared && (
+        <div className="hidden sm:flex w-[16%] px-4 py-2 items-center" onClick={(e) => e.stopPropagation()}>
+          {item.shared_by_email || item.owner_email ? (
+            <ContactCardPopover
+              email={item.shared_by_email || item.owner_email || ''}
+              role={item.role}
+              sharedAt={item.shared_at}
+              onFilterByEmail={onFilterBySender}
+              showEmailText={false}
+            />
+          ) : (
+            <span className="text-zinc-600 font-mono text-[10px]">--</span>
+          )}
+        </div>
+      )}
       
-      <div className="hidden md:block w-[20%] px-4 py-2 truncate text-zinc-400 font-mono text-[10px]">
-        {isTrash ? formatDate(item.deleted_at || '') : isShared ? 'Unknown' : formatDate(item.updated_at || item.created_at)}
+      <div className={cn("hidden sm:block px-4 py-2 truncate text-zinc-400 font-mono text-[10px]", isShared ? "w-[18%]" : "w-[20%]")}>
+        {isTrash ? formatDate(item.deleted_at || '') : isShared ? formatDate(item.shared_at || item.created_at) : formatDate(item.updated_at || item.created_at)}
       </div>
       
       {isTrash && (
@@ -217,6 +244,10 @@ export function ListView({
   onOpenFolder,
   onOpenFile,
   onContextMenu,
+  onFilterBySender,
+  sortField,
+  sortDirection = 'asc',
+  onSortChange,
 }: ListViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { height } = useResizeObserver(containerRef)
@@ -234,7 +265,7 @@ export function ListView({
   return (
     <div className="flex-1 flex flex-col min-h-0 select-none">
       {/* Header Row */}
-      <div className="hidden md:flex items-center text-left font-mono text-[9px] font-semibold uppercase tracking-[0.15em] text-zinc-500 border-b border-arch-border bg-arch-950 pr-[14px]">
+      <div className="hidden sm:flex items-center text-left font-mono text-[9px] font-semibold uppercase tracking-[0.15em] text-zinc-500 border-b border-arch-border bg-arch-950 pr-[14px]">
         <div className="pl-4 pr-1 py-2.5 w-10 shrink-0 flex items-center">
           {(selectedIds?.size ?? 0) > 0 && (
             <input
@@ -245,11 +276,62 @@ export function ListView({
             />
           )}
         </div>
-        <div className="flex-1 min-w-0 pr-4 py-2.5">NAME</div>
-        {isTrash && <div className="hidden md:block w-[20%] px-4 py-2.5">ORIGINAL LOCATION</div>}
-        <div className="hidden md:block w-[20%] px-4 py-2.5">{isTrash ? 'DATE DELETED' : isShared ? 'DATE SHARED' : 'DATE MODIFIED'}</div>
+
+        {/* Name Column */}
+        <div
+          onClick={() => onSortChange?.('name')}
+          className="flex-1 min-w-0 pr-4 py-2.5 flex items-center gap-1.5 cursor-pointer hover:text-zinc-200 transition-colors group select-none"
+          title="Sort by Name"
+        >
+          <span>NAME</span>
+          {sortField === 'name' ? (
+            <span className="text-zinc-300 font-bold text-[10px] leading-none">
+              {sortDirection === 'asc' ? '↑' : '↓'}
+            </span>
+          ) : (
+            <span className="opacity-0 group-hover:opacity-40 text-zinc-500 text-[10px] leading-none">↕</span>
+          )}
+        </div>
+
+        {isTrash && <div className="hidden sm:block w-[20%] px-4 py-2.5">ORIGINAL LOCATION</div>}
+        {isShared && <div className="hidden sm:block w-[16%] px-4 py-2.5">SHARED BY</div>}
+
+        {/* Date Column */}
+        <div
+          onClick={() => onSortChange?.('date')}
+          className={cn(
+            "hidden sm:flex items-center gap-1.5 px-4 py-2.5 cursor-pointer hover:text-zinc-200 transition-colors group select-none",
+            isShared ? "w-[18%]" : "w-[20%]"
+          )}
+          title={isTrash ? 'Sort by Date Deleted' : isShared ? 'Sort by Date Shared' : 'Sort by Date Modified'}
+        >
+          <span>{isTrash ? 'DATE DELETED' : isShared ? 'DATE SHARED' : 'DATE MODIFIED'}</span>
+          {sortField === 'date' ? (
+            <span className="text-zinc-300 font-bold text-[10px] leading-none">
+              {sortDirection === 'asc' ? '↑' : '↓'}
+            </span>
+          ) : (
+            <span className="opacity-0 group-hover:opacity-40 text-zinc-500 text-[10px] leading-none">↕</span>
+          )}
+        </div>
+
         {isTrash && <div className="hidden lg:block w-[10%] px-4 py-2.5">ITEMS</div>}
-        <div className="hidden sm:block w-[15%] px-4 py-2.5">SIZE</div>
+
+        {/* Size Column */}
+        <div
+          onClick={() => onSortChange?.('size')}
+          className="hidden sm:flex items-center gap-1.5 w-[15%] px-4 py-2.5 cursor-pointer hover:text-zinc-200 transition-colors group select-none"
+          title="Sort by File Size"
+        >
+          <span>SIZE</span>
+          {sortField === 'size' ? (
+            <span className="text-zinc-300 font-bold text-[10px] leading-none">
+              {sortDirection === 'asc' ? '↑' : '↓'}
+            </span>
+          ) : (
+            <span className="opacity-0 group-hover:opacity-40 text-zinc-500 text-[10px] leading-none">↕</span>
+          )}
+        </div>
       </div>
       
       {/* Virtualized List */}
@@ -273,6 +355,7 @@ export function ListView({
                 onOpenFolder,
                 onOpenFile,
                 onContextMenu,
+                onFilterBySender,
               }}
               rowComponent={Row as any}
             />

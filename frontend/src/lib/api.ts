@@ -25,6 +25,7 @@ import {
 export const apiClient = axios.create({
   baseURL: import.meta.env.VITE_API_BASE ?? '/api',
   headers: { 'Content-Type': 'application/json' },
+  withCredentials: true,
 })
 
 /* Mark requests that are already a retry, so we don't loop forever. */

@@ -16,7 +16,7 @@
 //	Zone        Env var prefix   Default limit
 //	────────────────────────────────────────────
 //	auth        RL_AUTH_*        10 req/min   (brute-force / credential stuffing)
-//	upload      RL_UPLOAD_*      30 req/min   (expensive S3 presign calls)
+//	upload      RL_UPLOAD_*      300 req/min  (multi-chunk uploads & S3 presign calls)
 //	api         RL_API_*         120 req/min  (general authenticated endpoints)
 //
 // All limits return 429 Too Many Requests with standard headers:

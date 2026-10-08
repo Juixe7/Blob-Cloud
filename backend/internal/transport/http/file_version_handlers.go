@@ -96,7 +96,13 @@ func (s *Server) HandleRestoreFileVersion(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error listing versions"})
 		return
 	}
-	nextVersion := len(versionsList) + 1
+	maxVersion := 0
+	for _, v := range versionsList {
+		if v.VersionNumber > maxVersion {
+			maxVersion = v.VersionNumber
+		}
+	}
+	nextVersion := maxVersion + 1
 
 	backupVersion := &domain.FileVersion{
 		FileID:        fileID,

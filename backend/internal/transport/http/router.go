@@ -147,13 +147,16 @@ func NewRouter(s *Server, rl RateLimiters) http.Handler {
 			r.Get("/{id}/history", s.HandleFileHistory) // Tier 2F: audit trail
 		})
 
-		// --- Share Invitations (Collaborative Safety Gate) ---
-		r.Route("/api/shares/invitations", func(r chi.Router) {
-			r.Get("/", s.HandleListInvitations)
-			r.Post("/{id}/accept", s.HandleAcceptInvitation)
-			r.Post("/{id}/decline", s.HandleDeclineInvitation)
-			r.Post("/{id}/block", s.HandleBlockSender)
-			r.Get("/{id}/preview", s.HandlePreviewInvitation)
+		// --- Share Management & Invitations (Collaborative Safety Gate) ---
+		r.Route("/api/shares", func(r chi.Router) {
+			r.Delete("/shared-with-me/{id}", s.HandleRemoveSharedWithMe)
+			r.Route("/invitations", func(r chi.Router) {
+				r.Get("/", s.HandleListInvitations)
+				r.Post("/{id}/accept", s.HandleAcceptInvitation)
+				r.Post("/{id}/decline", s.HandleDeclineInvitation)
+				r.Post("/{id}/block", s.HandleBlockSender)
+				r.Get("/{id}/preview", s.HandlePreviewInvitation)
+			})
 		})
 
 		// --- Phase 2: Dropbox-Grade Delta Sync Engine ---

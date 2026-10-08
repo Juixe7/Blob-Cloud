@@ -7,6 +7,7 @@ import { cn } from '../lib/format'
 import { FileIcon } from './FileIcon'
 import { useResizeObserver } from '../hooks/useResizeObserver'
 import { markThumbnailFailed, isThumbnailFailed } from '../lib/thumbnailCache'
+import { ContactCardPopover } from './ContactCardPopover'
 
 interface GridViewProps {
   items: FileItem[]
@@ -17,6 +18,7 @@ interface GridViewProps {
   onOpenFolder: (item: FileItem) => void
   onOpenFile?: (item: FileItem) => void
   onContextMenu: (item: FileItem, e: MouseEvent) => void
+  onFilterBySender?: (email: string) => void
 }
 
 function chunkArray<T>(arr: T[], size: number): T[][] {
@@ -36,6 +38,7 @@ interface CardProps {
   onOpenFolder: (f: FileItem) => void
   onOpenFile?: (f: FileItem) => void
   onContextMenu: (item: FileItem, e: MouseEvent) => void
+  onFilterBySender?: (email: string) => void
 }
 
 const Card = React.memo(function Card({
@@ -47,6 +50,7 @@ const Card = React.memo(function Card({
   onOpenFolder,
   onOpenFile,
   onContextMenu,
+  onFilterBySender,
 }: CardProps) {
   const isShortcut = item.mime_type === 'application/vnd.google-apps.shortcut'
   const isBrokenShortcut = isShortcut && item.shortcut_target_id === null
@@ -185,22 +189,41 @@ const Card = React.memo(function Card({
         )}
       </div>
 
-      <div className="flex flex-1 items-center justify-between px-3 py-3">
-        <h3
-          className={cn(
-            "truncate text-[13px] font-medium text-zinc-200",
-            item.is_directory && "hover:text-amber-400 hover:underline cursor-pointer"
+      <div className="flex flex-1 items-center justify-between px-3 py-2.5 gap-2">
+        <div className="flex-1 min-w-0">
+          <h3
+            className={cn(
+              "truncate text-[13px] font-medium text-zinc-200",
+              item.is_directory && "hover:text-amber-400 hover:underline cursor-pointer"
+            )}
+            title={item.name}
+            onClick={(e) => {
+              if (item.is_directory) {
+                e.stopPropagation()
+                onOpenFolder(item)
+              }
+            }}
+          >
+            {item.name}
+          </h3>
+          {item.shared_by_email && (
+            <p className="text-[10px] text-zinc-500 truncate mt-0.5 font-mono">
+              Shared by {item.shared_by_email}
+            </p>
           )}
-          title={item.name}
-          onClick={(e) => {
-            if (item.is_directory) {
-              e.stopPropagation()
-              onOpenFolder(item)
-            }
-          }}
-        >
-          {item.name}
-        </h3>
+        </div>
+        {(item.shared_by_email || (item.role && item.role !== 'OWNER' && item.owner_email)) && (
+          <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
+            <ContactCardPopover
+              email={item.shared_by_email || item.owner_email || ''}
+              role={item.role}
+              sharedAt={item.shared_at}
+              onFilterByEmail={onFilterBySender}
+              showEmailText={false}
+              avatarSize="sm"
+            />
+          </div>
+        )}
         {item.is_directory && (
           <button
             type="button"
@@ -232,6 +255,7 @@ type GridRowPropsType = {
   onOpenFolder: (item: FileItem) => void
   onOpenFile?: (item: FileItem) => void
   onContextMenu: (item: FileItem, e: MouseEvent) => void
+  onFilterBySender?: (email: string) => void
 }
 
 type GridRowProps = {
@@ -251,6 +275,7 @@ const GridRow = React.memo(function GridRow({
   onOpenFolder,
   onOpenFile,
   onContextMenu,
+  onFilterBySender,
 }: GridRowProps) {
   const rowItems = chunkedRows[index]
   if (!rowItems) return null
@@ -268,6 +293,7 @@ const GridRow = React.memo(function GridRow({
             onOpenFolder={onOpenFolder}
             onOpenFile={onOpenFile}
             onContextMenu={onContextMenu}
+            onFilterBySender={onFilterBySender}
           />
         </div>
       ))}
@@ -284,6 +310,7 @@ export function GridView({
   onOpenFolder,
   onOpenFile,
   onContextMenu,
+  onFilterBySender,
 }: GridViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const { width, height } = useResizeObserver(containerRef)
@@ -307,7 +334,8 @@ export function GridView({
     onOpenFolder,
     onOpenFile,
     onContextMenu,
-  }), [chunkedRows, columnCount, selectedIds, onToggleSelect, onSingleSelect, onSelectRange, onOpenFolder, onOpenFile, onContextMenu])
+    onFilterBySender,
+  }), [chunkedRows, columnCount, selectedIds, onToggleSelect, onSingleSelect, onSelectRange, onOpenFolder, onOpenFile, onContextMenu, onFilterBySender])
 
   if (items.length === 0) {
     return (

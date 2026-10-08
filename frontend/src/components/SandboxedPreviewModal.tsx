@@ -1,9 +1,8 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Modal } from './ui/Modal'
 import { Button } from './ui/Button'
 import { Spinner } from './ui/Spinner'
 import { formatFileSize } from '../lib/format'
-import { getAccessToken } from '../lib/token'
 import { apiClient } from '../lib/api'
 import type { ShareInvitation } from '../types/file'
 import { FileIcon } from './FileIcon'
@@ -24,18 +23,76 @@ export function SandboxedPreviewModal({
   onDecline,
 }: SandboxedPreviewModalProps) {
   const [loadingAction, setLoadingAction] = useState<'accept' | 'decline' | null>(null)
-  const [iframeLoading, setIframeLoading] = useState(true)
+  const [blobUrl, setBlobUrl] = useState<string | null>(null)
+  const [loadingFile, setLoadingFile] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+
+  const isImage = Boolean(
+    invitation && (/\.(jpg|jpeg|png|webp|gif|svg)$/i.test(invitation.file_name) || invitation.mime_type?.startsWith('image/'))
+  )
+  const isPdf = Boolean(
+    invitation && (/\.pdf$/i.test(invitation.file_name) || invitation.mime_type === 'application/pdf')
+  )
+  const isAudio = Boolean(
+    invitation && (/\.(mp3|wav|ogg|m4a)$/i.test(invitation.file_name) || invitation.mime_type?.startsWith('audio/'))
+  )
+  const isVideo = Boolean(
+    invitation && (/\.(mp4|webm|mov)$/i.test(invitation.file_name) || invitation.mime_type?.startsWith('video/'))
+  )
+
+  useEffect(() => {
+    if (!open || !invitation) {
+      setBlobUrl(null)
+      setLoadError(null)
+      return
+    }
+
+    const currentInv = invitation
+    let active = true
+    let currentBlobUrl: string | null = null
+
+    async function loadPreviewBlob() {
+      setLoadingFile(true)
+      setLoadError(null)
+
+      try {
+        const res = await apiClient.get<Blob>(
+          `/shares/invitations/${currentInv.id}/preview`,
+          { responseType: 'blob' }
+        )
+
+        if (!active) return
+
+        let mimeType = (res.headers['content-type'] as string) || ''
+        if (isPdf) {
+          mimeType = 'application/pdf'
+        } else if (isImage && !mimeType) {
+          mimeType = 'image/png'
+        }
+
+        const blob = new Blob([res.data], { type: mimeType || 'application/octet-stream' })
+        currentBlobUrl = URL.createObjectURL(blob)
+        setBlobUrl(currentBlobUrl)
+      } catch (err) {
+        if (!active) return
+        console.error('Failed to load preview blob:', err)
+        setLoadError('Unable to load document preview. Please try again.')
+      } finally {
+        if (active) setLoadingFile(false)
+      }
+    }
+
+    void loadPreviewBlob()
+
+    return () => {
+      active = false
+      if (currentBlobUrl) {
+        URL.revokeObjectURL(currentBlobUrl)
+      }
+    }
+  }, [open, invitation, isPdf, isImage])
 
   if (!invitation) return null
-
-  const token = getAccessToken() ?? ''
-  const base = apiClient.defaults.baseURL ?? '/api'
-  const previewUrl = `${base}/shares/invitations/${invitation.id}/preview?token=${encodeURIComponent(token)}`
-
-  const isImage = /\.(jpg|jpeg|png|webp|gif|svg)$/i.test(invitation.file_name) || invitation.mime_type?.startsWith('image/')
-  const isPdf = /\.pdf$/i.test(invitation.file_name) || invitation.mime_type === 'application/pdf'
-  const isAudio = /\.(mp3|wav|ogg|m4a)$/i.test(invitation.file_name) || invitation.mime_type?.startsWith('audio/')
-  const isVideo = /\.(mp4|webm|mov)$/i.test(invitation.file_name) || invitation.mime_type?.startsWith('video/')
 
   const handleAccept = async () => {
     setLoadingAction('accept')
@@ -62,7 +119,7 @@ export function SandboxedPreviewModal({
       open={open}
       onClose={onClose}
       label="Protected Preview (Unaccepted File)"
-      maxWidthClass="max-w-3xl"
+      maxWidthClass="max-w-4xl w-[92vw]"
     >
       <div className="space-y-4">
         {/* Header */}
@@ -99,7 +156,7 @@ export function SandboxedPreviewModal({
             </span>
             <span className="text-zinc-500">({formatFileSize(invitation.size_bytes)})</span>
           </div>
-          <span className="rounded border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[11px] font-semibold text-indigo-300 uppercase tracking-wider">
+          <span className="rounded border border-zinc-700/60 bg-zinc-800/80 px-2 py-0.5 text-[11px] font-semibold text-zinc-300 uppercase tracking-wider">
             {invitation.role} Role
           </span>
         </div>
@@ -126,57 +183,53 @@ export function SandboxedPreviewModal({
         )}
 
         {/* Sandboxed Viewer Container */}
-        <div className="relative min-h-[350px] max-h-[500px] w-full overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950 flex flex-col items-center justify-center">
-          {iframeLoading && (
-            <div className="absolute inset-0 flex items-center justify-center bg-zinc-950/80 z-10">
-              <Spinner size={24} className="text-indigo-500" />
+        <div className="relative min-h-[380px] max-h-[550px] w-full overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950 flex flex-col items-center justify-center">
+          {loadingFile && (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/80 z-10 gap-2">
+              <Spinner size={24} className="text-amber-500" />
+              <span className="text-xs text-zinc-400">Loading document stream...</span>
             </div>
           )}
 
-          {isImage ? (
+          {loadError ? (
+            <div className="p-8 text-center text-xs text-rose-400">
+              <p>{loadError}</p>
+            </div>
+          ) : isImage && blobUrl ? (
             <img
-              src={previewUrl}
+              src={blobUrl}
               alt={invitation.file_name}
-              onLoad={() => setIframeLoading(false)}
-              onError={() => setIframeLoading(false)}
-              className="max-h-[480px] w-auto max-w-full object-contain p-2 select-none"
+              className="max-h-[520px] w-auto max-w-full object-contain p-2 select-none"
             />
-          ) : isPdf ? (
+          ) : isPdf && blobUrl ? (
             <iframe
-              src={previewUrl}
+              src={blobUrl}
               title={invitation.file_name}
-              sandbox="allow-scripts"
-              onLoad={() => setIframeLoading(false)}
-              className="h-[480px] w-full border-none"
+              className="h-[520px] w-full border-none rounded-lg bg-zinc-900"
             />
-          ) : isAudio ? (
-            <div className="p-8 w-full max-w-md text-center" onLoadedData={() => setIframeLoading(false)}>
-              <audio controls src={previewUrl} className="w-full" onCanPlay={() => setIframeLoading(false)}>
+          ) : isAudio && blobUrl ? (
+            <div className="p-8 w-full max-w-md text-center">
+              <audio controls src={blobUrl} className="w-full">
                 Your browser does not support audio preview.
               </audio>
             </div>
-          ) : isVideo ? (
+          ) : isVideo && blobUrl ? (
             <video
               controls
-              src={previewUrl}
-              className="max-h-[480px] w-full"
-              onCanPlay={() => setIframeLoading(false)}
+              src={blobUrl}
+              className="max-h-[520px] w-full"
             >
               Your browser does not support video preview.
             </video>
-          ) : (
-            <iframe
-              src={previewUrl}
-              title={invitation.file_name}
-              sandbox="allow-same-origin"
-              onLoad={() => setIframeLoading(false)}
-              className="h-[450px] w-full border-none p-4 text-zinc-300 font-mono text-xs bg-zinc-950"
-            />
-          )}
+          ) : !loadingFile ? (
+            <div className="p-8 text-center text-xs text-zinc-500">
+              No preview available for this file type.
+            </div>
+          ) : null}
 
           {/* Watermark */}
           <div className="pointer-events-none absolute bottom-3 right-3 rounded bg-zinc-900/90 px-2 py-1 text-[10px] font-mono tracking-wider text-zinc-500 border border-zinc-800">
-            PROTECTED SANDBOX
+            PROTECTED PREVIEW
           </div>
         </div>
 
@@ -199,7 +252,7 @@ export function SandboxedPreviewModal({
               onClick={handleAccept}
               loading={loadingAction === 'accept'}
               disabled={loadingAction !== null}
-              className="bg-indigo-600 hover:bg-indigo-500 text-white"
+              className="bg-amber-500 hover:bg-amber-400 text-arch-950 font-semibold"
             >
               Accept & Add to Drive
             </Button>

@@ -15,13 +15,14 @@ interface FilePreviewModalProps {
   file: FileItem | null
   onDownload?: (file: FileItem) => void
   publicToken?: string
+  shareSessionToken?: string | null
 }
 
 /**
  * Full-screen Google Drive style in-browser file preview modal.
  * Supports inline rendering for Images, PDFs, Audio, Video, and Code/Text files.
  */
-export function FilePreviewModal({ open, onClose, file, onDownload, publicToken }: FilePreviewModalProps) {
+export function FilePreviewModal({ open, onClose, file, onDownload, publicToken, shareSessionToken }: FilePreviewModalProps) {
   const [blobUrl, setBlobUrl] = useState<string | null>(null)
   const [textContent, setTextContent] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -81,7 +82,9 @@ export function FilePreviewModal({ open, onClose, file, onDownload, publicToken 
 
       try {
         const token = getAccessToken()
-        const url = publicToken ? `/public/shares/${publicToken}/download?inline=true` : `/files/${file!.id}/download?inline=true`
+        const url = publicToken
+          ? `/public/shares/${publicToken}/download?inline=true${shareSessionToken ? `&share_token=${encodeURIComponent(shareSessionToken)}` : ''}`
+          : `/files/${file!.id}/download?inline=true`
         const headers: Record<string, string> = {}
         if (!publicToken && token) {
           headers['Authorization'] = `Bearer ${token}`
@@ -116,7 +119,7 @@ export function FilePreviewModal({ open, onClose, file, onDownload, publicToken 
       active = false
       if (currentBlobUrl) URL.revokeObjectURL(currentBlobUrl)
     }
-  }, [open, file, isTextCode, publicToken])
+  }, [open, file, isTextCode, publicToken, shareSessionToken])
 
   const handleDecryptSubmit = async (e?: React.FormEvent) => {
     if (e) e.preventDefault()
@@ -129,7 +132,7 @@ export function FilePreviewModal({ open, onClose, file, onDownload, publicToken 
     try {
       const token = getAccessToken()
       const url = publicToken
-        ? `/public/shares/${publicToken}/download`
+        ? `/public/shares/${publicToken}/download${shareSessionToken ? `?share_token=${encodeURIComponent(shareSessionToken)}` : ''}`
         : `/files/${file.id}/download`
       const headers: Record<string, string> = {}
       if (!publicToken && token) {
@@ -262,7 +265,7 @@ export function FilePreviewModal({ open, onClose, file, onDownload, publicToken 
                   setDecryptionError(null)
                 }}
                 placeholder="Enter decryption passphrase"
-                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-500"
+                className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm placeholder:text-slate-400 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100 dark:placeholder:text-zinc-500"
                 autoFocus
               />
 

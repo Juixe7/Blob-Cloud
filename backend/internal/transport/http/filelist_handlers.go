@@ -57,6 +57,14 @@ func (s *Server) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 				if parentFile.DeletedAt != nil {
 					w.Header().Set("X-Directory-Deleted", "true")
 				}
+				// If parentFile is a shortcut, resolve to target directory for children listing
+				if parentFile.TargetID != nil && *parentFile.TargetID != "" {
+					parentID = parentFile.TargetID
+					w.Header().Set("X-Directory-Target-ID", *parentID)
+				} else if parentFile.ShortcutTargetID != nil && *parentFile.ShortcutTargetID != "" {
+					parentID = parentFile.ShortcutTargetID
+					w.Header().Set("X-Directory-Target-ID", *parentID)
+				}
 			}
 		}
 		items, err = s.fileOps.ListDirectory(r.Context(), userID, parentID)
@@ -72,6 +80,19 @@ func (s *Server) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	// `items.map(...)` works without a nil-guard.
 	if items == nil {
 		items = []*domain.File{}
+	}
+
+	if filter != "shared" && len(items) > 0 && s.users != nil {
+		if u, err := s.users.GetByID(r.Context(), userID); err == nil && u != nil {
+			for _, item := range items {
+				if item.UserID == userID {
+					item.OwnerEmail = &u.Email
+					if item.Role == "" {
+						item.Role = domain.RoleOwner
+					}
+				}
+			}
+		}
 	}
 
 	if s.journal != nil {

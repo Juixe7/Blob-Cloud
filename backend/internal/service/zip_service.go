@@ -42,7 +42,12 @@ func (s *ZipService) StreamItemsZip(ctx context.Context, ids []string, userID st
 
 	// 2. Initialize zip.Writer directly on the target writer.
 	zw := zip.NewWriter(w)
-	defer zw.Close()
+	var closed bool
+	defer func() {
+		if !closed {
+			_ = zw.Close()
+		}
+	}()
 
 	// 3. Loop over and compress each file.
 	for _, f := range zippables {
@@ -93,12 +98,20 @@ func (s *ZipService) StreamItemsZip(ctx context.Context, ids []string, userID st
 			if err != nil {
 				return fmt.Errorf("read block %s for file %s: %w", hash, f.RelativePath, err)
 			}
-			_, err = io.Copy(zf, rc)
-			rc.Close()
-			if err != nil {
-				return fmt.Errorf("copy block %s to zip stream: %w", hash, err)
+			copyErr := func() error {
+				defer rc.Close()
+				_, copyErr := io.Copy(zf, rc)
+				return copyErr
+			}()
+			if copyErr != nil {
+				return fmt.Errorf("copy block %s to zip stream: %w", hash, copyErr)
 			}
 		}
+	}
+
+	closed = true
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("close zip writer: %w", err)
 	}
 
 	return nil

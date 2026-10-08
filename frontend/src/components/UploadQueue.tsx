@@ -143,7 +143,13 @@ function JobRow({ job }: { job: UploadJob }) {
             <div
               className={cn(
                 'h-full transition-all duration-200',
-                status === 'FAILED' ? 'bg-rose-500' : 'bg-amber-500',
+                status === 'FAILED'
+                  ? 'bg-rose-500'
+                  : status === 'RESUMING'
+                    ? 'bg-blue-500'
+                    : status === 'PAUSED_NETWORK'
+                      ? 'bg-amber-500/50'
+                      : 'bg-amber-500',
               )}
               style={{ width: `${status === 'FAILED' ? 100 : Math.max(2, progress)}%` }}
               role="progressbar"
@@ -158,7 +164,7 @@ function JobRow({ job }: { job: UploadJob }) {
   )
 }
 
-/** Inline status icon: spinner for active, check for done, warning for failed. */
+/** Inline status icon: spinner for active, wifi-off for paused, check for done, warning for failed. */
 function StatusIcon({ status }: { status: UploadStatus }) {
   if (status === 'COMPLETED') {
     return (
@@ -198,6 +204,35 @@ function StatusIcon({ status }: { status: UploadStatus }) {
       </svg>
     )
   }
+  if (status === 'PAUSED_NETWORK') {
+    // Wifi-off icon in amber — connection dropped, waiting to reconnect
+    return (
+      <svg
+        width="14"
+        height="14"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="mt-0.5 shrink-0 text-amber-400/70"
+        aria-hidden="true"
+      >
+        <line x1="1" y1="1" x2="23" y2="23" />
+        <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55" />
+        <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39" />
+        <path d="M10.71 5.05A16 16 0 0 1 22.56 9" />
+        <path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88" />
+        <path d="M8.53 16.11a6 6 0 0 1 6.95 0" />
+        <line x1="12" y1="20" x2="12.01" y2="20" />
+      </svg>
+    )
+  }
+  if (status === 'RESUMING') {
+    // Blue spinner — actively reconnecting and resuming
+    return <Spinner size={14} className="mt-0.5 shrink-0 text-blue-400" />
+  }
   return <Spinner size={14} className="mt-0.5 shrink-0 text-amber-400" />
 }
 
@@ -216,12 +251,17 @@ function statusText(status: UploadStatus, progress: number, error?: string): str
       return 'Completed'
     case 'FAILED':
       return error ?? 'Failed'
+    case 'PAUSED_NETWORK':
+      return 'No connection — will auto-resume'
+    case 'RESUMING':
+      return 'Reconnected — resuming upload…'
     default:
       return ''
   }
 }
 
-/** True for states that no longer change (completed or failed). */
+/** True for states that no longer change (completed or failed).
+ *  PAUSED_NETWORK and RESUMING are transient — they must NOT be auto-cleared. */
 function isTerminal(status: UploadStatus): boolean {
   return status === 'COMPLETED' || status === 'FAILED'
 }

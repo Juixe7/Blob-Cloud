@@ -8,6 +8,8 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -323,11 +325,13 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 					p.log.Info("finished embedding", "chunk", i, "err", err)
 					if err != nil {
 						p.log.Error("failed to generate chunk embedding", "chunk_index", i, "err", err)
-						// Exponential/context-aware sleep if error hit
+						// Exponential/context-aware backoff if error hit (e.g. rate limit quota)
+						errTimer := time.NewTimer(3 * time.Second)
 						select {
 						case <-ctx.Done():
+							errTimer.Stop()
 							return ctx.Err()
-						case <-time.After(5 * time.Second):
+						case <-errTimer.C:
 						}
 					} else if len(embedding) > 0 {
 						fileChunks = append(fileChunks, &domain.FileChunk{
@@ -336,12 +340,23 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 							ChunkText:  chunkText,
 							Embedding:  embedding,
 						})
-					}
-					// Context-aware pacing to respect Gemini RPM limits while allowing prompt shutdown
-					select {
-					case <-ctx.Done():
-						return ctx.Err()
-					case <-time.After(2 * time.Second):
+
+						// Configurable pacing between successful chunk embeddings (default: 200ms)
+						paceDelay := 200 * time.Millisecond
+						if envDelay := os.Getenv("GEMINI_EMBEDDING_PACE_MS"); envDelay != "" {
+							if ms, err := strconv.Atoi(envDelay); err == nil && ms >= 0 {
+								paceDelay = time.Duration(ms) * time.Millisecond
+							}
+						}
+						if paceDelay > 0 {
+							paceTimer := time.NewTimer(paceDelay)
+							select {
+							case <-ctx.Done():
+								paceTimer.Stop()
+								return ctx.Err()
+							case <-paceTimer.C:
+							}
+						}
 					}
 				}
 

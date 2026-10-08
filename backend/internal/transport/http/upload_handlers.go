@@ -120,6 +120,13 @@ func (s *Server) HandleCompleteUpload(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.uploads.Complete(r.Context(), req, userID)
 	if err != nil {
+		if errors.Is(err, service.ErrFileConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "A file with this name already exists in this destination.",
+				"code":  "VERSION_CONFLICT",
+			})
+			return
+		}
 		// Missing blocks / wrong session state -> 400; access denied -> 403; anything else -> 500.
 		code := http.StatusInternalServerError
 		if strings.Contains(err.Error(), "access denied") {

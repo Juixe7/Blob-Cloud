@@ -40,15 +40,10 @@ import { UploadQueue } from '../components/UploadQueue'
 import { downloadEncryptedFile } from '../lib/download'
 import { VersionHistoryModal } from '../components/VersionHistoryModal'
 import { UploadConflictModal } from '../components/UploadConflictModal'
-import { GetInfoModal } from '../components/GetInfoModal'
 import { DetailPanel } from '../components/DetailPanel'
-import { PendingInvitationsBanner } from '../components/PendingInvitationsBanner'
+import { NotificationsView } from '../components/NotificationsView'
 import { SandboxedPreviewModal } from '../components/SandboxedPreviewModal'
-
-/** Mocked storage limit for the gauge (15 GB in bytes). */
-const STORAGE_LIMIT = 15 * 1_073_741_824
-/** Mocked storage used (2.4 GB). */
-const STORAGE_USED = 2.4 * 1_073_741_824
+import { FilterChipsBar, type TypeFilter, type DateFilter, type SortField, type SortDirection } from '../components/FilterChipsBar'
 
 /**
  * File Explorer Dashboard.
@@ -65,7 +60,12 @@ export function Dashboard() {
 
   // ---- Navigation state (driven by URL search params for Chrome Back/Forward support) ----
   const rawNav = searchParams.get('nav')
-  const activeNav = rawNav === 'shared' ? 'shared' : rawNav === 'trash' ? 'trash' : 'drive'
+  const activeNav: 'drive' | 'shared' | 'recent' | 'trash' | 'notifications' =
+    rawNav === 'shared' ? 'shared' :
+    rawNav === 'recent' ? 'recent' :
+    rawNav === 'trash' ? 'trash' :
+    rawNav === 'notifications' ? 'notifications' :
+    'drive'
   const currentFolderId = activeNav !== 'drive' ? null : searchParams.get('folder')
   const [breadcrumbs, setBreadcrumbs] = useState<BreadcrumbNode[]>([
     { id: null, name: 'My Drive' },
@@ -96,14 +96,27 @@ export function Dashboard() {
     searchQueryRef.current = searchQuery
   }, [searchQuery])
 
-  const isInTrash = activeNav === 'trash' || isTrashContext
+  // Automatically reset isTrashContext whenever activeNav is not trash
+  useEffect(() => {
+    if (activeNav !== 'trash') {
+      setIsTrashContext(false)
+    }
+  }, [activeNav])
+
+  const isInTrash = activeNav === 'trash' || (activeNav === 'drive' && isTrashContext)
 
   const currentKey = activeNav + ':' + (currentFolderId || '')
   const isCurrentStateLoaded = lastFetchedKey === currentKey
 
   const effectiveBreadcrumbs = useMemo<BreadcrumbNode[]>(() => {
+    if (activeNav === 'notifications') {
+      return [{ id: null, name: 'Notifications' }]
+    }
     if (activeNav === 'shared') {
       return [{ id: null, name: 'Shared with me' }]
+    }
+    if (activeNav === 'recent') {
+      return [{ id: null, name: 'Recent' }]
     }
     if (activeNav === 'trash' || isTrashContext) {
       const base: BreadcrumbNode[] = [
@@ -141,8 +154,12 @@ export function Dashboard() {
 
   // Sync breadcrumbs when activeNav or currentFolderId changes
   useEffect(() => {
-    if (activeNav === 'shared') {
+    if (activeNav === 'notifications') {
+      setBreadcrumbs([{ id: null, name: 'Notifications' }])
+    } else if (activeNav === 'shared') {
       setBreadcrumbs([{ id: null, name: 'Shared with me' }])
+    } else if (activeNav === 'recent') {
+      setBreadcrumbs([{ id: null, name: 'Recent' }])
     } else if (activeNav === 'trash') {
       setBreadcrumbs([
         { id: null, name: 'My Drive' },
@@ -174,7 +191,6 @@ export function Dashboard() {
   const [previewTarget, setPreviewTarget] = useState<FileItem | null>(null)
   const [publicShareTarget, setPublicShareTarget] = useState<FileItem | null>(null)
   const [versionHistoryTarget, setVersionHistoryTarget] = useState<FileItem | null>(null)
-  const [infoTarget, setInfoTarget] = useState<FileItem | null>(null)
   const [isDetailsOpen, setIsDetailsOpen] = useState(false)
 
   // File Versioning & Conflict State
@@ -211,6 +227,8 @@ export function Dashboard() {
 
   // ---- Abort controller ref for fetch cleanup ----
   const abortRef = useRef<AbortController | null>(null)
+  // ---- Tab SWR Cache for 0ms instant tab switching ----
+  const tabCacheRef = useRef<Map<string, FileItem[]>>(new Map())
 
   // ---- Fetch directory contents ----
   const fetchDirectory = useCallback(async (
@@ -223,8 +241,23 @@ export function Dashboard() {
     const controller = new AbortController()
     abortRef.current = controller
 
-    setIsLoading(true)
-    setFetchError(null)
+    if (navMode === 'notifications') {
+      setItems([])
+      setIsTrashContext(false)
+      setIsLoading(false)
+      setLastFetchedKey('notifications:')
+      return
+    }
+
+    const cacheKey = `${navMode}:${folderId || ''}:${query.trim()}`
+
+    // Stale-While-Revalidate: render cached tab items immediately for zero-lag switching
+    if (tabCacheRef.current.has(cacheKey) && !query.trim()) {
+      setItems(tabCacheRef.current.get(cacheKey)!)
+      setIsLoading(false)
+    } else {
+      setIsLoading(true)
+    }
 
     try {
       let url = '/files'
@@ -262,7 +295,7 @@ export function Dashboard() {
       }
 
       const token = getAccessToken() || ''
-      const sorted = rawData.map(item => {
+      const mapped = rawData.map(item => {
         const isSupportedMedia = !item.is_directory && (
           /\.(jpg|jpeg|png|webp|gif|mp4|webm|mov|mkv|pdf)$/i.test(item.name) ||
           item.mime_type?.startsWith('image/') ||
@@ -276,11 +309,18 @@ export function Dashboard() {
           }
         }
         return item
-      }).sort((a, b) => {
-        if (a.is_directory !== b.is_directory) return a.is_directory ? -1 : 1
-        return a.name.localeCompare(b.name)
       })
 
+      // In Recent tab, keep the backend's chronological activity order!
+      let sorted = mapped
+      if (navMode !== 'recent') {
+        sorted = [...mapped].sort((a, b) => {
+          if (a.is_directory !== b.is_directory) return a.is_directory ? -1 : 1
+          return a.name.localeCompare(b.name)
+        })
+      }
+
+      tabCacheRef.current.set(cacheKey, sorted)
       setItems(sorted)
       setLastFetchedKey(navMode + ':' + (folderId || ''))
 
@@ -291,8 +331,8 @@ export function Dashboard() {
         if (!isNaN(parsed) && parsed >= 0) {
           syncCursorRef.current = parsed
         }
-      } else {
-        // Fallback: sync latest cursor baseline for delta sync
+      } else if (syncCursorRef.current === 0) {
+        // Fallback: sync latest cursor baseline on initial load only
         apiClient.get<{ cursor: number }>('/sync/cursor')
           .then(cRes => {
             if (cRes.data && typeof cRes.data.cursor === 'number') {
@@ -337,14 +377,11 @@ export function Dashboard() {
 
   // Debounced search fetch
   useEffect(() => {
+    if (!searchQuery.trim()) return
+
     const delayDebounceFn = setTimeout(() => {
-      if (searchQuery.trim() !== '') {
-        void fetchDirectory(currentFolderId, activeNav, searchQuery)
-      } else {
-        // If cleared, fetch normal directory
-        void fetchDirectory(currentFolderId, activeNav, '')
-      }
-    }, 500)
+      void fetchDirectory(currentFolderId, activeNav, searchQuery)
+    }, 400)
 
     return () => clearTimeout(delayDebounceFn)
   }, [searchQuery, currentFolderId, activeNav, fetchDirectory])
@@ -432,6 +469,51 @@ export function Dashboard() {
     setPreviewInvitation(inv)
   }, [])
 
+  const [isBatchProcessing, setIsBatchProcessing] = useState(false)
+
+  const handleAcceptAll = useCallback(async () => {
+    if (invitations.length === 0) return
+    setIsBatchProcessing(true)
+    let successCount = 0
+    for (const inv of invitations) {
+      try {
+        await apiClient.post(`/shares/invitations/${inv.id}/accept`)
+        successCount++
+      } catch {
+        // continue
+      }
+    }
+    setInvitations([])
+    pushToast({
+      variant: 'success',
+      message: `Accepted ${successCount} invitation${successCount === 1 ? '' : 's'} and added to Shared with me!`,
+    })
+    if (activeNav === 'shared') {
+      void fetchDirectory(null, 'shared')
+    }
+    setIsBatchProcessing(false)
+  }, [invitations, activeNav, fetchDirectory, pushToast])
+
+  const handleDeclineAll = useCallback(async () => {
+    if (invitations.length === 0) return
+    setIsBatchProcessing(true)
+    let successCount = 0
+    for (const inv of invitations) {
+      try {
+        await apiClient.post(`/shares/invitations/${inv.id}/decline`)
+        successCount++
+      } catch {
+        // continue
+      }
+    }
+    setInvitations([])
+    pushToast({
+      variant: 'info',
+      message: `Declined ${successCount} invitation${successCount === 1 ? '' : 's'}.`,
+    })
+    setIsBatchProcessing(false)
+  }, [invitations, pushToast])
+
   // ---- Navigation handlers ----
 
   /** Navigate into a folder (double-click / Enter key). */
@@ -473,9 +555,135 @@ export function Dashboard() {
     setSearchQuery('')
   }, [effectiveBreadcrumbs, setSearchParams, isInTrash, activeNav])
 
-  // ---- Search filter ----
-  // Semantic search is handled by the backend, so we just use items directly.
-  const filteredItems = items
+  // ---- Advanced Filter Chips & Sorting ----
+  const [typeFilter, setTypeFilter] = useState<TypeFilter>('all')
+  const [personFilter, setPersonFilter] = useState<string | null>(null)
+  const [dateFilter, setDateFilter] = useState<DateFilter>('all')
+  const [sortField, setSortField] = useState<SortField>('name')
+  const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
+
+  useEffect(() => {
+    setTypeFilter('all')
+    setPersonFilter(null)
+    setDateFilter('all')
+  }, [activeNav])
+
+  const handleResetFilters = useCallback(() => {
+    setTypeFilter('all')
+    setPersonFilter(null)
+    setDateFilter('all')
+  }, [])
+
+  const handleSortChange = useCallback((field: SortField) => {
+    if (sortField === field) {
+      setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setSortField(field)
+      setSortDirection(field === 'name' ? 'asc' : 'desc')
+    }
+  }, [sortField])
+
+  const handleToggleSortDirection = useCallback(() => {
+    setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'))
+  }, [])
+
+  const availablePeople = useMemo(() => {
+    const set = new Set<string>()
+    items.forEach((it) => {
+      if (it.shared_by_email) set.add(it.shared_by_email)
+      if (it.owner_email) {
+        if (!user?.email || it.owner_email !== user.email) {
+          set.add(it.owner_email)
+        }
+      }
+    })
+    invitations.forEach((inv) => {
+      if (inv.sender_email) set.add(inv.sender_email)
+    })
+    return Array.from(set).sort()
+  }, [items, user?.email, invitations])
+
+  const filteredItems = useMemo(() => {
+    let result = [...items]
+
+    // 1. Type Filter
+    if (typeFilter !== 'all') {
+      result = result.filter((it) => {
+        if (typeFilter === 'folders') return it.is_directory
+        if (it.is_directory) return false
+        const ext = it.name.split('.').pop()?.toLowerCase() || ''
+        const mime = it.mime_type?.toLowerCase() || ''
+        if (typeFilter === 'pdfs') {
+          return ext === 'pdf' || mime === 'application/pdf'
+        }
+        if (typeFilter === 'documents') {
+          return ['doc', 'docx', 'txt', 'rtf', 'odt', 'md'].includes(ext) || mime.includes('word') || mime.includes('text')
+        }
+        if (typeFilter === 'spreadsheets') {
+          return ['xls', 'xlsx', 'csv', 'ods'].includes(ext) || mime.includes('sheet') || mime.includes('csv')
+        }
+        if (typeFilter === 'images') {
+          return ['jpg', 'jpeg', 'png', 'webp', 'gif', 'svg', 'bmp'].includes(ext) || mime.startsWith('image/')
+        }
+        if (typeFilter === 'videos') {
+          return ['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext) || mime.startsWith('video/')
+        }
+        if (typeFilter === 'audio') {
+          return ['mp3', 'wav', 'ogg', 'm4a', 'flac'].includes(ext) || mime.startsWith('audio/')
+        }
+        return true
+      })
+    }
+
+    // 2. People Filter
+    if (personFilter !== null) {
+      result = result.filter((it) => {
+        return (
+          it.shared_by_email?.toLowerCase() === personFilter.toLowerCase() ||
+          it.owner_email?.toLowerCase() === personFilter.toLowerCase()
+        )
+      })
+    }
+
+    // 3. Date Filter
+    if (dateFilter !== 'all') {
+      const now = new Date().getTime()
+      const dayMs = 24 * 60 * 60 * 1000
+      result = result.filter((it) => {
+        const itemDate = new Date(it.shared_at || it.updated_at || it.created_at).getTime()
+        const diffMs = now - itemDate
+        if (dateFilter === 'today') return diffMs <= dayMs
+        if (dateFilter === '7days') return diffMs <= 7 * dayMs
+        if (dateFilter === '30days') return diffMs <= 30 * dayMs
+        if (dateFilter === 'this_year') return diffMs <= 365 * dayMs
+        return true
+      })
+    }
+
+    // 4. Sorting (Directories always grouped first, then items sorted by chosen field & direction)
+    result.sort((a, b) => {
+      if (a.is_directory !== b.is_directory) {
+        return a.is_directory ? -1 : 1
+      }
+
+      let cmp = 0
+      if (sortField === 'name') {
+        cmp = a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+      } else if (sortField === 'date') {
+        const dateA = new Date(a.shared_at || a.updated_at || a.created_at).getTime() || 0
+        const dateB = new Date(b.shared_at || b.updated_at || b.created_at).getTime() || 0
+        cmp = dateA - dateB
+      } else if (sortField === 'size') {
+        const sizeA = (a.aggregate_size ?? a.size_bytes) || 0
+        const sizeB = (b.aggregate_size ?? b.size_bytes) || 0
+        cmp = sizeA - sizeB
+      }
+
+      return sortDirection === 'asc' ? cmp : -cmp
+    })
+
+    return result
+  }, [items, typeFilter, personFilter, dateFilter, sortField, sortDirection])
 
   // ---- New folder callback ----
   const handleFolderCreated = useCallback((folder: FileItem) => {
@@ -547,6 +755,7 @@ export function Dashboard() {
   // Batch debouncer for upload completion toasts to prevent toast flooding during folder uploads.
   const batchUploadCountRef = useRef(0)
   const batchUploadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const deltaRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const lastUploadedNameRef = useRef<string | null>(null)
 
   const triggerBatchUploadToast = useCallback((name: string | null) => {
@@ -590,10 +799,17 @@ export function Dashboard() {
 
     try {
       let hasMore = true
+      const updatedItemIds = new Set<string>()
       while (hasMore) {
         const since = syncCursorRef.current
         const res = await apiClient.get<DeltaSyncResponse>(`/sync/delta?since=${since}&limit=100`)
-        const { entries, next_cursor, has_more } = res.data
+        const { entries, next_cursor, has_more, reset_cursor } = res.data
+
+        if (reset_cursor) {
+          syncCursorRef.current = next_cursor
+          void fetchDirectory(currentFolderIdRef.current)
+          break
+        }
 
         if (entries && entries.length > 0) {
           setItems((prevItems) => {
@@ -652,14 +868,8 @@ export function Dashboard() {
                       thumbnail_url: entry.thumbnail_url || updated[existingIdx].thumbnail_url || fallbackThumb,
                       updated_at: entry.created_at,
                     }
+                    updatedItemIds.add(entry.file_id)
                   }
-                  // Refresh full item asynchronously to catch updated tags/summary
-                  apiClient.get<FileItem>(`/files/${entry.file_id}`).then((res) => {
-                    if (res.data) {
-                      setItems((prev) => prev.map((it) => (it.id === entry.file_id ? { ...it, ...res.data } : it)))
-                      setInfoTarget((prev) => (prev && prev.id === entry.file_id ? { ...prev, ...res.data } : prev))
-                    }
-                  }).catch(() => {})
                   break
                 }
 
@@ -779,8 +989,45 @@ export function Dashboard() {
         syncCursorRef.current = next_cursor
         hasMore = has_more
       }
-    } catch (err) {
+
+      // Batch or debounce background metadata refresh (AI tags, AI summaries)
+      if (updatedItemIds.size > 0) {
+        if (updatedItemIds.size <= 3) {
+          const ids = Array.from(updatedItemIds)
+          Promise.allSettled(ids.map((id) => apiClient.get<FileItem>(`/files/${id}`)))
+            .then((results) => {
+              const fresh: FileItem[] = []
+              for (const r of results) {
+                if (r.status === 'fulfilled' && r.value.data) {
+                  fresh.push(r.value.data)
+                }
+              }
+              if (fresh.length > 0) {
+                const map = new Map(fresh.map((item) => [item.id, item]))
+                setItems((prev) => prev.map((it) => (map.has(it.id) ? { ...it, ...map.get(it.id)! } : it)))
+              }
+            })
+            .catch(() => {})
+        } else {
+          // Large burst update: Debounce a single fetchDirectory to avoid request storms
+          if (deltaRefreshTimerRef.current) {
+            clearTimeout(deltaRefreshTimerRef.current)
+          }
+          deltaRefreshTimerRef.current = setTimeout(() => {
+            void fetchDirectory(currentFolderIdRef.current)
+          }, 500)
+        }
+      }
+    } catch (err: any) {
       console.error('Failed to apply delta sync, falling back to full refresh', err)
+      if (err.response?.status === 410 || err.response?.status === 400) {
+        try {
+          const curRes = await apiClient.get<{ cursor: number }>('/sync/cursor')
+          syncCursorRef.current = curRes.data.cursor
+        } catch {
+          syncCursorRef.current = 0
+        }
+      }
       void fetchDirectory(currentFolderIdRef.current)
     } finally {
       isSyncingRef.current = false
@@ -812,15 +1059,6 @@ export function Dashboard() {
                   : it
               )
             )
-            setInfoTarget((prev) =>
-              prev && prev.id === payload.file_id
-                ? {
-                    ...prev,
-                    tags: payload.tags !== undefined ? payload.tags : prev.tags,
-                    summary: payload.summary !== undefined ? payload.summary : prev.summary,
-                  }
-                : prev
-            )
           }
           break
         }
@@ -844,9 +1082,6 @@ export function Dashboard() {
                     const updatedFile = res.data
                     setItems((prev) =>
                       prev.map((it) => (it.id === fileId ? { ...it, ...updatedFile } : it))
-                    )
-                    setInfoTarget((prev) =>
-                      prev && prev.id === fileId ? { ...prev, ...updatedFile } : prev
                     )
                     // If AI summary or AI tags are ready, terminate polling early
                     if (updatedFile.summary || updatedFile.tags) {
@@ -1020,7 +1255,11 @@ export function Dashboard() {
         versionUploadTargetRef.current = item
         versionFileInputRef.current?.click()
       },
-      onGetInfo: (item) => setInfoTarget(item),
+      onGetInfo: (item) => {
+        setSelectedIds(new Set([item.id]))
+        setLastSelectedId(item.id)
+        setIsDetailsOpen(true)
+      },
     }),
     [handleDownload, handleRestore, navigateToFolder],
   )
@@ -1054,6 +1293,11 @@ export function Dashboard() {
   /** Optimistically remove a deleted item from the listing. */
   const handleDeleted = useCallback((itemId: string) => {
     setItems((prev) => prev.filter((it) => !selectedIds.has(it.id) && it.id !== itemId))
+    if (tabCacheRef.current) {
+      for (const [key, cachedList] of tabCacheRef.current.entries()) {
+        tabCacheRef.current.set(key, cachedList.filter((it) => it.id !== itemId))
+      }
+    }
   }, [selectedIds])
 
   // Clear selection on folder navigation or tab change
@@ -1144,17 +1388,30 @@ export function Dashboard() {
     const ids = Array.from(selectedIds)
     if (ids.length === 0) return
     try {
-      await apiClient.post('/files/bulk/delete', { ids })
+      if (activeNav === 'shared') {
+        await Promise.all(ids.map((id) => apiClient.delete(`/shares/shared-with-me/${id}`)))
+        pushToast({
+          variant: 'success',
+          message: `Successfully removed ${ids.length} shared item${ids.length > 1 ? 's' : ''} from your view.`,
+        })
+      } else {
+        await apiClient.post('/files/bulk/delete', { ids })
+        pushToast({
+          variant: 'success',
+          message: `Successfully moved ${ids.length} item${ids.length > 1 ? 's' : ''} to Trash.`,
+        })
+      }
       setItems((prev) => prev.filter((it) => !selectedIds.has(it.id)))
-      pushToast({
-        variant: 'success',
-        message: `Successfully moved ${ids.length} item${ids.length > 1 ? 's' : ''} to Trash.`,
-      })
+      if (tabCacheRef.current) {
+        for (const [key, cachedList] of tabCacheRef.current.entries()) {
+          tabCacheRef.current.set(key, cachedList.filter((it) => !selectedIds.has(it.id)))
+        }
+      }
       clearSelection()
     } catch {
       pushToast({ message: 'Failed to delete selected items.' })
     }
-  }, [selectedIds, pushToast, clearSelection])
+  }, [selectedIds, pushToast, clearSelection, activeNav])
 
   const handleBulkRestore = useCallback(async () => {
     const ids = Array.from(selectedIds)
@@ -1238,20 +1495,6 @@ export function Dashboard() {
       fileInputRef.current?.click()
     }
   }, [isE2EEnabled])
-
-  const getAvailableFileName = (originalName: string, existingNames: Set<string>): string => {
-    const dotIndex = originalName.lastIndexOf('.')
-    const base = dotIndex !== -1 ? originalName.slice(0, dotIndex) : originalName
-    const ext = dotIndex !== -1 ? originalName.slice(dotIndex) : ''
-    let counter = 1
-    let candidate = `${base} (${counter})${ext}`
-    while (existingNames.has(candidate.toLowerCase())) {
-      counter++
-      candidate = `${base} (${counter})${ext}`
-    }
-    return candidate
-  }
-
   const processUploadFiles = useCallback(
     (files: File[], parentId: string | null, passphrase?: string) => {
       const conflicts: Array<{ file: File; parentId: string | null; passphrase?: string }> = []
@@ -1281,7 +1524,7 @@ export function Dashboard() {
   const handleResolveConflictUpdate = useCallback(() => {
     const current = pendingConflicts[0]
     if (current) {
-      uploadFile(current.file, current.parentId, undefined, current.passphrase)
+      uploadFile(current.file, current.parentId, undefined, current.passphrase, 'version')
       pushToast({ message: `Updating version for ${current.file.name}...`, variant: 'info' })
     }
     setPendingConflicts((prev) => prev.slice(1))
@@ -1290,14 +1533,11 @@ export function Dashboard() {
   const handleResolveConflictKeepBoth = useCallback(() => {
     const current = pendingConflicts[0]
     if (current) {
-      const existingNames = new Set(items.map((i) => i.name.toLowerCase()))
-      const newName = getAvailableFileName(current.file.name, existingNames)
-      const renamed = new File([current.file], newName, { type: current.file.type })
-      uploadFile(renamed, current.parentId, undefined, current.passphrase)
-      pushToast({ message: `Uploading copy ${newName}...`, variant: 'info' })
+      uploadFile(current.file, current.parentId, undefined, current.passphrase, 'copy')
+      pushToast({ message: `Uploading copy for ${current.file.name}...`, variant: 'info' })
     }
     setPendingConflicts((prev) => prev.slice(1))
-  }, [pendingConflicts, items, uploadFile, pushToast])
+  }, [pendingConflicts, uploadFile, pushToast])
 
   const handleResolveConflictCancel = useCallback(() => {
     setPendingConflicts((prev) => prev.slice(1))
@@ -1383,6 +1623,18 @@ export function Dashboard() {
     return () => window.removeEventListener(UPLOAD_COMPLETE_EVENT, handler)
   }, [UPLOAD_COMPLETE_EVENT, applyDeltaSync])
 
+  // Prompt conflict modal when a server-side 409 conflict is encountered
+  useEffect(() => {
+    const handleConflictEvent = (e: Event) => {
+      const custom = e as CustomEvent<{ file: File; parentId: string | null; passphrase?: string }>
+      if (custom.detail) {
+        setPendingConflicts((prev) => [...prev, custom.detail])
+      }
+    }
+    window.addEventListener('upload-conflict', handleConflictEvent)
+    return () => window.removeEventListener('upload-conflict', handleConflictEvent)
+  }, [])
+
 
 
   return (
@@ -1414,11 +1666,16 @@ export function Dashboard() {
           onOpenSettings={() => setSettingsModalOpen(true)}
           isE2EEnabled={isE2EEnabled}
           onToggleE2E={() => setIsE2EEnabled(!isE2EEnabled)}
-          activeNav={isInTrash ? 'trash' : activeNav}
-          disableNew={isInTrash}
+          activeNav={activeNav}
+          disableNew={isInTrash || activeNav === 'notifications' || activeNav === 'recent'}
           onSelectNav={(navId) => {
-            if (navId === 'shared') {
+            setIsTrashContext(false)
+            if (navId === 'notifications') {
+              setSearchParams({ nav: 'notifications' })
+            } else if (navId === 'shared') {
               setSearchParams({ nav: 'shared' })
+            } else if (navId === 'recent') {
+              setSearchParams({ nav: 'recent' })
             } else if (navId === 'trash') {
               setSearchParams({ nav: 'trash' })
             } else {
@@ -1427,8 +1684,6 @@ export function Dashboard() {
             setMobileSidebarOpen(false)
           }}
           onSignOut={logout}
-          storageUsed={STORAGE_USED}
-          storageLimit={STORAGE_LIMIT}
           syncStatus={wsStatus}
           isCircuitBroken={isCircuitBroken}
           onRetrySync={retryWs}
@@ -1488,6 +1743,27 @@ export function Dashboard() {
           onToggleMobileSidebar={() => setMobileSidebarOpen((o) => !o)}
         />
 
+        {/* Google Drive-style Filter Chips Bar */}
+        {activeNav !== 'notifications' && (
+          <FilterChipsBar
+            typeFilter={typeFilter}
+            onTypeFilterChange={setTypeFilter}
+            personFilter={personFilter}
+            onPersonFilterChange={setPersonFilter}
+            dateFilter={dateFilter}
+            onDateFilterChange={setDateFilter}
+            availablePeople={availablePeople}
+            totalItems={items.length}
+            filteredItemsCount={filteredItems.length}
+            onResetFilters={handleResetFilters}
+            sortField={sortField}
+            onSortFieldChange={handleSortChange}
+            sortDirection={sortDirection}
+            onToggleSortDirection={handleToggleSortDirection}
+            isSharedView={activeNav === 'shared'}
+          />
+        )}
+
         <div className="flex flex-1 w-full h-full overflow-hidden relative">
           <div className="flex-1 flex flex-col min-h-0 overflow-y-auto" onClick={clearSelection}>
             {/* Error banner */}
@@ -1507,20 +1783,20 @@ export function Dashboard() {
           </div>
         )}
 
-        {/* Share Invitations Banner (Collaborative Safety Gate - Option A) */}
-        {activeNav === 'shared' && !currentFolderId && (
-          <PendingInvitationsBanner
+        {/* Dedicated Notifications View */}
+        {activeNav === 'notifications' ? (
+          <NotificationsView
             invitations={invitations}
             onAccept={handleAcceptInvitation}
             onDecline={handleDeclineInvitation}
             onBlockSender={handleBlockSender}
             onPreview={handlePreviewInvitation}
+            onAcceptAll={handleAcceptAll}
+            onDeclineAll={handleDeclineAll}
             loadingId={loadingInvitationId}
+            isBatchLoading={isBatchProcessing}
           />
-        )}
-
-        {/* File list / grid / skeleton */}
-        {isLoading || !isCurrentStateLoaded ? (
+        ) : isLoading || !isCurrentStateLoaded ? (
           <DirectorySkeleton />
         ) : viewMode === 'list' ? (
           <ListView
@@ -1535,6 +1811,10 @@ export function Dashboard() {
             onOpenFolder={(item) => navigateToFolder(item)}
             onOpenFile={handleOpenFile}
             onContextMenu={handleItemContextMenu}
+            onFilterBySender={(email) => setPersonFilter(email)}
+            sortField={sortField}
+            sortDirection={sortDirection}
+            onSortChange={handleSortChange}
           />
         ) : (
           <GridView
@@ -1545,9 +1825,10 @@ export function Dashboard() {
             onSelectRange={handleSelectRange}
             onOpenFolder={(item) => navigateToFolder(item)}
             onOpenFile={handleOpenFile}
-              onContextMenu={handleItemContextMenu}
-            />
-          )}
+            onContextMenu={handleItemContextMenu}
+            onFilterBySender={(email) => setPersonFilter(email)}
+          />
+        )}
           </div>
           <DetailPanel
             item={selectedIds.size === 1 ? filteredItems.find(it => selectedIds.has(it.id)) || null : null}
@@ -1556,6 +1837,10 @@ export function Dashboard() {
             onItemUpdated={(updated) => {
               setItems((prev) => prev.map((it) => (it.id === updated.id ? updated : it)))
             }}
+            onManageAccess={(item) => setShareTarget(item)}
+            isSharedView={activeNav === 'shared'}
+            currentLocationPath={effectiveBreadcrumbs.map((b) => b.name).join(' / ')}
+            currentUserEmail={user?.email}
           />
         </div>
 
@@ -1610,7 +1895,7 @@ export function Dashboard() {
       <ShareModal
         open={shareTarget !== null}
         onClose={() => setShareTarget(null)}
-        file={shareTarget}
+        file={shareTarget ? { id: shareTarget.target_id || shareTarget.id, name: shareTarget.name } : null}
       />
       <RenameModal
         open={renameTarget !== null}
@@ -1640,6 +1925,7 @@ export function Dashboard() {
         file={deleteTarget}
         onDeleted={handleDeleted}
         isPermanent={false}
+        isShared={activeNav === 'shared'}
       />
       <DeleteModal
         open={permanentDeleteTarget !== null || bulkDeletePermanentOpen}
@@ -1754,17 +2040,6 @@ export function Dashboard() {
         onRestoreComplete={() => void fetchDirectory()}
       />
 
-      {infoTarget && (
-        <GetInfoModal
-          item={infoTarget}
-          onClose={() => setInfoTarget(null)}
-          onItemUpdated={(updated) => {
-            setItems((prev) => prev.map((it) => (it.id === updated.id ? updated : it)))
-            setInfoTarget(updated)
-          }}
-        />
-      )}
-
       {/* Sandboxed Read-Only Preview Modal for Unaccepted Shares */}
       <SandboxedPreviewModal
         open={previewInvitation !== null}
@@ -1775,10 +2050,15 @@ export function Dashboard() {
       />
 
       <MobileNav
-        activeNav={isInTrash ? 'trash' : activeNav}
+        activeNav={activeNav}
         onSelectNav={(navId) => {
-          if (navId === 'shared') {
+          setIsTrashContext(false)
+          if (navId === 'notifications') {
+            setSearchParams({ nav: 'notifications' })
+          } else if (navId === 'shared') {
             setSearchParams({ nav: 'shared' })
+          } else if (navId === 'recent') {
+            setSearchParams({ nav: 'recent' })
           } else if (navId === 'trash') {
             setSearchParams({ nav: 'trash' })
           } else {
@@ -1787,7 +2067,8 @@ export function Dashboard() {
         }}
         onOpenSettings={() => setSettingsModalOpen(true)}
         onUploadFile={handleUploadFile}
-        disableNew={isInTrash}
+        disableNew={isInTrash || activeNav === 'notifications' || activeNav === 'recent'}
+        pendingInvitationsCount={invitations.length}
       />
     </div>
   )

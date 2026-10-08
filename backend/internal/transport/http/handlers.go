@@ -51,6 +51,7 @@ type Server struct {
 	// Phase 6: real-time layer. hub is nil when WS notifications aren't
 	// configured; the WS handler then returns 503.
 	hub            *sync.Hub
+	notifier       sync.Notifier
 	jwtSecret      string
 	wsUpgrader     websocket.Upgrader
 	mailer         *email.Mailer
@@ -86,7 +87,27 @@ func (s *Server) WithRealtime(hub *sync.Hub, jwtSecret string, wsCORSOrigins []s
 	s.hub = hub
 	s.jwtSecret = jwtSecret
 	s.wsUpgrader = newUpgrader(wsCORSOrigins)
+	if s.notifier == nil && hub != nil {
+		s.notifier = hub
+	}
 	return s
+}
+
+// WithNotifier wires an external or cluster-aware Notifier (e.g. RedisBackplane)
+// so events published from HTTP handlers route to peer nodes in a multi-instance deployment.
+func (s *Server) WithNotifier(notifier sync.Notifier) *Server {
+	s.notifier = notifier
+	return s
+}
+
+// notifyUser routes a notification event through the cluster-aware notifier if present,
+// or directly to the local hub.
+func (s *Server) notifyUser(userID string, event sync.NotificationEvent) {
+	if s.notifier != nil {
+		s.notifier.NotifyUser(userID, event)
+	} else if s.hub != nil {
+		s.hub.NotifyUser(userID, event)
+	}
 }
 
 // WithUsers wires the user repository, needed by the share handler to resolve

@@ -142,6 +142,40 @@ func (s *Server) HandleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Populate owner_email
+	if s.users != nil && file.UserID != "" {
+		if owner, err := s.users.GetByID(r.Context(), file.UserID); err == nil && owner != nil {
+			file.OwnerEmail = &owner.Email
+		}
+	}
+
+	// If caller is not owner, resolve caller's role, who shared it, and when
+	if file.UserID != userID && s.users != nil && s.perms != nil {
+		if u, err := s.users.GetByID(r.Context(), userID); err == nil && u != nil {
+			if role, err := s.fileOps.GetResolvedPermission(r.Context(), fileID, u.Email); err == nil {
+				file.Role = role
+			}
+			if perms, err := s.perms.GetPermissionsByFile(r.Context(), fileID); err == nil {
+				for _, p := range perms {
+					if strings.EqualFold(p.GranteeEmail, u.Email) {
+						file.SharedAt = &p.CreatedAt
+						if p.InvitedBy != nil && *p.InvitedBy != "" {
+							if sender, err := s.users.GetByID(r.Context(), *p.InvitedBy); err == nil && sender != nil {
+								file.SharedByEmail = &sender.Email
+							}
+						}
+						if file.SharedByEmail == nil {
+							file.SharedByEmail = file.OwnerEmail
+						}
+						break
+					}
+				}
+			}
+		}
+	} else if file.UserID == userID {
+		file.Role = domain.RoleOwner
+	}
+
 	writeJSON(w, http.StatusOK, file)
 }
 
@@ -377,6 +411,11 @@ func (s *Server) HandleGetThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If this file is a shortcut, resolve the thumbnail for the underlying target file
+	if f, err := s.fileOps.GetFileInfo(r.Context(), fileID); err == nil && f != nil && f.TargetID != nil && *f.TargetID != "" {
+		fileID = *f.TargetID
+	}
+
 	thumbKey := fmt.Sprintf("thumbnails/%s.png", fileID)
 	rc, err := s.storage.GetObject(r.Context(), thumbKey)
 	if err != nil {
@@ -452,15 +491,13 @@ func (s *Server) HandleUploadThumbnail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.hub != nil {
-		s.hub.NotifyUser(userID, wsSync.NotificationEvent{
-			Type: wsSync.EventThumbnailReady,
-			Payload: map[string]any{
-				"file_id":       fileID,
-				"thumbnail_url": fmt.Sprintf("/api/files/%s/thumbnail", fileID),
-			},
-		})
-	}
+	s.notifyUser(userID, wsSync.NotificationEvent{
+		Type: wsSync.EventThumbnailReady,
+		Payload: map[string]any{
+			"file_id":       fileID,
+			"thumbnail_url": fmt.Sprintf("/api/files/%s/thumbnail", fileID),
+		},
+	})
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"file_id":       fileID,
@@ -537,6 +574,13 @@ func (s *Server) HandleDownload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// If this single item is a shortcut, resolve to the underlying target file
+		if file.TargetID != nil && *file.TargetID != "" {
+			if targetFile, tErr := s.fileOps.GetFileInfo(r.Context(), *file.TargetID); tErr == nil && targetFile != nil {
+				file = targetFile
+			}
+		}
+
 		if !file.IsDirectory {
 			s.streamSingleFile(w, r, file)
 			return
@@ -601,10 +645,10 @@ func (s *Server) HandleCreateShortcut(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, shortcut)
 }
 
-// parseRangeHeader parses HTTP Range header e.g. "bytes=0-100" or "bytes=100-".
+// parseRangeHeader parses HTTP Range header e.g. "bytes=0-100", "bytes=100-", or "bytes=-500" (suffix range per RFC 7233).
 // Returns start, end, and true if parsed.
 func parseRangeHeader(header string, fileSize int64) (int64, int64, bool) {
-	if header == "" || !strings.HasPrefix(header, "bytes=") {
+	if header == "" || !strings.HasPrefix(header, "bytes=") || fileSize <= 0 {
 		return 0, 0, false
 	}
 	parts := strings.Split(header[6:], "-")
@@ -616,9 +660,24 @@ func parseRangeHeader(header string, fileSize int64) (int64, int64, bool) {
 
 	var start, end int64
 	var err error
+
+	// RFC 7233 Suffix Range: bytes=-500 (requests the final 500 bytes of the representation)
 	if startStr == "" {
-		return 0, 0, false
+		if endStr == "" {
+			return 0, 0, false
+		}
+		suffixLen, err := strconv.ParseInt(endStr, 10, 64)
+		if err != nil || suffixLen <= 0 {
+			return 0, 0, false
+		}
+		if suffixLen > fileSize {
+			suffixLen = fileSize
+		}
+		start = fileSize - suffixLen
+		end = fileSize - 1
+		return start, end, true
 	}
+
 	start, err = strconv.ParseInt(startStr, 10, 64)
 	if err != nil || start < 0 || start >= fileSize {
 		return 0, 0, false
@@ -771,6 +830,15 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 			logCtx.Info("download cancelled by client context")
 			return
 		default:
+		}
+
+		// Periodic sanity check on long streams (every 16 blocks = 64MB)
+		if idx > startBlockIndex && (idx-startBlockIndex)%16 == 0 && s.files != nil {
+			f, checkErr := s.files.GetByID(r.Context(), file.ID)
+			if checkErr != nil || f == nil || f.DeletedAt != nil || f.Status == "TRASHED" {
+				logCtx.Warn("download aborted: file was deleted or revoked during streaming", "block_index", idx)
+				return
+			}
 		}
 
 		blk := blocks[idx]

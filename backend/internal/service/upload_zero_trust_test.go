@@ -106,3 +106,115 @@ func TestZeroTrust_CASPoisoningRejected(t *testing.T) {
 		t.Errorf("poisoned staging object %s was not purged after rejection", stagingKey)
 	}
 }
+
+// TestGetSession_StagingReconciliation verifies that GetSession correctly
+// identifies chunks already present in S3 staging after a network interruption.
+//
+// Scenario: A 3-chunk upload where chunks 0 and 1 successfully reach S3 staging
+// before the connection drops. On reconnect, the client calls GET /session/:id.
+// The backend must recognise those two chunks as already staged (AlreadyExists=true,
+// no UploadURL) and only issue a fresh URL for the genuinely missing chunk 2.
+// This prevents wasteful re-uploading of chunks that already cleared the public WAN.
+func TestGetSession_StagingReconciliation(t *testing.T) {
+	db := openE2EDB(t)
+	defer db.Close()
+	freshE2ESchema(t, db)
+
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stor := newMemStorage()
+	pub := &capturingPublisher{}
+
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	blocks := postgresrepo.NewBlockRepository(db)
+	sessions := postgresrepo.NewUploadSessionRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
+
+	svc := service.NewUploadService(
+		db, users, files, blocks, sessions, perms,
+		stor, pub, wsSync.NoopNotifier(), log,
+	)
+
+	user := &domain.User{
+		Email:        fmt.Sprintf("resume-%d@example.com", time.Now().UnixNano()),
+		PasswordHash: "hash",
+		IsVerified:   true,
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	// Build 3 distinct chunks.
+	type chunkDef struct {
+		data []byte
+		hash string
+		size int32
+	}
+	makeChunk := func(content string) chunkDef {
+		d := []byte(content)
+		sum := sha256.Sum256(d)
+		return chunkDef{data: d, hash: hex.EncodeToString(sum[:]), size: int32(len(d))}
+	}
+	chunk0 := makeChunk("chunk-zero-data-payload-alpha")
+	chunk1 := makeChunk("chunk-one-data-payload-beta")
+	chunk2 := makeChunk("chunk-two-data-payload-gamma")
+
+	// Initiate upload session with all 3 chunks.
+	initResp, err := svc.Initiate(ctx, service.InitiateRequest{
+		UserID:    user.ID,
+		Filename:  "large-video.mp4",
+		TotalSize: int64(chunk0.size + chunk1.size + chunk2.size),
+		Chunks: []service.InitiateChunk{
+			{SHA256: chunk0.hash, SizeBytes: chunk0.size},
+			{SHA256: chunk1.hash, SizeBytes: chunk1.size},
+			{SHA256: chunk2.hash, SizeBytes: chunk2.size},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Initiate: %v", err)
+	}
+	sessionID := initResp.SessionID
+
+	// Simulate: chunks 0 and 1 successfully uploaded to S3 staging before disconnect.
+	// Chunk 2 never arrived (network dropped).
+	for i, chunk := range []chunkDef{chunk0, chunk1} {
+		key := fmt.Sprintf("staging/%s/%d", sessionID, i)
+		if err := stor.PutObject(ctx, key, bytes.NewReader(chunk.data), int64(chunk.size), "application/octet-stream"); err != nil {
+			t.Fatalf("put chunk %d: %v", i, err)
+		}
+	}
+
+	// Call GetSession (simulates reconnect — client asks: what do I still need to upload?).
+	statusResp, err := svc.GetSession(ctx, sessionID, user.ID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if len(statusResp.Chunks) != 3 {
+		t.Fatalf("expected 3 chunks in response, got %d", len(statusResp.Chunks))
+	}
+
+	// Validate per-chunk reconciliation results.
+	for _, rc := range statusResp.Chunks {
+		switch rc.SequenceNumber {
+		case 0, 1:
+			// These chunks are already in S3 staging — must not be re-uploaded.
+			if !rc.AlreadyExists {
+				t.Errorf("chunk %d: expected AlreadyExists=true (already staged), got false", rc.SequenceNumber)
+			}
+			if rc.UploadURL != "" {
+				t.Errorf("chunk %d: expected no UploadURL for already-staged chunk, got %q", rc.SequenceNumber, rc.UploadURL)
+			}
+		case 2:
+			// This chunk never made it to staging — must receive a fresh presigned URL.
+			if rc.AlreadyExists {
+				t.Errorf("chunk 2: expected AlreadyExists=false (not yet staged), got true")
+			}
+			if rc.UploadURL == "" {
+				t.Errorf("chunk 2: expected a fresh UploadURL for missing chunk, got empty string")
+			}
+		default:
+			t.Errorf("unexpected sequence_number %d in response", rc.SequenceNumber)
+		}
+	}
+}

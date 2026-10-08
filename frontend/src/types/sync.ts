@@ -57,6 +57,7 @@ export interface DeltaSyncResponse {
   entries: JournalEntry[]
   next_cursor: number
   has_more: boolean
+  reset_cursor?: boolean
 }
 
 /** Payload for SYNC_DELTA push notification. */

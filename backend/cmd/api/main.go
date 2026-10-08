@@ -159,6 +159,9 @@ func main() {
 		}
 
 		srv = srv.WithRealtime(hub, cfg.JWTSecret, cfg.WSCORSOrigins)
+		if notifier != nil {
+			srv = srv.WithNotifier(notifier)
+		}
 		log.Info("websocket hub started")
 	}
 
@@ -222,8 +225,8 @@ func main() {
 				publisher = queue.NewSQSPublisher(sqsClient, cfg.SQSQueueURL, log)
 				log.Info("SQS publisher configured for decoupled worker service", "queue_url", cfg.SQSQueueURL)
 
-				// Start in-process SQS worker pool so jobs are processed immediately without requiring a standalone daemon
-				if os.Getenv("ENABLE_INPROCESS_WORKER") != "false" {
+				// Start in-process SQS worker pool only if explicitly enabled (default is false for AWS Lambda decoupled workers)
+				if cfg.EnableInProcessWorker {
 					numWorkers := cfg.SQSNumWorkers
 					if numWorkers <= 0 {
 						numWorkers = 2
@@ -235,6 +238,8 @@ func main() {
 					wp := queue.NewWorkerPool(sqsClient, cfg.SQSQueueURL, processor, numWorkers, int32(pollTimeout), log)
 					wp.Start(workerCtx, &workerWg)
 					log.Info("in-process SQS worker pool started", "workers", numWorkers, "queue_url", cfg.SQSQueueURL)
+				} else {
+					log.Info("SQS decoupled mode active: in-process worker pool bypassed (workers handled by AWS Lambda / standalone worker)")
 				}
 			} else {
 				channelQueue := queue.NewChannelQueue(processor, 100, 2, log)

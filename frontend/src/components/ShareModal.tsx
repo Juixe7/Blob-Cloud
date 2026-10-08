@@ -38,11 +38,11 @@ function initialsFor(email: string): string {
 /** Deterministic gradient per email so avatars feel distinct without assets. */
 function avatarGradient(email: string): string {
   const palettes = [
-    'from-violet-500 to-fuchsia-500',
-    'from-sky-500 to-indigo-500',
+    'from-amber-500 to-yellow-500',
+    'from-slate-600 to-zinc-500',
     'from-emerald-500 to-teal-500',
-    'from-amber-500 to-orange-500',
-    'from-rose-500 to-pink-500',
+    'from-amber-600 to-orange-500',
+    'from-rose-500 to-orange-400',
     'from-cyan-500 to-blue-500',
   ]
   let hash = 0

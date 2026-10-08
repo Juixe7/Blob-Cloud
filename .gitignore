@@ -61,3 +61,4 @@ frontend_change.md
 # Binary & Lambda build artifacts
 bootstrap
 *.zip
+*.exe

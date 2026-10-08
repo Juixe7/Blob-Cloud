@@ -112,7 +112,7 @@ export function ActiveSessionsModal({
                           {sess.device_name || 'Unknown Device'}
                         </span>
                         {sess.is_current && (
-                          <span className="rounded-md bg-indigo-500/10 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-indigo-600 dark:text-indigo-400">
+                          <span className="rounded-md bg-amber-500/15 border border-amber-500/30 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wider text-amber-500 dark:text-amber-400">
                             Current
                           </span>
                         )}

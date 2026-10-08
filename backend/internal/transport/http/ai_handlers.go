@@ -163,23 +163,21 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if s.hub != nil {
-		s.hub.NotifyUser(userID, wsSync.NotificationEvent{
-			Type: wsSync.EventAIMetadataReady,
-			Payload: map[string]any{
-				"file_id": fileID,
-				"tags":    tagsStr,
-				"summary": summaryStr,
-			},
-		})
-		s.hub.NotifyUser(userID, wsSync.NotificationEvent{
-			Type: wsSync.EventSyncDelta,
-			Payload: map[string]any{
-				"file_id": fileID,
-				"action":  domain.ActionFileUpdated,
-			},
-		})
-	}
+	s.notifyUser(userID, wsSync.NotificationEvent{
+		Type: wsSync.EventAIMetadataReady,
+		Payload: map[string]any{
+			"file_id": fileID,
+			"tags":    tagsStr,
+			"summary": summaryStr,
+		},
+	})
+	s.notifyUser(userID, wsSync.NotificationEvent{
+		Type: wsSync.EventSyncDelta,
+		Payload: map[string]any{
+			"file_id": fileID,
+			"action":  domain.ActionFileUpdated,
+		},
+	})
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"file_id": fileID,

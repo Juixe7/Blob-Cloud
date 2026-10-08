@@ -45,6 +45,10 @@ export interface FileItem {
   tags?: string | null
   /** AI-generated document summary */
   summary?: string | null
+  /** Owner email */
+  owner_email?: string | null
+  /** Email of the person who shared this file */
+  shared_by_email?: string | null
 }
 
 /** A single node in the clickable breadcrumb trail. */
@@ -80,6 +84,10 @@ export type UploadStatus =
   | 'COMPLETING'
   | 'COMPLETED'
   | 'FAILED'
+  /** Wi-Fi/network dropped mid-upload. Chunks paused; will auto-resume on reconnect. */
+  | 'PAUSED_NETWORK'
+  /** Reconnected — calling GET /session/:id to reconcile; resuming upload. */
+  | 'RESUMING'
 
 /** A single upload tracked in the global queue. */
 export interface UploadJob {
@@ -98,7 +106,11 @@ export interface UploadJob {
   file_count?: number
   /** ID of the parent folder job, if this file is part of a folder upload. */
   folder_job_id?: string
+  /** Active upload session ID, stored so the network-recovery handler can call
+   *  GET /api/upload/session/:id and resume from exact chunk that was interrupted. */
+  sessionId?: string
 }
+
 
 /* ---- API request/response contracts (snake_case, match backend) ---- */
 

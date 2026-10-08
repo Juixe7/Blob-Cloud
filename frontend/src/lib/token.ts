@@ -12,6 +12,7 @@ export const UNAUTH_EVENT = 'blobcloud:unauth'
 /** Decoded JWT payload shape. We only care about identity + expiry. */
 export interface JwtUser {
   user_id: string
+  email?: string
   /** Expiry, in seconds since epoch. */
   exp?: number
   iat?: number

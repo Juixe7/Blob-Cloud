@@ -135,9 +135,9 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Notify the grantee in real-time about the pending invitation so their UI refreshes without polling
-	if s.hub != nil && s.users != nil {
+	if s.users != nil {
 		if grantee, err := s.users.GetByEmail(r.Context(), req.GranteeEmail); err == nil && grantee != nil {
-			s.hub.NotifyUser(grantee.ID, wsSync.NotificationEvent{
+			s.notifyUser(grantee.ID, wsSync.NotificationEvent{
 				Type: wsSync.EventShareInvitation,
 				Payload: map[string]string{
 					"invitation_id": perm.ID,
@@ -426,8 +426,8 @@ func (s *Server) HandleAcceptInvitation(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Notify the sender if available that their invitation was accepted
-	if s.hub != nil && perm.InvitedBy != nil && *perm.InvitedBy != "" {
-		s.hub.NotifyUser(*perm.InvitedBy, wsSync.NotificationEvent{
+	if perm.InvitedBy != nil && *perm.InvitedBy != "" {
+		s.notifyUser(*perm.InvitedBy, wsSync.NotificationEvent{
 			Type: wsSync.EventFileShared,
 			Payload: map[string]string{
 				"file_id":     perm.FileID,
@@ -438,15 +438,13 @@ func (s *Server) HandleAcceptInvitation(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Trigger real-time sync update on recipient's connection so the shared file view refreshes immediately
-	if s.hub != nil {
-		s.hub.NotifyUser(userID, wsSync.NotificationEvent{
-			Type: wsSync.EventSyncDelta,
-			Payload: map[string]string{
-				"action":  "INVITATION_ACCEPTED",
-				"file_id": perm.FileID,
-			},
-		})
-	}
+	s.notifyUser(userID, wsSync.NotificationEvent{
+		Type: wsSync.EventSyncDelta,
+		Payload: map[string]string{
+			"action":  "INVITATION_ACCEPTED",
+			"file_id": perm.FileID,
+		},
+	})
 
 	s.auditLog.Log(r.Context(), audit.Entry{
 		UserID:       userID,
@@ -624,8 +622,8 @@ func (s *Server) HandlePreviewInvitation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Security sandbox headers: prevent running scripts or navigating outside the sandbox
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; sandbox")
+	// Security preview headers: prevent script execution while permitting browser document rendering
+	w.Header().Set("Content-Security-Policy", "script-src 'none'; object-src 'self' data: blob:;")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	// Ensure query parameter has inline=true for streamSingleFile
@@ -634,4 +632,45 @@ func (s *Server) HandlePreviewInvitation(w http.ResponseWriter, r *http.Request)
 	r.URL.RawQuery = q.Encode()
 
 	s.streamSingleFile(w, r, file)
+}
+
+// HandleRemoveSharedWithMe implements DELETE /api/shares/shared-with-me/{id}.
+// It allows a collaborator (recipient) to remove a shared file from their own "Shared with me" view.
+// It deletes or revokes the caller's permission record for the file without modifying the file or affecting other collaborators.
+func (s *Server) HandleRemoveSharedWithMe(w http.ResponseWriter, r *http.Request) {
+	if s.perms == nil || s.users == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "permissions service unavailable",
+		})
+		return
+	}
+
+	userID, code, msg := s.userFromBearer(r)
+	if code != 0 {
+		writeJSON(w, code, map[string]string{"error": msg})
+		return
+	}
+
+	fileID := chi.URLParam(r, "id")
+	if fileID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file id"})
+		return
+	}
+
+	user, err := s.users.GetByID(r.Context(), userID)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
+		return
+	}
+
+	// Revoke/remove the grantee's permission for this file
+	if err := s.perms.RevokePermission(r.Context(), fileID, user.Email); err != nil {
+		if !errors.Is(err, domain.ErrPermissionNotFound) {
+			s.log.Error("failed to remove shared file for user", "file_id", fileID, "email", user.Email, "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to remove shared file"})
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "removed from shared with me"})
 }

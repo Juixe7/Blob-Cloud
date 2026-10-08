@@ -447,9 +447,13 @@ func (r *FileRepository) Restore(ctx context.Context, rootID string, userID stri
 // (excluding files owned by the user themselves and excluding soft-deleted files).
 func (r *FileRepository) ListSharedWithUser(ctx context.Context, userEmail, userID string) ([]*domain.File, error) {
 	const q = `
-		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, p.created_at, f.target_id, p.role
+		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status,
+		       p.created_at, p.role,
+		       COALESCE(u_owner.email, ''), COALESCE(u_sender.email, u_owner.email, '')
 		FROM files f
 		JOIN permissions p ON f.id = p.file_id
+		LEFT JOIN users u_owner ON f.user_id = u_owner.id
+		LEFT JOIN users u_sender ON p.invited_by = u_sender.id
 		WHERE p.grantee_email = $1 AND p.status = 'ACCEPTED' AND f.user_id != $2 AND f.deleted_at IS NULL
 		ORDER BY p.created_at DESC
 	`
@@ -463,12 +467,22 @@ func (r *FileRepository) ListSharedWithUser(ctx context.Context, userEmail, user
 	for rows.Next() {
 		var f domain.File
 		var sharedAt time.Time
+		var ownerEmail, sharedByEmail string
 		if err := rows.Scan(
 			&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.Path, &f.IsDirectory, &f.SizeBytes,
-			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &sharedAt, &f.TargetID, &f.Role); err != nil {
+			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt, &f.TargetID, &f.MimeType,
+			&f.ShortcutTargetID, &f.IsEncrypted, &f.EncryptionSalt, &f.Tags, &f.Summary, &f.Status,
+			&sharedAt, &f.Role,
+			&ownerEmail, &sharedByEmail); err != nil {
 			return nil, fmt.Errorf("scan shared file row: %w", err)
 		}
 		f.SharedAt = &sharedAt
+		if ownerEmail != "" {
+			f.OwnerEmail = &ownerEmail
+		}
+		if sharedByEmail != "" {
+			f.SharedByEmail = &sharedByEmail
+		}
 		out = append(out, &f)
 	}
 	return out, rows.Err()
@@ -477,31 +491,61 @@ func (r *FileRepository) ListSharedWithUser(ctx context.Context, userEmail, user
 // MoveSubtree atomically moves a folder and all its nested descendants to a new parent,
 // updating all materialized paths in O(1) via prefix substitution.
 func (r *FileRepository) MoveSubtree(ctx context.Context, folderID string, newParentID *string, userID string) error {
+	// If not already in an open transaction, wrap in RunInTx so advisory locks are held until commit
+	db, ok := r.db.(*sql.DB)
+	if ok {
+		return RunInTx(ctx, db, func(tx DBTX) error {
+			txRepo := r.WithTx(tx)
+			return txRepo.MoveSubtree(ctx, folderID, newParentID, userID)
+		})
+	}
+
+	// 0. Acquire deterministic transaction-scoped advisory locks on both folder IDs.
+	// Sorting the lock keys guarantees no AB-BA deadlocks during concurrent folder moves.
+	var targetIDStr string
+	if newParentID != nil {
+		targetIDStr = *newParentID
+	}
+	firstLock, secondLock := folderID, targetIDStr
+	if firstLock > secondLock {
+		firstLock, secondLock = targetIDStr, firstLock
+	}
+	if firstLock != "" {
+		if _, err := r.db.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext('tree_move_' || $1))", firstLock); err != nil {
+			return fmt.Errorf("acquire first move lock: %w", err)
+		}
+	}
+	if secondLock != "" && secondLock != firstLock {
+		if _, err := r.db.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext('tree_move_' || $1))", secondLock); err != nil {
+			return fmt.Errorf("acquire second move lock: %w", err)
+		}
+	}
+
 	var (
 		oldPath    string
 		targetPath string
 		newPrefix  string
 	)
 
-	// 1. Fetch current folder path
-	err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1 AND user_id = $2", folderID, userID).Scan(&oldPath)
+	// 1. Fetch current folder path under lock
+	err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL", folderID, userID).Scan(&oldPath)
 	if err != nil {
 		return fmt.Errorf("lookup folder %s: %w", folderID, err)
 	}
 
-	// 2. Resolve new parent path
+	// 2. Resolve new parent path under lock
 	if newParentID == nil || *newParentID == "" {
 		newPrefix = "/" + folderID + "/"
 	} else {
 		if *newParentID == folderID {
 			return fmt.Errorf("cannot move a folder into itself")
 		}
-		err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1", *newParentID).Scan(&targetPath)
+		err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1 AND deleted_at IS NULL", *newParentID).Scan(&targetPath)
 		if err != nil {
 			return fmt.Errorf("lookup new parent %s: %w", *newParentID, err)
 		}
 
-		// Cycle check: target parent path cannot start with oldPath
+		// Cycle check under transaction lock: target parent path cannot start with oldPath
 		if strings.HasPrefix(targetPath, oldPath) {
 			return fmt.Errorf("cannot move directory inside its own descendant")
 		}
@@ -520,10 +564,10 @@ func (r *FileRepository) MoveSubtree(ctx context.Context, folderID string, newPa
 
 	const q = `
 		UPDATE files
-		SET path = $1 || SUBSTRING(path FROM $2),
+		SET path = $1 || COALESCE(SUBSTRING(path FROM $2), ''),
 		    parent_id = CASE WHEN id = $6 THEN $7 ELSE parent_id END,
 		    updated_at = CURRENT_TIMESTAMP
-		WHERE user_id = $3 AND (path = $4 OR path LIKE $5 ESCAPE '\')
+		WHERE user_id = $3 AND (path = $4 OR path LIKE $5 ESCAPE '\') AND deleted_at IS NULL
 	`
 	_, err = r.db.ExecContext(ctx, q,
 		newPrefix,
@@ -546,52 +590,50 @@ func (r *FileRepository) MoveSubtree(ctx context.Context, folderID string, newPa
 // repopulated with the persisted row (including server-set path and updated_at).
 func (r *FileRepository) Update(ctx context.Context, file *domain.File) error {
 	// If parent_id changed, handle subtree relocation or single file move
-	if file.ParentID != nil {
-		var (
-			currentParentID *string
-			isDir           bool
-			userID          string
-		)
-		err := r.db.QueryRowContext(ctx, "SELECT parent_id, is_directory, user_id FROM files WHERE id = $1", file.ID).Scan(
-			&currentParentID, &isDir, &userID)
-		if err != nil {
-			return fmt.Errorf("lookup file for update %s: %w", file.ID, err)
-		}
+	var (
+		currentParentID *string
+		isDir           bool
+		userID          string
+	)
+	err := r.db.QueryRowContext(ctx, "SELECT parent_id, is_directory, user_id FROM files WHERE id = $1 AND deleted_at IS NULL", file.ID).Scan(
+		&currentParentID, &isDir, &userID)
+	if err != nil {
+		return fmt.Errorf("lookup file for update %s: %w", file.ID, err)
+	}
 
-		var reqParentID *string
-		if *file.ParentID != "" {
-			reqParentID = file.ParentID
-		}
+	var reqParentID *string
+	if file.ParentID != nil && *file.ParentID != "" && *file.ParentID != "root" {
+		reqParentID = file.ParentID
+	}
 
-		parentChanged := false
-		if (currentParentID == nil && reqParentID != nil) || (currentParentID != nil && reqParentID == nil) {
-			parentChanged = true
-		} else if currentParentID != nil && reqParentID != nil && *currentParentID != *reqParentID {
-			parentChanged = true
-		}
+	parentChanged := false
+	if (currentParentID == nil && reqParentID != nil) || (currentParentID != nil && reqParentID == nil) {
+		parentChanged = true
+	} else if currentParentID != nil && reqParentID != nil && *currentParentID != *reqParentID {
+		parentChanged = true
+	}
 
-		if parentChanged {
-			if isDir {
-				if err := r.MoveSubtree(ctx, file.ID, reqParentID, userID); err != nil {
-					return err
-				}
+	if parentChanged {
+		if isDir {
+			if err := r.MoveSubtree(ctx, file.ID, reqParentID, userID); err != nil {
+				return err
+			}
+		} else {
+			// Single file move
+			var newPath string
+			if reqParentID == nil {
+				newPath = "/" + file.ID + "/"
 			} else {
-				// Single file move
-				var newPath string
-				if reqParentID == nil {
-					newPath = "/" + file.ID + "/"
-				} else {
-					var parentPath string
-					if err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1", *reqParentID).Scan(&parentPath); err != nil {
-						return fmt.Errorf("lookup parent path: %w", err)
-					}
-					newPath = parentPath + file.ID + "/"
+				var parentPath string
+				if err := r.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1", *reqParentID).Scan(&parentPath); err != nil {
+					return fmt.Errorf("lookup parent path: %w", err)
 				}
-				_, err := r.db.ExecContext(ctx, "UPDATE files SET parent_id = $1, path = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3",
-					reqParentID, newPath, file.ID)
-				if err != nil {
-					return fmt.Errorf("update file parent/path %s: %w", file.ID, err)
-				}
+				newPath = parentPath + file.ID + "/"
+			}
+			_, err := r.db.ExecContext(ctx, "UPDATE files SET parent_id = $1, path = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 AND deleted_at IS NULL",
+				reqParentID, newPath, file.ID)
+			if err != nil {
+				return fmt.Errorf("update file parent/path %s: %w", file.ID, err)
 			}
 		}
 	}
@@ -606,7 +648,7 @@ func (r *FileRepository) Update(ctx context.Context, file *domain.File) error {
 		    is_encrypted = $5,
 		    encryption_salt = $6,
 		    updated_at = CURRENT_TIMESTAMP 
-		WHERE id = $7
+		WHERE id = $7 AND deleted_at IS NULL
 	`
 	if _, err := r.db.ExecContext(ctx, q, file.Name, file.SizeBytes, file.MimeType, file.Status, file.IsEncrypted, file.EncryptionSalt, file.ID); err != nil {
 		return fmt.Errorf("update file row %s: %w", file.ID, err)
@@ -789,7 +831,16 @@ func (r *FileRepository) findOrphanedHashes(ctx context.Context, hashes []string
 		sb.WriteString(fmt.Sprintf("$%d", i+1))
 		args = append(args, h)
 	}
-	sb.WriteString(`) AND NOT EXISTS (SELECT 1 FROM file_blocks fb WHERE fb.block_id = b.id) AND NOT EXISTS (SELECT 1 FROM file_versions fv WHERE b.sha256 = ANY(fv.chunk_hashes))`)
+	sb.WriteString(`) 
+		AND NOT EXISTS (SELECT 1 FROM file_blocks fb WHERE fb.block_id = b.id) 
+		AND NOT EXISTS (SELECT 1 FROM file_versions fv WHERE b.sha256 = ANY(fv.chunk_hashes))
+		AND NOT EXISTS (
+			SELECT 1 FROM session_blocks sb 
+			JOIN upload_sessions us ON sb.session_id = us.id 
+			WHERE sb.block_hash = b.sha256 
+			  AND us.status = 'INITIATED' 
+			  AND us.created_at > NOW() - INTERVAL '6 hours'
+		)`)
 
 	rows, err := r.db.QueryContext(ctx, sb.String(), args...)
 	if err != nil {
@@ -948,7 +999,14 @@ func (r *FileRepository) BulkMove(ctx context.Context, ids []string, parentID *s
 			}
 
 			// 3. Golden Rule fallback
-			isMove := parentID != nil && ((file.ParentID == nil && *parentID != "") || (file.ParentID != nil && *parentID != *file.ParentID))
+			var targetParent *string
+			if parentID != nil && *parentID != "" && *parentID != "root" {
+				targetParent = parentID
+			}
+
+			isMove := (file.ParentID == nil && targetParent != nil) ||
+				(file.ParentID != nil && targetParent == nil) ||
+				(file.ParentID != nil && targetParent != nil && *file.ParentID != *targetParent)
 			
 			if isMove && (role == domain.RoleViewer || (role == domain.RoleEditor && file.IsDirectory)) {
 				realTargetID := file.ID
@@ -959,7 +1017,7 @@ func (r *FileRepository) BulkMove(ctx context.Context, ids []string, parentID *s
 				shortcut := &domain.File{
 					UserID: userID,
 					Name: file.Name,
-					ParentID: parentID,
+					ParentID: targetParent,
 					IsDirectory: file.IsDirectory,
 					SizeBytes: file.SizeBytes,
 					TargetID: &realTargetID,
@@ -973,7 +1031,7 @@ func (r *FileRepository) BulkMove(ctx context.Context, ids []string, parentID *s
 				if role != domain.RoleOwner && role != domain.RoleEditor {
 					return fmt.Errorf("access denied to move file %s", id)
 				}
-				file.ParentID = parentID
+				file.ParentID = targetParent
 				if err := txRepo.Update(ctx, file); err != nil {
 					return fmt.Errorf("update parent_id for %s: %w", id, err)
 				}
@@ -993,20 +1051,86 @@ func (r *FileRepository) BulkHardDelete(ctx context.Context, ids []string, userI
 	var allOrphans []string
 
 	execBulk := func(repo *FileRepository) error {
+		candidateHashesMap := make(map[string]struct{})
 		for _, id := range ids {
 			file, err := repo.GetByID(ctx, id)
 			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
 				return fmt.Errorf("get file %s: %w", id, err)
 			}
 			if file.UserID != userID {
 				return fmt.Errorf("access denied to delete %s", id)
 			}
-			count, orphans, err := repo.DeleteRecursive(ctx, id, userID)
+
+			var rootPath string
+			err = repo.db.QueryRowContext(ctx, "SELECT path FROM files WHERE id = $1 AND user_id = $2", id, userID).Scan(&rootPath)
 			if err != nil {
-				return fmt.Errorf("hard delete %s: %w", id, err)
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				return fmt.Errorf("lookup root path %s: %w", id, err)
 			}
+			escapedPrefix := EscapeSQLLike(rootPath) + "%"
+
+			// 1. Collect candidate block hashes before deleting subtree
+			const collectSubtreeHashes = `
+				SELECT DISTINCT b.sha256
+				FROM file_blocks fb
+				JOIN blocks b ON b.id = fb.block_id
+				WHERE fb.file_id IN (
+					SELECT id FROM files
+					WHERE user_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\')
+				)
+			`
+			rows, err := repo.db.QueryContext(ctx, collectSubtreeHashes, userID, rootPath, escapedPrefix)
+			if err == nil {
+				for rows.Next() {
+					var h string
+					if err := rows.Scan(&h); err == nil && h != "" {
+						candidateHashesMap[h] = struct{}{}
+					}
+				}
+				_ = rows.Close()
+			}
+
+			// 2. Orphan foreign files under subtree
+			const orphanSubtree = `
+				UPDATE files
+				SET parent_id = NULL
+				WHERE parent_id IN (
+					SELECT id FROM files WHERE user_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\')
+				) AND user_id != $1
+			`
+			if _, err := repo.db.ExecContext(ctx, orphanSubtree, userID, rootPath, escapedPrefix); err != nil {
+				return fmt.Errorf("orphan foreign files under subtree %s: %w", id, err)
+			}
+
+			// 3. Delete the subtree
+			const deleteSubtree = `
+				DELETE FROM files
+				WHERE user_id = $1 AND (path = $2 OR path LIKE $3 ESCAPE '\')
+			`
+			res, err := repo.db.ExecContext(ctx, deleteSubtree, userID, rootPath, escapedPrefix)
+			if err != nil {
+				return fmt.Errorf("delete subtree %s: %w", id, err)
+			}
+			count, _ := res.RowsAffected()
 			totalDeleted += count
-			allOrphans = append(allOrphans, orphans...)
+		}
+
+		// 4. Atomically discover all blocks made orphaned by this bulk delete operation
+		if len(candidateHashesMap) > 0 {
+			candidateHashes := make([]string, 0, len(candidateHashesMap))
+			for h := range candidateHashesMap {
+				candidateHashes = append(candidateHashes, h)
+			}
+			orphans, err := repo.findOrphanedHashes(ctx, candidateHashes)
+			if err != nil {
+				return err
+			}
+			allOrphans = orphans
 		}
 		return nil
 	}
@@ -1181,14 +1305,14 @@ func (r *FileRepository) RecordView(ctx context.Context, userID, fileID string) 
 	return nil
 }
 
-// GetRecentViews returns the user's recently viewed files, ordered by most recent first.
+// GetRecentViews returns the user's recently active and viewed files, ordered by most recent activity first.
 func (r *FileRepository) GetRecentViews(ctx context.Context, userID string, limit int) ([]*domain.File, error) {
 	const q = `
 		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
 		FROM files f
-		JOIN user_file_views v ON f.id = v.file_id
-		WHERE v.user_id = $1 AND f.deleted_at IS NULL
-		ORDER BY v.viewed_at DESC
+		LEFT JOIN user_file_views v ON f.id = v.file_id AND v.user_id = $1
+		WHERE (f.user_id = $1 OR v.file_id IS NOT NULL) AND f.deleted_at IS NULL
+		ORDER BY GREATEST(f.created_at, f.updated_at, COALESCE(v.viewed_at, f.created_at)) DESC
 		LIMIT $2
 	`
 	rows, err := r.db.QueryContext(ctx, q, userID, limit)

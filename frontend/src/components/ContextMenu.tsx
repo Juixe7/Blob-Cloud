@@ -199,7 +199,7 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
               <line x1="12" y1="8" x2="12.01" y2="8" />
             </svg>
           }
-          label="Get Info (AI)"
+          label="File Information"
           onClick={run(actions.onGetInfo)}
         />
       )}

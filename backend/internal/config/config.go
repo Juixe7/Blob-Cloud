@@ -61,6 +61,9 @@ type Config struct {
 	SQSAccessKeyID string
 	// SQSSecretAccessKey is the optional dedicated AWS IAM secret key for SQS.
 	SQSSecretAccessKey string
+	// EnableInProcessWorker controls whether the API process runs an in-memory SQS worker pool.
+	// Defaults to false for decoupled architectures (e.g. AWS Lambda worker service).
+	EnableInProcessWorker bool
 
 	// --- Auth / realtime (Phase 6) ---
 	// JWTSecret signs and validates the JWTs used to authenticate WebSocket
@@ -137,10 +140,11 @@ func Load() (Config, error) {
 		// --- SQS (event-driven thumbnail processing) ---
 		SQSQueueURL:        envStr("SQS_QUEUE_URL", ""),
 		SQSRegion:          resolveSQSRegion(envStr("SQS_QUEUE_URL", "")),
-		SQSNumWorkers:      sqsWorkers,
-		SQSPollTimeoutSec:  sqsPollTimeout,
-		SQSAccessKeyID:     firstEnvStr("SQS_AWS_ACCESS_KEY_ID", "AWS_SQS_ACCESS_KEY_ID"),
-		SQSSecretAccessKey: firstEnvStr("SQS_AWS_SECRET_ACCESS_KEY", "AWS_SQS_SECRET_ACCESS_KEY"),
+		SQSNumWorkers:         sqsWorkers,
+		SQSPollTimeoutSec:     sqsPollTimeout,
+		SQSAccessKeyID:        firstEnvStr("SQS_AWS_ACCESS_KEY_ID", "AWS_SQS_ACCESS_KEY_ID"),
+		SQSSecretAccessKey:    firstEnvStr("SQS_AWS_SECRET_ACCESS_KEY", "AWS_SQS_SECRET_ACCESS_KEY"),
+		EnableInProcessWorker: envBool("ENABLE_INPROCESS_WORKER", false),
 
 		// --- Auth / realtime (Phase 6) ---
 		JWTSecret:     envStr("JWT_SECRET", ""),
@@ -151,7 +155,7 @@ func Load() (Config, error) {
 
 		// --- Rate limiting (Tier 2E) ---
 		RateLimitAuthPerMin:   mustEnvInt("RL_AUTH_RPM", 10),
-		RateLimitUploadPerMin: mustEnvInt("RL_UPLOAD_RPM", 30),
+		RateLimitUploadPerMin: mustEnvInt("RL_UPLOAD_RPM", 300),
 		RateLimitAPIPerMin:    mustEnvInt("RL_API_RPM", 120),
 	}, nil
 }
@@ -294,3 +298,13 @@ func mustEnvInt(key string, fallback int) int {
 	}
 	return n
 }
+
+// envBool parses a boolean env var ("true", "1", "yes"). Defaults to fallback if empty.
+func envBool(key string, fallback bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		return fallback
+	}
+	return v == "true" || v == "1" || v == "yes"
+}
+

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { apiClient } from '../lib/api'
 import { useAuth } from '../hooks/useAuth'
-import { formatFileSize } from '../lib/format'
+import { formatFileSize, cn } from '../lib/format'
 import { Modal } from './ui/Modal'
 import { Button } from './ui/Button'
 import { Spinner } from './ui/Spinner'
@@ -91,36 +91,52 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
 
   return (
     <>
-      <Modal open={open} onClose={onClose} label="Settings" maxWidthClass="max-w-2xl">
-        <div className="space-y-6">
-          <div>
-            <h2 className="text-xl font-bold text-slate-900 dark:text-zinc-50">Settings</h2>
-            <p className="text-xs text-slate-500 dark:text-zinc-400">
-              Manage account, storage, devices, and preferences
-            </p>
+      <Modal open={open} onClose={onClose} label="Settings" maxWidthClass="max-w-lg p-5">
+        <div className="space-y-4">
+          {/* Header with Close ✕ Button */}
+          <div className="flex items-start justify-between pb-3 border-b border-zinc-800/80">
+            <div>
+              <h2 className="text-base font-bold text-zinc-100 font-display">Settings</h2>
+              <p className="text-xs text-zinc-400 mt-0.5">
+                Manage account, storage, devices, and preferences
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors"
+              title="Close settings"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
           </div>
 
-          {/* Nav Tabs */}
-          <div className="flex border-b border-slate-200 text-sm dark:border-zinc-800">
+          {/* Segmented Pill Tabs */}
+          <div className="flex rounded-lg bg-zinc-950/70 p-1 border border-zinc-800/80 text-xs font-medium">
             <button
               type="button"
               onClick={() => setActiveTab('storage')}
-              className={`pb-2.5 px-4 font-medium transition-colors border-b-2 -mb-px ${
+              className={cn(
+                'flex-1 py-1.5 px-3 rounded-md transition-all text-center',
                 activeTab === 'storage'
-                  ? 'border-amber-500 text-amber-600 dark:border-amber-400 dark:text-amber-400 font-semibold'
-                  : 'border-transparent text-slate-500 hover:text-slate-900 dark:text-zinc-400 dark:hover:text-zinc-200'
-              }`}
+                  ? 'bg-zinc-800 text-amber-400 font-semibold shadow-xs'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              )}
             >
               Storage Usage
             </button>
             <button
               type="button"
               onClick={() => setActiveTab('account')}
-              className={`pb-2.5 px-4 font-medium transition-colors border-b-2 -mb-px ${
+              className={cn(
+                'flex-1 py-1.5 px-3 rounded-md transition-all text-center',
                 activeTab === 'account'
-                  ? 'border-amber-500 text-amber-600 dark:border-amber-400 dark:text-amber-400 font-semibold'
-                  : 'border-transparent text-slate-500 hover:text-slate-900 dark:text-zinc-400 dark:hover:text-zinc-200'
-              }`}
+                  ? 'bg-zinc-800 text-amber-400 font-semibold shadow-xs'
+                  : 'text-zinc-400 hover:text-zinc-200'
+              )}
             >
               Account & Devices
             </button>
@@ -128,48 +144,50 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
 
           {/* Tab 1: Storage Usage */}
           {activeTab === 'storage' && (
-            <div className="space-y-6">
+            <div className="space-y-3">
               {loadingStorage ? (
-                <div className="flex h-32 items-center justify-center">
-                  <Spinner size={24} />
+                <div className="flex h-28 items-center justify-center">
+                  <Spinner size={20} />
                 </div>
               ) : (
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-3 dark:border-zinc-800 dark:bg-zinc-900/60">
-                  <div className="flex items-center justify-between text-sm">
-                    <span className="font-semibold text-slate-800 dark:text-zinc-200">Used Storage</span>
-                    <span className="font-mono text-xs text-slate-500 dark:text-zinc-400">
+                <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 p-3.5 space-y-3">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-zinc-200">Used Storage</span>
+                    <span className="font-mono text-zinc-400">
                       {formatFileSize(used)} / {formatFileSize(limit)} ({totalPct}%)
                     </span>
                   </div>
 
-                  <div className="flex h-3.5 w-full overflow-hidden rounded-full bg-slate-200 p-0.5 dark:bg-zinc-800">
-                    <div className="h-full rounded-l-full bg-zinc-600 transition-all" style={{ width: `${imagesPct}%` }} title="Images" />
-                    <div className="h-full bg-zinc-500 transition-all" style={{ width: `${docsPct}%` }} title="Documents" />
-                    <div className="h-full bg-slate-400 transition-all" style={{ width: `${mediaPct}%` }} title="Media" />
-                    <div className="h-full bg-amber-500 transition-all" style={{ width: `${codePct}%` }} title="Code" />
-                    <div className="h-full rounded-r-full bg-zinc-700 transition-all" style={{ width: `${otherPct}%` }} title="Other" />
+                  {/* Refined Progress Bar */}
+                  <div className="flex h-2.5 w-full overflow-hidden rounded-full bg-zinc-800 p-0.5">
+                    {imagesPct > 0 && <div className="h-full rounded-l-full bg-indigo-500 transition-all" style={{ width: `${imagesPct}%` }} title="Images" />}
+                    {docsPct > 0 && <div className="h-full bg-sky-500 transition-all" style={{ width: `${docsPct}%` }} title="Documents" />}
+                    {mediaPct > 0 && <div className="h-full bg-purple-500 transition-all" style={{ width: `${mediaPct}%` }} title="Media" />}
+                    {codePct > 0 && <div className="h-full bg-amber-500 transition-all" style={{ width: `${codePct}%` }} title="Code" />}
+                    {otherPct > 0 && <div className="h-full rounded-r-full bg-zinc-500 transition-all" style={{ width: `${otherPct}%` }} title="Other" />}
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2 pt-2 text-xs text-slate-600 dark:text-zinc-400 sm:grid-cols-3">
+                  {/* Category Breakdown Legend */}
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1 text-[11px] text-zinc-400">
                     <div className="flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-zinc-600" />
-                      <span>Images ({formatFileSize(images)})</span>
+                      <span className="h-2 w-2 rounded-full bg-indigo-500 shrink-0" />
+                      <span className="truncate">Images ({images > 0 ? formatFileSize(images) : '0 B'})</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-zinc-500" />
-                      <span>Documents ({formatFileSize(docs)})</span>
+                      <span className="h-2 w-2 rounded-full bg-sky-500 shrink-0" />
+                      <span className="truncate">Docs ({docs > 0 ? formatFileSize(docs) : '0 B'})</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-slate-400" />
-                      <span>Media ({formatFileSize(media)})</span>
+                      <span className="h-2 w-2 rounded-full bg-purple-500 shrink-0" />
+                      <span className="truncate">Media ({media > 0 ? formatFileSize(media) : '0 B'})</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-amber-500" />
-                      <span>Code ({formatFileSize(code)})</span>
+                      <span className="h-2 w-2 rounded-full bg-amber-500 shrink-0" />
+                      <span className="truncate">Code ({code > 0 ? formatFileSize(code) : '0 B'})</span>
                     </div>
                     <div className="flex items-center gap-1.5">
-                      <span className="h-2.5 w-2.5 rounded-full bg-zinc-700 dark:bg-zinc-400" />
-                      <span>Other ({formatFileSize(other)})</span>
+                      <span className="h-2 w-2 rounded-full bg-zinc-500 shrink-0" />
+                      <span className="truncate">Other ({other > 0 ? formatFileSize(other) : '0 B'})</span>
                     </div>
                   </div>
                 </div>
@@ -179,82 +197,63 @@ export function SettingsModal({ open, onClose }: SettingsModalProps) {
 
           {/* Tab 2: Account & Devices */}
           {activeTab === 'account' && (
-            <div className="space-y-5">
+            <div className="space-y-3">
               {/* User Credentials */}
-              <div>
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-500 mb-2">
-                  User Credentials
-                </h3>
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 flex items-center justify-between dark:border-zinc-800 dark:bg-zinc-900/60">
-                  <div className="flex items-center gap-3">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-full border-2 border-zinc-700 bg-zinc-800 font-bold text-zinc-100 text-sm">
-                      {user?.user_id ? 'U' : 'A'}
-                    </div>
-                    <div>
-                      <p className="text-sm font-semibold text-slate-900 dark:text-zinc-100">Authenticated Account</p>
-                      <p className="text-xs font-mono text-slate-500 dark:text-zinc-400">User ID: {user?.user_id ?? 'Unknown'}</p>
-                    </div>
+              <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 p-3 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="flex h-8 w-8 items-center justify-center rounded-full border border-zinc-700 bg-zinc-800 font-bold text-zinc-200 text-xs shrink-0">
+                    {user?.user_id ? 'U' : 'A'}
                   </div>
-                  <Button variant="secondary" className="py-1 px-3 text-xs" onClick={logout}>
-                    Sign Out
-                  </Button>
+                  <div className="min-w-0">
+                    <p className="text-xs font-semibold text-zinc-100 truncate">Authenticated Account</p>
+                    <p className="text-[11px] font-mono text-zinc-400 truncate">User ID: {user?.user_id ?? 'Unknown'}</p>
+                  </div>
                 </div>
+                <Button variant="secondary" className="py-1 px-2.5 text-xs h-7 shrink-0" onClick={logout}>
+                  Sign Out
+                </Button>
               </div>
 
               {/* Security & Password */}
-              <div>
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-500 mb-2">
-                  Security & Password
-                </h3>
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 flex items-center justify-between dark:border-zinc-800 dark:bg-zinc-900/60">
-                  <div>
-                    <p className="text-sm font-semibold text-slate-900 dark:text-zinc-100">Account Password</p>
-                    <p className="text-xs text-slate-500 dark:text-zinc-400">
-                      Update your account password or revoke other active sessions
-                    </p>
-                  </div>
-                  <Button
-                    variant="primary"
-                    className="py-1.5 px-4 text-xs font-semibold"
-                    onClick={() => setUpdatePasswordModalOpen(true)}
-                  >
-                    Update Password
-                  </Button>
+              <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 p-3 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-zinc-100">Account Password</p>
+                  <p className="text-[11px] text-zinc-400 mt-0.5 truncate">
+                    Update your account password or revoke sessions
+                  </p>
                 </div>
+                <Button
+                  variant="primary"
+                  className="py-1 px-3 text-xs font-semibold h-7 shrink-0"
+                  onClick={() => setUpdatePasswordModalOpen(true)}
+                >
+                  Update
+                </Button>
               </div>
 
               {/* Active Device Sessions */}
-              <div>
-                <div className="flex items-center justify-between mb-2">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400 dark:text-zinc-500">
-                    Active Device Sessions
-                  </h3>
+              <div className="rounded-xl border border-zinc-800/80 bg-zinc-950/40 p-3 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-zinc-100">Active Sessions</p>
+                  <p className="text-[11px] text-zinc-400 mt-0.5 truncate">
+                    Review logged-in devices and active IPs
+                  </p>
                 </div>
-                <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 flex items-center justify-between dark:border-zinc-800 dark:bg-zinc-900/60">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <p className="text-sm font-semibold text-slate-900 dark:text-zinc-100">Device Management</p>
-                    </div>
-                    <p className="text-xs text-slate-500 dark:text-zinc-400 mt-0.5">
-                      Review all devices and IP addresses logged into your account
-                    </p>
-                  </div>
-                  <Button
-                    variant="secondary"
-                    className="py-1.5 px-4 text-xs font-semibold"
-                    onClick={() => setActiveSessionsModalOpen(true)}
-                  >
-                    View Active Sessions
-                  </Button>
-                </div>
+                <Button
+                  variant="secondary"
+                  className="py-1 px-3 text-xs font-semibold h-7 shrink-0"
+                  onClick={() => setActiveSessionsModalOpen(true)}
+                >
+                  Manage
+                </Button>
               </div>
             </div>
           )}
         </div>
 
         {/* Footer */}
-        <div className="mt-6 flex justify-end border-t border-slate-200 pt-3 dark:border-zinc-800">
-          <Button variant="secondary" onClick={onClose}>
+        <div className="mt-4 flex justify-end border-t border-zinc-800/80 pt-3">
+          <Button variant="secondary" onClick={onClose} className="h-8 px-4 text-xs font-medium">
             Close
           </Button>
         </div>

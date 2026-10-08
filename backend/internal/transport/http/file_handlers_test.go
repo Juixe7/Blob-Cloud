@@ -317,3 +317,45 @@ func (s *testMemStorage) PromoteObject(ctx context.Context, srcKey, destKey stri
 	delete(s.objects, srcKey)
 	return nil
 }
+
+func TestParseRangeHeader(t *testing.T) {
+	fileSize := int64(1000)
+
+	tests := []struct {
+		name      string
+		header    string
+		fileSize  int64
+		wantStart int64
+		wantEnd   int64
+		wantOk    bool
+	}{
+		{"Standard range 0-499", "bytes=0-499", fileSize, 0, 499, true},
+		{"Open-ended range 500-", "bytes=500-", fileSize, 500, 999, true},
+		{"Suffix range -500 (RFC 7233)", "bytes=-500", fileSize, 500, 999, true},
+		{"Suffix range larger than file -1500", "bytes=-1500", fileSize, 0, 999, true},
+		{"Single last byte -1", "bytes=-1", fileSize, 999, 999, true},
+		{"Invalid empty header", "", fileSize, 0, 0, false},
+		{"Invalid prefix", "characters=0-500", fileSize, 0, 0, false},
+		{"Invalid negative start", "bytes=-50-100", fileSize, 0, 0, false},
+		{"Invalid start > end", "bytes=600-200", fileSize, 0, 0, false},
+		{"Invalid start >= fileSize", "bytes=1000-1050", fileSize, 0, 0, false},
+		{"Invalid suffix -0", "bytes=-0", fileSize, 0, 0, false},
+		{"Empty range -", "bytes=-", fileSize, 0, 0, false},
+		{"Zero file size", "bytes=0-100", 0, 0, 0, false},
+		{"Zero file size suffix", "bytes=-100", 0, 0, 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotStart, gotEnd, gotOk := parseRangeHeader(tt.header, tt.fileSize)
+			if gotOk != tt.wantOk {
+				t.Fatalf("parseRangeHeader(%q) ok = %v, want %v", tt.header, gotOk, tt.wantOk)
+			}
+			if gotOk {
+				if gotStart != tt.wantStart || gotEnd != tt.wantEnd {
+					t.Fatalf("parseRangeHeader(%q) = (%d, %d), want (%d, %d)", tt.header, gotStart, gotEnd, tt.wantStart, tt.wantEnd)
+				}
+			}
+		})
+	}
+}

@@ -36,6 +36,8 @@ type File struct {
 	Tags             *string    `json:"tags,omitempty"`
 	Summary          *string    `json:"summary,omitempty"`
 	Status           string     `json:"status"`
+	OwnerEmail       *string    `json:"owner_email,omitempty"`
+	SharedByEmail    *string    `json:"shared_by_email,omitempty"`
 }
 
 // FileVersion represents a historical snapshot of a file's blocks and size.

@@ -286,7 +286,7 @@ async function chunkFileFastCDC(
 
     // Phase 1: Sub-Average Region [MIN_SIZE, AVG_SIZE) -> MaskSmall
     for (let i = MIN_SIZE; i < midPoint; i++) {
-      hash = ((hash << 1n) & UINT64_MASK) + GEAR_TABLE[windowBytes[i]]
+      hash = ((hash << 1n) + GEAR_TABLE[windowBytes[i]]) & UINT64_MASK
       if ((hash & MASK_SMALL) === 0n) {
         cut = i + 1
         found = true
@@ -297,7 +297,7 @@ async function chunkFileFastCDC(
     // Phase 2: Post-Average Region [AVG_SIZE, MAX_SIZE) -> MaskLarge
     if (!found) {
       for (let i = midPoint; i < windowSize; i++) {
-        hash = ((hash << 1n) & UINT64_MASK) + GEAR_TABLE[windowBytes[i]]
+        hash = ((hash << 1n) + GEAR_TABLE[windowBytes[i]]) & UINT64_MASK
         if ((hash & MASK_LARGE) === 0n) {
           cut = i + 1
           break
