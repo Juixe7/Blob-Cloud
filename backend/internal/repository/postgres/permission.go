@@ -29,8 +29,12 @@ func (r *PermissionRepository) WithTx(tx DBTX) *PermissionRepository {
 // (so a share can be issued before the recipient has signed in). A duplicate
 // (file_id, grantee_email) violates the unique constraint and errors out.
 func (r *PermissionRepository) GrantPermission(ctx context.Context, perm *domain.Permission) error {
+	perm.GranteeEmail = strings.TrimSpace(perm.GranteeEmail)
 	if perm.Status == "" {
 		perm.Status = domain.PermissionStatusAccepted
+	}
+	if perm.Status == domain.PermissionStatusAccepted {
+		perm.ExpiresAt = nil
 	}
 	const q = `
 		INSERT INTO permissions (file_id, grantee_email, role, status, message, expires_at, invited_by)
@@ -86,7 +90,7 @@ func (r *PermissionRepository) GetPermissionsByFile(ctx context.Context, fileID 
 // set of acceptable roles (e.g. ["VIEWER","EDITOR","OWNER"] for a read check,
 // ["EDITOR","OWNER"] for a write check).
 func (r *PermissionRepository) CheckUserPermission(ctx context.Context, fileID string, userEmail string, requiredRoles []string) (bool, error) {
-	if len(requiredRoles) == 0 {
+	if len(requiredRoles) == 0 || strings.TrimSpace(userEmail) == "" {
 		return false, nil
 	}
 
@@ -116,7 +120,7 @@ func (r *PermissionRepository) CheckUserPermission(ctx context.Context, fileID s
 			SELECT 1
 			FROM permissions p
 			JOIN chain c ON c.id = p.file_id
-			WHERE p.grantee_email = $2
+			WHERE LOWER(p.grantee_email) = LOWER($2)
 			  AND p.status = 'ACCEPTED'
 			  AND p.role IN (%s)
 			  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
@@ -139,7 +143,7 @@ func (r *PermissionRepository) UpdatePermission(ctx context.Context, fileID stri
 	const q = `
 		UPDATE permissions
 		SET role = $1
-		WHERE file_id = $2 AND grantee_email = $3
+		WHERE file_id = $2 AND LOWER(grantee_email) = LOWER($3)
 	`
 	res, err := r.db.ExecContext(ctx, q, role, fileID, granteeEmail)
 	if err != nil {
@@ -159,7 +163,7 @@ func (r *PermissionRepository) UpdatePermission(ctx context.Context, fileID stri
 func (r *PermissionRepository) RevokePermission(ctx context.Context, fileID string, granteeEmail string) error {
 	const q = `
 		DELETE FROM permissions
-		WHERE file_id = $1 AND grantee_email = $2
+		WHERE file_id = $1 AND LOWER(grantee_email) = LOWER($2)
 	`
 	res, err := r.db.ExecContext(ctx, q, fileID, granteeEmail)
 	if err != nil {
@@ -184,7 +188,7 @@ func (r *PermissionRepository) ListPendingInvitations(ctx context.Context, userE
 		FROM permissions p
 		JOIN files f ON p.file_id = f.id
 		LEFT JOIN users u ON p.invited_by = u.id
-		WHERE p.grantee_email = $1
+		WHERE LOWER(p.grantee_email) = LOWER($1)
 		  AND p.status = 'PENDING'
 		  AND p.expires_at > CURRENT_TIMESTAMP
 		  AND f.deleted_at IS NULL
@@ -212,11 +216,18 @@ func (r *PermissionRepository) ListPendingInvitations(ctx context.Context, userE
 }
 
 // RespondToInvitation transitions a PENDING invitation to ACCEPTED or DECLINED.
+// When transitioning to ACCEPTED, expires_at is cleared (NULL) because the 7-day
+// TTL only applies while the invitation is PENDING.
 func (r *PermissionRepository) RespondToInvitation(ctx context.Context, invitationID string, userEmail string, status string) (*domain.Permission, error) {
 	const q = `
 		UPDATE permissions
-		SET status = $1, responded_at = CURRENT_TIMESTAMP
-		WHERE id = $2 AND grantee_email = $3 AND status = 'PENDING' AND expires_at > CURRENT_TIMESTAMP
+		SET status = $1,
+		    responded_at = CURRENT_TIMESTAMP,
+		    expires_at = CASE WHEN $1 = 'ACCEPTED' THEN NULL ELSE expires_at END
+		WHERE id = $2
+		  AND LOWER(grantee_email) = LOWER($3)
+		  AND status = 'PENDING'
+		  AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
 		RETURNING id, file_id, grantee_email, role, status, message, expires_at, responded_at, invited_by, created_at
 	`
 	var p domain.Permission
@@ -265,6 +276,7 @@ func (r *PermissionRepository) PurgeStaleInvitations(ctx context.Context) (int64
 
 // BlockUser blocks an email address from sharing files with userID.
 func (r *PermissionRepository) BlockUser(ctx context.Context, userID string, blockedEmail string) error {
+	blockedEmail = strings.TrimSpace(strings.ToLower(blockedEmail))
 	const q = `
 		INSERT INTO user_blocks (user_id, blocked_email)
 		VALUES ($1, $2)
@@ -282,7 +294,7 @@ func (r *PermissionRepository) IsBlocked(ctx context.Context, userID string, sen
 	const q = `
 		SELECT EXISTS (
 			SELECT 1 FROM user_blocks
-			WHERE user_id = $1 AND blocked_email = $2
+			WHERE user_id = $1 AND LOWER(blocked_email) = LOWER($2)
 		)
 	`
 	var blocked bool

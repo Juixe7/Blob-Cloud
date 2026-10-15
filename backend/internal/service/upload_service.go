@@ -68,6 +68,20 @@ func detectMimeType(filename string) string {
 	}
 }
 
+// UploadBlockStore defines the block deduplication operations used by UploadService.
+type UploadBlockStore interface {
+	GetMultipleByHashes(ctx context.Context, hashes []string) ([]*domain.Block, error)
+	WithTx(tx postgresrepo.DBTX) *postgresrepo.BlockRepository
+}
+
+// UploadSessionStore defines the upload session persistence operations used by UploadService.
+type UploadSessionStore interface {
+	CreateSession(ctx context.Context, session *domain.UploadSession, blocks []domain.SessionBlock) error
+	GetSessionByID(ctx context.Context, id string) (*domain.UploadSession, []domain.SessionBlock, error)
+	UpdateSessionStatus(ctx context.Context, id string, status string) error
+	WithTx(tx postgresrepo.DBTX) *postgresrepo.UploadSessionRepository
+}
+
 // UploadService orchestrates resumable uploads: initiating a session with
 // deduplication, regenerating URLs for resumption, and committing a completed
 // upload as one atomic transaction. After a successful completion it publishes
@@ -76,14 +90,15 @@ type UploadService struct {
 	db        *sql.DB
 	users     *postgresrepo.UserRepository
 	files     *postgresrepo.FileRepository
-	blocks    *postgresrepo.BlockRepository
-	sessions  *postgresrepo.UploadSessionRepository
+	blocks    UploadBlockStore
+	sessions  UploadSessionStore
 	perms     *postgresrepo.PermissionRepository
 	storage   domain.StorageProvider
 	publisher queue.Publisher
 	notifier  wsSync.Notifier // optional; nil-safe (NoopNotifier)
 	journal   *postgresrepo.JournalRepository
 	log       *slog.Logger
+	commitTx  func(ctx context.Context, session *domain.UploadSession, sessionBlocks []domain.SessionBlock, req CompleteRequest) (fileID string, cursors map[string]int64, action string, err error)
 }
 
 // NewUploadService wires the service with all the repositories it needs. The
@@ -94,8 +109,8 @@ func NewUploadService(
 	db *sql.DB,
 	users *postgresrepo.UserRepository,
 	files *postgresrepo.FileRepository,
-	blocks *postgresrepo.BlockRepository,
-	sessions *postgresrepo.UploadSessionRepository,
+	blocks UploadBlockStore,
+	sessions UploadSessionStore,
 	perms *postgresrepo.PermissionRepository,
 	storage domain.StorageProvider,
 	publisher queue.Publisher,
@@ -482,12 +497,22 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 	}
 
 	// 3. Fast Atomic Database Transaction (Metadata writes only, ~20-50ms)
-	txErr := postgresrepo.RunInTx(ctx, s.db, func(tx postgresrepo.DBTX) error {
-		sessions := s.sessions.WithTx(tx)
-		blocks := s.blocks.WithTx(tx)
-		files := s.files.WithTx(tx)
-		perms := s.perms.WithTx(tx)
-		users := s.users.WithTx(tx)
+	var txErr error
+	if s.commitTx != nil {
+		var fID string
+		fID, recordedCursors, recordedAction, txErr = s.commitTx(ctx, session, sessionBlocks, req)
+		if txErr == nil {
+			result.FileID = fID
+			result.SessionID = req.SessionID
+			result.Status = domain.SessionStatusCompleted
+		}
+	} else {
+		txErr = postgresrepo.RunInTx(ctx, s.db, func(tx postgresrepo.DBTX) error {
+			sessions := s.sessions.WithTx(tx)
+			blocks := s.blocks.WithTx(tx)
+			files := s.files.WithTx(tx)
+			perms := s.perms.WithTx(tx)
+			users := s.users.WithTx(tx)
 
 		// Re-verify session state under transaction lock
 		currentSession, _, err := sessions.GetSessionByID(ctx, req.SessionID)
@@ -575,6 +600,9 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 				if err := blocks.LinkBlocksToFile(ctx, file.ID, seqs); err != nil {
 					return err
 				}
+				if !req.IsEncrypted {
+					_, _, _, _, _ = files.TryCopyAIMetadataFromCAS(ctx, file.ID)
+				}
 
 				uploader, err := users.GetByID(ctx, session.UserID)
 				if err != nil {
@@ -633,6 +661,23 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 				if err := blocks.ReplaceBlocksForFile(ctx, existingFile.ID, seqs); err != nil {
 					return err
 				}
+
+				// Check if block sequence changed compared to previous version
+				sameBlocks := len(oldBlocks) == len(sessionBlocks)
+				if sameBlocks {
+					for i, sb := range sessionBlocks {
+						if oldBlocks[i] != sb.BlockHash {
+							sameBlocks = false
+							break
+						}
+					}
+				}
+				if !sameBlocks {
+					_ = files.UpdateAIMetadata(ctx, existingFile.ID, nil, nil, nil)
+					if !req.IsEncrypted {
+						_, _, _, _, _ = files.TryCopyAIMetadataFromCAS(ctx, existingFile.ID)
+					}
+				}
 			}
 		} else {
 			// No collision, create new file
@@ -656,6 +701,9 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 			// 5. Link blocks to the file in order.
 			if err := blocks.LinkBlocksToFile(ctx, file.ID, seqs); err != nil {
 				return err
+			}
+			if !req.IsEncrypted {
+				_, _, _, _, _ = files.TryCopyAIMetadataFromCAS(ctx, file.ID)
 			}
 	
 			// 6. Grant the uploader OWNER. Resolve their email from the user row.
@@ -728,6 +776,7 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 		result.Status = domain.SessionStatusCompleted
 		return nil
 	})
+	}
 	if txErr != nil {
 		s.log.Error("complete upload failed", "session_id", req.SessionID, "err", txErr)
 		return nil, txErr

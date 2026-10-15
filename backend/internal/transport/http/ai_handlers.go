@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -16,6 +17,17 @@ import (
 	"go-drive-clone/internal/domain"
 	wsSync "go-drive-clone/internal/sync"
 )
+
+// aiInFlight prevents duplicate concurrent Gemini LLM calls for the same target file ID.
+var aiInFlight sync.Map
+
+type aiInFlightCall struct {
+	wg      sync.WaitGroup
+	tags    *string
+	summary *string
+	err     error
+	status  int
+}
 
 // HandleGenerateAIInsights generates AI tags and summaries on demand for a file.
 // POST /api/files/{id}/ai-insights
@@ -29,11 +41,6 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 	fileID := chi.URLParam(r, "id")
 	if fileID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file id"})
-		return
-	}
-
-	if s.aiClient == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI service is not configured"})
 		return
 	}
 
@@ -57,15 +64,104 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if file.IsDirectory {
+	// Resolve shortcut to the underlying target file so blocks and AI metadata live on the canonical target.
+	targetFileID := fileID
+	targetFile := file
+	if file.TargetID != nil && *file.TargetID != "" {
+		targetFileID = *file.TargetID
+	} else if file.ShortcutTargetID != nil && *file.ShortcutTargetID != "" {
+		targetFileID = *file.ShortcutTargetID
+	}
+	if targetFileID != fileID {
+		tf, err := s.files.GetByID(r.Context(), targetFileID)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "target file not found"})
+			return
+		}
+		targetFile = tf
+	}
+
+	if targetFile.IsDirectory {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot generate AI insights for folders"})
 		return
 	}
+	if targetFile.IsEncrypted {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot generate server-side AI insights for zero-trust encrypted files"})
+		return
+	}
 
-	// Read blocks up to 50MB
-	hashes, err := s.blocks.ListFileBlockHashes(r.Context(), fileID)
+	force := strings.EqualFold(r.URL.Query().Get("force"), "true")
+
+	// Fast Path 1: Unless explicitly forced, return already-computed AI metadata from the database immediately.
+	if !force {
+		hasSummary := targetFile.Summary != nil && strings.TrimSpace(*targetFile.Summary) != ""
+		hasTags := targetFile.Tags != nil && strings.TrimSpace(*targetFile.Tags) != ""
+		if hasSummary || hasTags {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"file_id": fileID,
+				"tags":    targetFile.Tags,
+				"summary": targetFile.Summary,
+				"cached":  true,
+			})
+			return
+		}
+
+		// Fast Path 2: Check if another file in CAS has the exact same ordered block hashes and reuse its AI metadata.
+		if _, copiedTags, copiedSummary, copied, errCopy := s.files.TryCopyAIMetadataFromCAS(r.Context(), targetFileID); errCopy == nil && copied {
+			s.notifyAIMetadataUpdated(userID, fileID, targetFileID, copiedTags, copiedSummary)
+			writeJSON(w, http.StatusOK, map[string]any{
+				"file_id": fileID,
+				"tags":    copiedTags,
+				"summary": copiedSummary,
+				"cached":  true,
+			})
+			return
+		}
+	} else {
+		// Force re-analysis requires write permission (OWNER or EDITOR) on the target file so VIEWERs cannot burn LLM quota.
+		if err := s.fileOps.AuthoriseWrite(r.Context(), userID, targetFileID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only owners or editors can force AI re-analysis"})
+			return
+		}
+	}
+
+	if s.aiClient == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "AI service is not configured"})
+		return
+	}
+
+	// Singleflight deduplication per targetFileID: if an identical request is already running, wait for its result.
+	call := &aiInFlightCall{}
+	call.wg.Add(1)
+	if actual, loaded := aiInFlight.LoadOrStore(targetFileID, call); loaded {
+		existing := actual.(*aiInFlightCall)
+		existing.wg.Wait()
+		if existing.err != nil {
+			status := existing.status
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			writeJSON(w, status, map[string]string{"error": existing.err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"file_id": fileID,
+			"tags":    existing.tags,
+			"summary": existing.summary,
+		})
+		return
+	}
+	defer func() {
+		aiInFlight.Delete(targetFileID)
+		call.wg.Done()
+	}()
+
+	// Read blocks up to 50MB from the canonical target file
+	hashes, err := s.blocks.ListFileBlockHashes(r.Context(), targetFileID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list file blocks"})
+		call.status = http.StatusInternalServerError
+		call.err = errors.New("failed to list file blocks")
+		writeJSON(w, call.status, map[string]string{"error": call.err.Error()})
 		return
 	}
 
@@ -74,7 +170,9 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 	for _, h := range hashes {
 		rc, err := s.storage.GetObject(r.Context(), "blocks/"+h)
 		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to get block %s", h)})
+			call.status = http.StatusInternalServerError
+			call.err = fmt.Errorf("failed to get block %s", h)
+			writeJSON(w, call.status, map[string]string{"error": call.err.Error()})
 			return
 		}
 		remaining := int64(maxAssemblySize) - int64(buf.Len())
@@ -88,7 +186,7 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 	}
 
 	fileBytes := buf.Bytes()
-	lowerName := strings.ToLower(file.Name)
+	lowerName := strings.ToLower(targetFile.Name)
 
 	var tags []string
 	var summary string
@@ -99,7 +197,9 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 	isDoc := strings.HasSuffix(lowerName, ".txt") || strings.HasSuffix(lowerName, ".md") || strings.HasSuffix(lowerName, ".pdf")
 
 	if !isImage && !isDoc {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported file format for AI analysis"})
+		call.status = http.StatusBadRequest
+		call.err = errors.New("unsupported file format for AI analysis")
+		writeJSON(w, call.status, map[string]string{"error": call.err.Error()})
 		return
 	}
 
@@ -107,7 +207,9 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 		tags, errAI = s.aiClient.GenerateImageTags(r.Context(), fileBytes)
 		if errAI != nil {
 			s.log.Error("failed to generate image tags", "err", errAI)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to generate image tags"})
+			call.status = http.StatusInternalServerError
+			call.err = errors.New("failed to generate image tags")
+			writeJSON(w, call.status, map[string]string{"error": call.err.Error()})
 			return
 		}
 	} else if isDoc {
@@ -117,9 +219,11 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 			if err == nil {
 				textReader, err2 := rPdf.GetPlainText()
 				if err2 == nil {
+					const maxPDFTextBytes = 2 * 1024 * 1024
+					limitReader := io.LimitReader(textReader, maxPDFTextBytes)
 					done := make(chan string, 1)
 					go func() {
-						b, _ := io.ReadAll(textReader)
+						b, _ := io.ReadAll(limitReader)
 						done <- string(b)
 					}()
 					select {
@@ -127,6 +231,9 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 						text = result
 					case <-time.After(15 * time.Second):
 						s.log.Error("timeout extracting text from PDF")
+						if closer, ok := textReader.(io.Closer); ok {
+							_ = closer.Close()
+						}
 					}
 				}
 			}
@@ -138,7 +245,9 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 			summary, tags, errAI = s.aiClient.GenerateDocumentSummary(r.Context(), text)
 			if errAI != nil {
 				s.log.Error("failed to generate doc summary", "err", errAI)
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to generate document summary"})
+				call.status = http.StatusInternalServerError
+				call.err = errors.New("failed to generate document summary")
+				writeJSON(w, call.status, map[string]string{"error": call.err.Error()})
 				return
 			}
 		} else if strings.HasSuffix(lowerName, ".pdf") {
@@ -157,27 +266,18 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 		summaryStr = &summary
 	}
 
-	if err := s.files.UpdateAIMetadata(r.Context(), fileID, tagsStr, summaryStr, nil); err != nil {
+	if err := s.files.UpdateAIMetadata(r.Context(), targetFileID, tagsStr, summaryStr, nil); err != nil {
 		s.log.Error("failed to update AI metadata", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save AI metadata"})
+		call.status = http.StatusInternalServerError
+		call.err = errors.New("failed to save AI metadata")
+		writeJSON(w, call.status, map[string]string{"error": call.err.Error()})
 		return
 	}
 
-	s.notifyUser(userID, wsSync.NotificationEvent{
-		Type: wsSync.EventAIMetadataReady,
-		Payload: map[string]any{
-			"file_id": fileID,
-			"tags":    tagsStr,
-			"summary": summaryStr,
-		},
-	})
-	s.notifyUser(userID, wsSync.NotificationEvent{
-		Type: wsSync.EventSyncDelta,
-		Payload: map[string]any{
-			"file_id": fileID,
-			"action":  domain.ActionFileUpdated,
-		},
-	})
+	call.tags = tagsStr
+	call.summary = summaryStr
+
+	s.notifyAIMetadataUpdated(userID, fileID, targetFileID, tagsStr, summaryStr)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"file_id": fileID,
@@ -185,3 +285,32 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 		"summary": summaryStr,
 	})
 }
+
+func (s *Server) notifyAIMetadataUpdated(userID, requestedFileID, targetFileID string, tags, summary *string) {
+	s.notifyUser(userID, wsSync.NotificationEvent{
+		Type: wsSync.EventAIMetadataReady,
+		Payload: map[string]any{
+			"file_id": requestedFileID,
+			"tags":    tags,
+			"summary": summary,
+		},
+	})
+	s.notifyUser(userID, wsSync.NotificationEvent{
+		Type: wsSync.EventSyncDelta,
+		Payload: map[string]any{
+			"file_id": requestedFileID,
+			"action":  domain.ActionFileUpdated,
+		},
+	})
+	if targetFileID != requestedFileID {
+		s.notifyUser(userID, wsSync.NotificationEvent{
+			Type: wsSync.EventAIMetadataReady,
+			Payload: map[string]any{
+				"file_id": targetFileID,
+				"tags":    tags,
+				"summary": summary,
+			},
+		})
+	}
+}
+

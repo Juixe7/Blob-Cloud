@@ -23,6 +23,20 @@ func EscapeSQLLike(s string) string {
 
 const fileSelectColumns = `id, user_id, name, parent_id, path, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status`
 
+const fileSelectColumnsWithTarget = `
+	f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory,
+	CASE WHEN t.id IS NOT NULL AND f.size_bytes = 0 THEN t.size_bytes ELSE f.size_bytes END AS size_bytes,
+	f.created_at, f.updated_at, f.deleted_at,
+	COALESCE(f.target_id, f.shortcut_target_id) AS target_id,
+	f.mime_type,
+	COALESCE(f.shortcut_target_id, f.target_id) AS shortcut_target_id,
+	COALESCE(t.is_encrypted, f.is_encrypted) AS is_encrypted,
+	COALESCE(t.encryption_salt, f.encryption_salt) AS encryption_salt,
+	COALESCE(t.tags, f.tags) AS tags,
+	COALESCE(t.summary, f.summary) AS summary,
+	COALESCE(t.status, f.status) AS status
+`
+
 func scanFileRow(scanner interface{ Scan(dest ...any) error }, f *domain.File) error {
 	return scanner.Scan(
 		&f.ID, &f.UserID, &f.Name, &f.ParentID, &f.Path, &f.IsDirectory, &f.SizeBytes,
@@ -78,9 +92,14 @@ func (r *FileRepository) Create(ctx context.Context, file *domain.File) error {
 	return nil
 }
 
-// GetByID returns the file with the given id.
+// GetByID returns the file with the given id, dynamically resolving target metadata when the row is a shortcut.
 func (r *FileRepository) GetByID(ctx context.Context, id string) (*domain.File, error) {
-	q := fmt.Sprintf(`SELECT %s FROM files WHERE id = $1`, fileSelectColumns)
+	q := fmt.Sprintf(`
+		SELECT %s
+		FROM files f
+		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+		WHERE f.id = $1
+	`, fileSelectColumnsWithTarget)
 	var f domain.File
 	err := scanFileRow(r.db.QueryRowContext(ctx, q, id), &f)
 	switch {
@@ -171,22 +190,24 @@ func (r *FileRepository) ListDirectory(ctx context.Context, userID string, paren
 	if parentID == nil {
 		q := fmt.Sprintf(`
 			SELECT %s
-			FROM files
-			WHERE user_id = $1 AND parent_id IS NULL AND deleted_at IS NULL
-			ORDER BY is_directory DESC, name ASC
-		`, fileSelectColumns)
+			FROM files f
+			LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+			WHERE f.user_id = $1 AND f.parent_id IS NULL AND f.deleted_at IS NULL
+			ORDER BY f.is_directory DESC, f.name ASC
+		`, fileSelectColumnsWithTarget)
 		rows, err = r.db.QueryContext(ctx, q, userID)
 	} else {
 		q := fmt.Sprintf(`
-			SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
+			SELECT %s
 			FROM files f
+			LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
 			WHERE f.parent_id = $1
 			  AND (
 			    (SELECT deleted_at FROM files WHERE id = $1) IS NOT NULL
 			    OR f.deleted_at IS NULL
 			  )
 			ORDER BY f.is_directory DESC, f.name ASC
-		`)
+		`, fileSelectColumnsWithTarget)
 		rows, err = r.db.QueryContext(ctx, q, *parentID)
 	}
 	if err != nil {
@@ -329,7 +350,7 @@ func (r *FileRepository) GetSubtreeForItems(ctx context.Context, ids []string, u
 
 	q := `
 		WITH RECURSIVE selected_hierarchy AS (
-			-- 1. Base Case: Start with all selected target items (files or folders)
+			-- 1. Base Case: Start with all selected target items (files or folders; caller has already authorised read access)
 			SELECT f.id, f.parent_id, f.name, f.mime_type, f.target_id, 1 AS depth, 
 				CASE WHEN array_length($1::uuid[], 1) > 1 AND f.parent_id IS NOT NULL THEN
 					COALESCE((SELECT p.name FROM files p WHERE p.id = f.parent_id), 'Root') || '/' || f.name
@@ -337,7 +358,7 @@ func (r *FileRepository) GetSubtreeForItems(ctx context.Context, ids []string, u
 					f.name
 				END::VARCHAR(1024) AS relative_path
 			FROM files f
-			WHERE f.id = ANY($1::uuid[]) AND f.user_id = $2 AND f.deleted_at IS NULL
+			WHERE f.id = ANY($1::uuid[]) AND f.deleted_at IS NULL
 			
 			UNION ALL
 			
@@ -354,7 +375,7 @@ func (r *FileRepository) GetSubtreeForItems(ctx context.Context, ids []string, u
 		ORDER BY depth ASC;
 	`
 
-	rows, err := r.db.QueryContext(ctx, q, pq.Array(resolvedIDs), userID)
+	rows, err := r.db.QueryContext(ctx, q, pq.Array(resolvedIDs))
 	if err != nil {
 		return nil, fmt.Errorf("query subtree for items: %w", err)
 	}
@@ -446,17 +467,22 @@ func (r *FileRepository) Restore(ctx context.Context, rootID string, userID stri
 // ListSharedWithUser returns all files/folders that have been shared with userEmail
 // (excluding files owned by the user themselves and excluding soft-deleted files).
 func (r *FileRepository) ListSharedWithUser(ctx context.Context, userEmail, userID string) ([]*domain.File, error) {
-	const q = `
-		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status,
+	q := fmt.Sprintf(`
+		SELECT %s,
 		       p.created_at, p.role,
 		       COALESCE(u_owner.email, ''), COALESCE(u_sender.email, u_owner.email, '')
 		FROM files f
+		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
 		JOIN permissions p ON f.id = p.file_id
 		LEFT JOIN users u_owner ON f.user_id = u_owner.id
 		LEFT JOIN users u_sender ON p.invited_by = u_sender.id
-		WHERE p.grantee_email = $1 AND p.status = 'ACCEPTED' AND f.user_id != $2 AND f.deleted_at IS NULL
+		WHERE LOWER(p.grantee_email) = LOWER($1)
+		  AND p.status = 'ACCEPTED'
+		  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
+		  AND f.user_id != $2
+		  AND f.deleted_at IS NULL
 		ORDER BY p.created_at DESC
-	`
+	`, fileSelectColumnsWithTarget)
 	rows, err := r.db.QueryContext(ctx, q, userEmail, userID)
 	if err != nil {
 		return nil, fmt.Errorf("query shared files: %w", err)
@@ -859,8 +885,11 @@ func (r *FileRepository) findOrphanedHashes(ctx context.Context, hashes []string
 		return orphans, rows.Err()
 	}
 
-// GetResolvedPermission checks permissions recursively up the folder tree
+// GetResolvedPermission checks permissions recursively up the folder tree.
 func (r *FileRepository) GetResolvedPermission(ctx context.Context, fileID string, userEmail string) (string, error) {
+	if strings.TrimSpace(userEmail) == "" {
+		return "", domain.ErrPermissionNotFound
+	}
 	const q = `
 		WITH RECURSIVE file_hierarchy AS (
 			-- 1. Base Case: Start with the target file/folder being checked
@@ -879,7 +908,7 @@ func (r *FileRepository) GetResolvedPermission(ctx context.Context, fileID strin
 		SELECT p.role
 		FROM file_hierarchy fh
 		INNER JOIN permissions p ON fh.id = p.file_id
-		WHERE p.grantee_email = $2
+		WHERE LOWER(p.grantee_email) = LOWER($2)
 		  AND p.status = 'ACCEPTED'
 		  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
 		ORDER BY fh.depth ASC
@@ -894,6 +923,48 @@ func (r *FileRepository) GetResolvedPermission(ctx context.Context, fileID strin
 		return "", fmt.Errorf("get resolved permission: %w", err)
 	}
 	return role, nil
+}
+
+// HasPublicLinkOrShortcutAccess checks whether fileID (or any ancestor folder in its hierarchy)
+// has an active, non-expired public ShareableLink, and if password-protected, that userID
+// already holds a saved shortcut to the resource.
+func (r *FileRepository) HasPublicLinkOrShortcutAccess(ctx context.Context, userID, fileID string) (bool, error) {
+	if fileID == "" {
+		return false, nil
+	}
+	const q = `
+		WITH RECURSIVE file_hierarchy AS (
+			SELECT id, parent_id
+			FROM files
+			WHERE id = $1 AND deleted_at IS NULL
+			UNION ALL
+			SELECT f.id, f.parent_id
+			FROM files f
+			INNER JOIN file_hierarchy fh ON f.id = fh.parent_id
+			WHERE f.deleted_at IS NULL
+		)
+		SELECT EXISTS (
+			SELECT 1
+			FROM file_hierarchy fh
+			INNER JOIN shareable_links sl ON sl.file_id = fh.id
+			WHERE (sl.expires_at IS NULL OR sl.expires_at > CURRENT_TIMESTAMP)
+			  AND (
+				  sl.password_hash IS NULL
+				  OR sl.password_hash = ''
+				  OR ($2 != '' AND EXISTS (
+					  SELECT 1 FROM files sc
+					  WHERE sc.user_id = $2
+					    AND sc.deleted_at IS NULL
+					    AND (sc.target_id = fh.id OR sc.shortcut_target_id = fh.id OR sc.target_id = $1 OR sc.shortcut_target_id = $1)
+				  ))
+			  )
+		)
+	`
+	var allowed bool
+	if err := r.db.QueryRowContext(ctx, q, fileID, userID).Scan(&allowed); err != nil {
+		return false, fmt.Errorf("check public link or shortcut access: %w", err)
+	}
+	return allowed, nil
 }
 
 // BulkSoftDelete soft-deletes multiple file/folder roots in a single transaction.
@@ -1307,14 +1378,15 @@ func (r *FileRepository) RecordView(ctx context.Context, userID, fileID string) 
 
 // GetRecentViews returns the user's recently active and viewed files, ordered by most recent activity first.
 func (r *FileRepository) GetRecentViews(ctx context.Context, userID string, limit int) ([]*domain.File, error) {
-	const q = `
-		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
+	q := fmt.Sprintf(`
+		SELECT %s
 		FROM files f
+		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
 		LEFT JOIN user_file_views v ON f.id = v.file_id AND v.user_id = $1
 		WHERE (f.user_id = $1 OR v.file_id IS NOT NULL) AND f.deleted_at IS NULL
 		ORDER BY GREATEST(f.created_at, f.updated_at, COALESCE(v.viewed_at, f.created_at)) DESC
 		LIMIT $2
-	`
+	`, fileSelectColumnsWithTarget)
 	rows, err := r.db.QueryContext(ctx, q, userID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("get recent views: %w", err)
@@ -1393,52 +1465,7 @@ func (r *FileRepository) InsertFileChunks(ctx context.Context, chunks []*domain.
 // We join with the files table and deduplicate by file id.
 func (r *FileRepository) SemanticSearchChunks(ctx context.Context, userID string, queryEmbedding []float32, limit int) ([]*domain.File, error) {
 	embStr := floatsToPgVectorStr(queryEmbedding)
-	// We want to find the top matching chunks, and then return their corresponding files.
-	// Since one file can have multiple chunks matching, we group by file fields or use DISTINCT ON.
 	query := `
-		SELECT DISTINCT ON (f.id)
-			f.id, f.user_id, f.name, f.parent_id, f.is_directory, f.size_bytes, 
-			f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, 
-			f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
-		FROM file_chunks fc
-		JOIN files f ON f.id = fc.file_id
-		WHERE f.deleted_at IS NULL AND f.user_id = $1
-		ORDER BY f.id, fc.embedding <=> $2
-	`
-	
-	// Actually, DISTINCT ON requires the ORDER BY to start with the DISTINCT ON expression (f.id).
-	// But we want to order by cosine similarity overall, not just within each file.
-	// A better query is to find top N chunks, then get the files for those chunks, preserving order.
-	
-	query = `
-		WITH RankedChunks AS (
-			SELECT file_id, embedding <=> $2 AS distance
-			FROM file_chunks
-			ORDER BY distance ASC
-			LIMIT $3
-		),
-		RankedFiles AS (
-			SELECT file_id, MIN(distance) as min_distance
-			FROM RankedChunks
-			GROUP BY file_id
-			ORDER BY min_distance ASC
-		)
-		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, 
-			f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, 
-			f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
-		FROM RankedFiles rf
-		JOIN files f ON f.id = rf.file_id
-		WHERE f.deleted_at IS NULL AND f.user_id = $1
-		ORDER BY rf.min_distance ASC
-	`
-
-	// Wait, the limit applies to chunks. If limit=20 chunks belong to 2 files, it returns 2 files. That's fine.
-	// But we must also ensure we only search chunks of the user's files to prevent data leak, 
-	// or we just filter by user_id at the end (which is safe since f.user_id = $1).
-	// But filtering at the end means if the top 20 chunks belong to other users, we might get 0 results.
-	// So we should filter by user_id in the chunk search CTE:
-
-	query = `
 		WITH UserFiles AS (
 			SELECT id FROM files WHERE user_id = $1 AND deleted_at IS NULL
 		),
@@ -1481,7 +1508,7 @@ func (r *FileRepository) SemanticSearchChunks(ctx context.Context, userID string
 }
 
 // HybridSearch performs a unified search matching filenames, tags, summaries, and vector chunk embeddings.
-// It searches both files owned by the user and files explicitly shared with the user.
+// It searches both files owned by the user and files explicitly shared with the user (with ACCEPTED, non-expired permissions).
 func (r *FileRepository) HybridSearch(ctx context.Context, userID, userEmail, query string, queryEmbedding []float32, limit int) ([]*domain.File, error) {
 	if limit <= 0 {
 		limit = 20
@@ -1493,18 +1520,20 @@ func (r *FileRepository) HybridSearch(ctx context.Context, userID, userEmail, qu
 	// keyword match + semantic chunk vector distance match
 	if len(queryEmbedding) > 0 {
 		embStr := floatsToPgVectorStr(queryEmbedding)
-		sqlQuery := `
+		sqlQuery := fmt.Sprintf(`
 			WITH AccessibleFiles AS (
-				SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, 
-					f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, 
-					f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
+				SELECT %s
 				FROM files f
+				LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
 				WHERE f.deleted_at IS NULL AND (
 					f.user_id = $1 OR 
-					EXISTS (
+					($2 != '' AND EXISTS (
 						SELECT 1 FROM permissions p 
-						WHERE p.file_id = f.id AND (p.grantee_email = $2 OR $2 = '')
-					)
+						WHERE p.file_id = f.id
+						  AND LOWER(p.grantee_email) = LOWER($2)
+						  AND p.status = 'ACCEPTED'
+						  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
+					))
 				)
 			),
 			KeywordMatches AS (
@@ -1522,11 +1551,11 @@ func (r *FileRepository) HybridSearch(ctx context.Context, userID, userEmail, qu
 				   OR (summary IS NOT NULL AND LOWER(summary) LIKE LOWER($4))
 			),
 			SemanticMatches AS (
-				SELECT fc.file_id AS id, 
+				SELECT af.id AS id, 
 					MIN(1.0 - (fc.embedding <=> $5)) AS semantic_score
 				FROM file_chunks fc
-				JOIN AccessibleFiles af ON fc.file_id = af.id
-				GROUP BY fc.file_id
+				JOIN AccessibleFiles af ON fc.file_id = COALESCE(af.target_id, af.id)
+				GROUP BY af.id
 			),
 			CombinedScores AS (
 				SELECT af.id,
@@ -1545,7 +1574,7 @@ func (r *FileRepository) HybridSearch(ctx context.Context, userID, userEmail, qu
 			JOIN AccessibleFiles af ON af.id = cs.id
 			ORDER BY cs.total_rank DESC, af.updated_at DESC
 			LIMIT $6;
-		`
+		`, fileSelectColumnsWithTarget)
 
 		rows, err := r.db.QueryContext(ctx, sqlQuery, userID, userEmail, query, searchPattern, embStr, limit)
 		if err == nil {
@@ -1573,21 +1602,23 @@ func (r *FileRepository) keywordSearch(ctx context.Context, userID, userEmail, q
 		limit = 20
 	}
 	searchPattern := "%" + strings.TrimSpace(query) + "%"
-	sqlQuery := `
-		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, 
-			f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, 
-			f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
+	sqlQuery := fmt.Sprintf(`
+		SELECT %s
 		FROM files f
+		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
 		WHERE f.deleted_at IS NULL AND (
 			f.user_id = $1 OR 
-			EXISTS (
+			($2 != '' AND EXISTS (
 				SELECT 1 FROM permissions p 
-				WHERE p.file_id = f.id AND (p.grantee_email = $2 OR $2 = '')
-			)
+				WHERE p.file_id = f.id
+				  AND LOWER(p.grantee_email) = LOWER($2)
+				  AND p.status = 'ACCEPTED'
+				  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
+			))
 		) AND (
 			f.name ILIKE $3 OR 
-			(f.tags IS NOT NULL AND f.tags ILIKE $3) OR 
-			(f.summary IS NOT NULL AND f.summary ILIKE $3)
+			(COALESCE(t.tags, f.tags) IS NOT NULL AND COALESCE(t.tags, f.tags) ILIKE $3) OR 
+			(COALESCE(t.summary, f.summary) IS NOT NULL AND COALESCE(t.summary, f.summary) ILIKE $3)
 		)
 		ORDER BY 
 			CASE 
@@ -1597,7 +1628,7 @@ func (r *FileRepository) keywordSearch(ctx context.Context, userID, userEmail, q
 			END ASC,
 			f.updated_at DESC
 		LIMIT $5;
-	`
+	`, fileSelectColumnsWithTarget)
 
 	rows, err := r.db.QueryContext(ctx, sqlQuery, userID, userEmail, searchPattern, query, limit)
 	if err != nil {
@@ -1615,3 +1646,59 @@ func (r *FileRepository) keywordSearch(ctx context.Context, userID, userEmail, q
 	}
 	return files, rows.Err()
 }
+
+// TryCopyAIMetadataFromCAS checks if another active, unencrypted file with the exact same
+// ordered CAS block sequence already has AI summary or tags in the database. If found,
+// it atomically copies tags, summary, embedding, and file_chunks to fileID without calling the LLM.
+func (r *FileRepository) TryCopyAIMetadataFromCAS(ctx context.Context, fileID string) (donorID string, tags *string, summary *string, copied bool, err error) {
+	const q = `
+		WITH target_sig AS (
+			SELECT ARRAY_AGG(fb.block_id ORDER BY fb.sequence_number ASC) AS sig
+			FROM file_blocks fb
+			WHERE fb.file_id = $1
+		),
+		donor AS (
+			SELECT f.id, f.tags, f.summary, f.embedding
+			FROM files f
+			JOIN target_sig ts ON ts.sig IS NOT NULL AND array_length(ts.sig, 1) > 0
+			WHERE f.id != $1
+			  AND f.is_encrypted = FALSE
+			  AND f.status != 'QUARANTINED'
+			  AND (f.summary IS NOT NULL OR f.tags IS NOT NULL)
+			  AND (
+				  SELECT ARRAY_AGG(fb2.block_id ORDER BY fb2.sequence_number ASC)
+				  FROM file_blocks fb2
+				  WHERE fb2.file_id = f.id
+			  ) = ts.sig
+			ORDER BY f.updated_at DESC
+			LIMIT 1
+		)
+		UPDATE files target
+		SET tags = COALESCE(target.tags, donor.tags),
+		    summary = COALESCE(target.summary, donor.summary),
+		    embedding = COALESCE(target.embedding, donor.embedding)
+		FROM donor
+		WHERE target.id = $1
+		RETURNING donor.id, target.tags, target.summary
+	`
+	err = r.db.QueryRowContext(ctx, q, fileID).Scan(&donorID, &tags, &summary)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil, nil, false, nil
+		}
+		return "", nil, nil, false, fmt.Errorf("copy ai metadata from cas: %w", err)
+	}
+
+	// Also copy semantic file_chunks from donor if target has none yet
+	const copyChunksQ = `
+		INSERT INTO file_chunks (file_id, chunk_index, chunk_text, embedding)
+		SELECT $1, chunk_index, chunk_text, embedding
+		FROM file_chunks
+		WHERE file_id = $2
+		  AND NOT EXISTS (SELECT 1 FROM file_chunks WHERE file_id = $1)
+	`
+	_, _ = r.db.ExecContext(ctx, copyChunksQ, fileID, donorID)
+
+	return donorID, tags, summary, true, nil
+}
+

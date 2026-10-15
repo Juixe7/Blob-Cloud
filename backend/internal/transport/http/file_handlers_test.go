@@ -8,9 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	mrand "math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -359,3 +362,464 @@ func TestParseRangeHeader(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// In-Memory Fakes for Deterministic Security, IDOR & Streaming Revocation Tests
+// ---------------------------------------------------------------------------
+
+type memUserStore struct {
+	mu    sync.RWMutex
+	users map[string]*domain.User
+}
+
+func (m *memUserStore) GetByID(_ context.Context, id string) (*domain.User, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	u, ok := m.users[id]
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	cp := *u
+	return &cp, nil
+}
+
+type memFileStore struct {
+	mu    sync.RWMutex
+	files map[string]*domain.File
+	roles map[string]map[string]string // fileID -> email -> role
+}
+
+func (m *memFileStore) GetByID(_ context.Context, id string) (*domain.File, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	f, ok := m.files[id]
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	cp := *f
+	return &cp, nil
+}
+
+func (m *memFileStore) GetResolvedPermission(_ context.Context, fileID string, userEmail string) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if byEmail, ok := m.roles[fileID]; ok {
+		if role, exists := byEmail[userEmail]; exists && role != "" {
+			return role, nil
+		}
+	}
+	return "", domain.ErrPermissionNotFound
+}
+
+func (m *memFileStore) GetFileByNameAndParent(context.Context, string, string, *string) (*domain.File, error) {
+	return nil, sql.ErrNoRows
+}
+func (m *memFileStore) GetFolderByNameAndParent(context.Context, string, string, *string) (*domain.File, error) {
+	return nil, sql.ErrNoRows
+}
+func (m *memFileStore) Create(context.Context, *domain.File) error                 { return nil }
+func (m *memFileStore) Update(context.Context, *domain.File) error                 { return nil }
+func (m *memFileStore) SoftDelete(context.Context, string, string) error           { return nil }
+func (m *memFileStore) Restore(context.Context, string, string) error              { return nil }
+func (m *memFileStore) ListTrash(context.Context, string) ([]*domain.File, error)  { return nil, nil }
+func (m *memFileStore) DeleteRecursive(context.Context, string, string) (int64, []string, error) {
+	return 0, nil, nil
+}
+func (m *memFileStore) ListDirectory(context.Context, string, *string) ([]*domain.File, error) {
+	return nil, nil
+}
+func (m *memFileStore) ListSharedWithUser(context.Context, string, string) ([]*domain.File, error) {
+	return nil, nil
+}
+func (m *memFileStore) GetUserStorageUsage(context.Context, string) (*domain.UserStorageUsage, error) {
+	return &domain.UserStorageUsage{}, nil
+}
+func (m *memFileStore) BulkSoftDelete(context.Context, []string, string) error { return nil }
+func (m *memFileStore) BulkRestore(context.Context, []string, string) error    { return nil }
+func (m *memFileStore) BulkMove(context.Context, []string, *string, string) error {
+	return nil
+}
+func (m *memFileStore) BulkHardDelete(context.Context, []string, string) (int64, []string, error) {
+	return 0, nil, nil
+}
+func (m *memFileStore) WithTx(_ postgresrepo.DBTX) *postgresrepo.FileRepository { return nil }
+
+type memBlockStore struct {
+	blocks map[string][]*domain.Block
+}
+
+func (m *memBlockStore) ListFileBlockHashes(_ context.Context, fileID string) ([]string, error) {
+	var hashes []string
+	for _, b := range m.blocks[fileID] {
+		hashes = append(hashes, b.SHA256)
+	}
+	return hashes, nil
+}
+
+func (m *memBlockStore) ListFileBlocks(_ context.Context, fileID string) ([]*domain.Block, error) {
+	return m.blocks[fileID], nil
+}
+
+type memPermStore struct{}
+
+func (m *memPermStore) CheckUserPermission(context.Context, string, string, []string) (bool, error) {
+	return false, nil
+}
+func (m *memPermStore) FindCollaboratorUserIDs(context.Context, string) ([]string, error) {
+	return nil, nil
+}
+func (m *memPermStore) WithTx(_ postgresrepo.DBTX) *postgresrepo.PermissionRepository { return nil }
+
+type hookMemStorage struct {
+	*testMemStorage
+	onGetObject func(key string)
+}
+
+func (h *hookMemStorage) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
+	if h.onGetObject != nil {
+		h.onGetObject(key)
+	}
+	return h.testMemStorage.GetObject(ctx, key)
+}
+
+// TestDownload_MidStreamRevocationAt16BlockBoundary proves that revoking a user's
+// read permission (or quarantining/trashing the file) while a multi-block download is
+// actively streaming cuts off the HTTP stream at the 16-block check window.
+func TestDownload_MidStreamRevocationAt16BlockBoundary(t *testing.T) {
+	const totalBlocks = 25
+	const blockSize = 1024
+
+	userStore := &memUserStore{
+		users: map[string]*domain.User{
+			"user-owner":  {ID: "user-owner", Email: "owner@blobcloud.dev"},
+			"user-viewer": {ID: "user-viewer", Email: "viewer@blobcloud.dev"},
+		},
+	}
+
+	fileStore := &memFileStore{
+		files: map[string]*domain.File{
+			"file-stream-25": {
+				ID:          "file-stream-25",
+				UserID:      "user-owner",
+				Name:        "confidential_archive.bin",
+				IsDirectory: false,
+				SizeBytes:   int64(totalBlocks * blockSize),
+				Status:      "ACTIVE",
+			},
+		},
+		roles: map[string]map[string]string{
+			"file-stream-25": {
+				"viewer@blobcloud.dev": domain.RoleViewer,
+			},
+		},
+	}
+
+	baseStorage := &testMemStorage{objects: make(map[string][]byte)}
+	var fileBlocks []*domain.Block
+	for i := 0; i < totalBlocks; i++ {
+		hash := fmt.Sprintf("block-hash-%02d", i)
+		baseStorage.objects["blocks/"+hash] = bytes.Repeat([]byte{byte('A' + i)}, blockSize)
+		fileBlocks = append(fileBlocks, &domain.Block{
+			ID:        fmt.Sprintf("blk-%d", i),
+			SHA256:    hash,
+			SizeBytes: blockSize,
+		})
+	}
+
+	blockStore := &memBlockStore{
+		blocks: map[string][]*domain.Block{
+			"file-stream-25": fileBlocks,
+		},
+	}
+
+	// Revoke user-viewer's VIEWER permission while block 5 is streaming!
+	storage := &hookMemStorage{
+		testMemStorage: baseStorage,
+		onGetObject: func(key string) {
+			if key == "blocks/block-hash-05" {
+				fileStore.mu.Lock()
+				delete(fileStore.roles["file-stream-25"], "viewer@blobcloud.dev")
+				fileStore.mu.Unlock()
+			}
+		},
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fileSvc := service.NewFileService(nil, userStore, fileStore, blockStore, &memPermStore{}, storage, logger)
+	zipSvc := service.NewZipService(nil, nil, storage)
+
+	srv := NewServer(storage, logger)
+	srv.jwtSecret = "abcdefghijklmnopqrstuvwxyz012345"
+	srv = srv.WithFileOperations(fileSvc, nil, nil).WithZipOperations(zipSvc)
+
+	viewerToken, err := auth.CreateToken(srv.jwtSecret, "user-viewer")
+	if err != nil {
+		t.Fatalf("CreateToken: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/files/file-stream-25/download?token="+viewerToken, nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "file-stream-25")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	w := httptest.NewRecorder()
+	srv.HandleDownload(w, req)
+
+	streamedBytes := w.Body.Bytes()
+	expectedCutoffBytes := 16 * blockSize // Blocks 0..15 streamed; cut off at idx == 16!
+	if len(streamedBytes) != expectedCutoffBytes {
+		t.Fatalf("expected stream to cut off at 16-block window (%d bytes), but streamed %d bytes (out of %d)",
+			expectedCutoffBytes, len(streamedBytes), totalBlocks*blockSize)
+	}
+}
+
+// TestDownload_IDORAndRBACBoundaries verifies that User B cannot download or access
+// thumbnails for User A's private file (IDOR -> 403 Forbidden), and that a VIEWER
+// can read a shared file (200 OK) but cannot overwrite its thumbnail (RBAC -> 403 Forbidden).
+func TestDownload_IDORAndRBACBoundaries(t *testing.T) {
+	userStore := &memUserStore{
+		users: map[string]*domain.User{
+			"user-alice":   {ID: "user-alice", Email: "alice@blobcloud.dev"},
+			"user-mallory": {ID: "user-mallory", Email: "mallory@blobcloud.dev"},
+			"user-viewer":  {ID: "user-viewer", Email: "viewer@blobcloud.dev"},
+		},
+	}
+
+	fileStore := &memFileStore{
+		files: map[string]*domain.File{
+			"alice-private-file": {
+				ID:          "alice-private-file",
+				UserID:      "user-alice",
+				Name:        "tax_return.pdf",
+				IsDirectory: false,
+				SizeBytes:   512,
+				Status:      "ACTIVE",
+			},
+		},
+		roles: map[string]map[string]string{
+			"alice-private-file": {
+				"viewer@blobcloud.dev": domain.RoleViewer,
+			},
+		},
+	}
+
+	storage := &testMemStorage{
+		objects: map[string][]byte{
+			"blocks/hash-private": bytes.Repeat([]byte("SECRET_TAX_DATA_"), 32), // 512 bytes
+		},
+	}
+	blockStore := &memBlockStore{
+		blocks: map[string][]*domain.Block{
+			"alice-private-file": {{ID: "b1", SHA256: "hash-private", SizeBytes: 512}},
+		},
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fileSvc := service.NewFileService(nil, userStore, fileStore, blockStore, &memPermStore{}, storage, logger)
+	zipSvc := service.NewZipService(nil, nil, storage)
+
+	srv := NewServer(storage, logger)
+	srv.jwtSecret = "abcdefghijklmnopqrstuvwxyz012345"
+	srv = srv.WithFileOperations(fileSvc, nil, nil).WithZipOperations(zipSvc)
+
+	malloryTok, _ := auth.CreateToken(srv.jwtSecret, "user-mallory")
+	viewerTok, _ := auth.CreateToken(srv.jwtSecret, "user-viewer")
+
+	// 1. IDOR Attack: Mallory attempts to download Alice's file -> 403 Forbidden
+	reqDownload := httptest.NewRequest(http.MethodGet, "/api/files/alice-private-file/download?token="+malloryTok, nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "alice-private-file")
+	reqDownload = reqDownload.WithContext(context.WithValue(reqDownload.Context(), chi.RouteCtxKey, rctx))
+	wDownload := httptest.NewRecorder()
+	srv.HandleDownload(wDownload, reqDownload)
+	if wDownload.Code != http.StatusForbidden {
+		t.Fatalf("IDOR download by Mallory: expected 403 Forbidden, got %d", wDownload.Code)
+	}
+
+	// 2. IDOR Attack: Mallory attempts to fetch Alice's thumbnail -> 403 Forbidden
+	reqThumb := httptest.NewRequest(http.MethodGet, "/api/files/alice-private-file/thumbnail?token="+malloryTok, nil)
+	reqThumb = reqThumb.WithContext(context.WithValue(reqThumb.Context(), chi.RouteCtxKey, rctx))
+	wThumb := httptest.NewRecorder()
+	srv.HandleGetThumbnail(wThumb, reqThumb)
+	if wThumb.Code != http.StatusForbidden {
+		t.Fatalf("IDOR thumbnail read by Mallory: expected 403 Forbidden, got %d", wThumb.Code)
+	}
+
+	// 3. RBAC Check: Viewer can download shared file (200 OK), but cannot upload/overwrite thumbnail (403 Forbidden)
+	reqViewerDL := httptest.NewRequest(http.MethodGet, "/api/files/alice-private-file/download?token="+viewerTok, nil)
+	reqViewerDL = reqViewerDL.WithContext(context.WithValue(reqViewerDL.Context(), chi.RouteCtxKey, rctx))
+	wViewerDL := httptest.NewRecorder()
+	srv.HandleDownload(wViewerDL, reqViewerDL)
+	if wViewerDL.Code != http.StatusOK || wViewerDL.Body.Len() != 512 {
+		t.Fatalf("Viewer download: expected 200 OK with 512 bytes, got status %d (%d bytes)", wViewerDL.Code, wViewerDL.Body.Len())
+	}
+
+	reqViewerWrite := httptest.NewRequest(http.MethodPut, "/api/files/alice-private-file/thumbnail", bytes.NewReader([]byte("fake-image")))
+	reqViewerWrite.Header.Set("Authorization", "Bearer "+viewerTok)
+	reqViewerWrite = reqViewerWrite.WithContext(context.WithValue(reqViewerWrite.Context(), chi.RouteCtxKey, rctx))
+	wViewerWrite := httptest.NewRecorder()
+	srv.HandleUploadThumbnail(wViewerWrite, reqViewerWrite)
+	if wViewerWrite.Code != http.StatusForbidden {
+		t.Fatalf("RBAC viewer write attempt: expected 403 Forbidden, got %d", wViewerWrite.Code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Property-Based Range Streaming Over Irregular FastCDC Blocks & Fuzzing
+// ---------------------------------------------------------------------------
+
+// TestRangeStreaming_PropertyRandomBlockLayoutsVsByteSliceReference generates a
+// file split into 12 irregular FastCDC-style variable-length blocks, then runs 100
+// randomized HTTP Range requests (closed ranges, open-ended ranges, and RFC 7233
+// suffix ranges) through HandleDownload and asserts byte-for-byte equality with
+// plain originalData[start:end+1] slicing.
+func TestRangeStreaming_PropertyRandomBlockLayoutsVsByteSliceReference(t *testing.T) {
+	rng := mrand.New(mrand.NewSource(99887766))
+
+	// Create 12 variable-length blocks (between 3 KB and 29 KB each)
+	blockSizes := []int{3100, 14250, 7890, 28400, 512, 19333, 11005, 4096, 22111, 8765, 15432, 6010}
+	var originalData []byte
+	storage := &testMemStorage{objects: make(map[string][]byte)}
+	var blocks []*domain.Block
+
+	for i, sz := range blockSizes {
+		chunk := make([]byte, sz)
+		_, _ = rng.Read(chunk)
+		hash := fmt.Sprintf("var-block-%02d", i)
+		storage.objects["blocks/"+hash] = chunk
+		originalData = append(originalData, chunk...)
+		blocks = append(blocks, &domain.Block{
+			ID:        fmt.Sprintf("vb-%d", i),
+			SHA256:    hash,
+			SizeBytes: int32(sz),
+		})
+	}
+	totalSize := int64(len(originalData))
+
+	userStore := &memUserStore{
+		users: map[string]*domain.User{
+			"user-prop": {ID: "user-prop", Email: "prop@blobcloud.dev"},
+		},
+	}
+	fileStore := &memFileStore{
+		files: map[string]*domain.File{
+			"file-var-blocks": {
+				ID:          "file-var-blocks",
+				UserID:      "user-prop",
+				Name:        "video_stream.mp4",
+				IsDirectory: false,
+				SizeBytes:   totalSize,
+				Status:      "ACTIVE",
+			},
+		},
+	}
+	blockStore := &memBlockStore{
+		blocks: map[string][]*domain.Block{
+			"file-var-blocks": blocks,
+		},
+	}
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	fileSvc := service.NewFileService(nil, userStore, fileStore, blockStore, &memPermStore{}, storage, logger)
+	zipSvc := service.NewZipService(nil, nil, storage)
+	srv := NewServer(storage, logger)
+	srv.jwtSecret = "abcdefghijklmnopqrstuvwxyz012345"
+	srv = srv.WithFileOperations(fileSvc, nil, nil).WithZipOperations(zipSvc)
+
+	tok, _ := auth.CreateToken(srv.jwtSecret, "user-prop")
+
+	// Run 100 randomized range requests straddling variable block boundaries
+	for trial := 0; trial < 100; trial++ {
+		var rangeHdr string
+		var wantStart, wantEnd int64
+
+		switch trial % 3 {
+		case 0:
+			// Closed range: bytes=start-end
+			wantStart = int64(rng.Intn(int(totalSize)))
+			wantEnd = wantStart + int64(rng.Intn(int(totalSize-wantStart)))
+			rangeHdr = fmt.Sprintf("bytes=%d-%d", wantStart, wantEnd)
+		case 1:
+			// Open-ended range: bytes=start-
+			wantStart = int64(rng.Intn(int(totalSize)))
+			wantEnd = totalSize - 1
+			rangeHdr = fmt.Sprintf("bytes=%d-", wantStart)
+		case 2:
+			// RFC 7233 Suffix range: bytes=-suffixLen
+			suffixLen := int64(1 + rng.Intn(int(totalSize)))
+			wantStart = totalSize - suffixLen
+			wantEnd = totalSize - 1
+			rangeHdr = fmt.Sprintf("bytes=-%d", suffixLen)
+		}
+
+		req := httptest.NewRequest(http.MethodGet, "/api/files/file-var-blocks/download?token="+tok, nil)
+		req.Header.Set("Range", rangeHdr)
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", "file-var-blocks")
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+		w := httptest.NewRecorder()
+		srv.HandleDownload(w, req)
+
+		if w.Code != http.StatusPartialContent {
+			t.Fatalf("trial %d (%s): expected 206 Partial Content, got %d", trial, rangeHdr, w.Code)
+		}
+
+		expectedSlice := originalData[wantStart : wantEnd+1]
+		if !bytes.Equal(w.Body.Bytes(), expectedSlice) {
+			t.Fatalf("trial %d (%s): range response bytes mismatch reference slice (got %d bytes, want %d bytes)",
+				trial, rangeHdr, w.Body.Len(), len(expectedSlice))
+		}
+	}
+}
+
+// FuzzParseRangeHeader uses Go's native fuzzing engine to verify parseRangeHeader
+// never panics on arbitrary malformed headers and always returns valid bounds when ok==true.
+func FuzzParseRangeHeader(f *testing.F) {
+	seeds := []string{
+		"",
+		"bytes=0-0",
+		"bytes=0-499",
+		"bytes=500-",
+		"bytes=-500",
+		"bytes=-1",
+		"bytes=-999999999",
+		"bytes=999999999999999999999999999-0",
+		"bytes=--10",
+		"bytes=10-5",
+		"bytes=0-10-20",
+		"bytes=\x00\xff-\xfe",
+		"items=0-10",
+	}
+	for _, s := range seeds {
+		f.Add(s, int64(1000))
+	}
+
+	f.Fuzz(func(t *testing.T, header string, fileSize int64) {
+		start, end, ok := parseRangeHeader(header, fileSize)
+		if !ok {
+			return
+		}
+		if fileSize <= 0 {
+			t.Fatalf("parseRangeHeader(%q, %d) returned ok=true for non-positive fileSize", header, fileSize)
+		}
+		if start < 0 || end < start || end >= fileSize {
+			t.Fatalf("parseRangeHeader(%q, %d) returned out-of-bounds [%d, %d]", header, fileSize, start, end)
+		}
+	})
+}
+
+// FuzzSanitiseFilename verifies SanitiseFilename never panics and strips all path separators.
+func FuzzSanitiseFilename(f *testing.F) {
+	for _, s := range []string{"report.pdf", "../../etc/passwd", `C:\Windows\System32\cmd.exe`, "file\x00name.txt", ""} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, input string) {
+		out := service.SanitiseFilename(input)
+		if strings.ContainsAny(out, `/\`) {
+			t.Fatalf("SanitiseFilename(%q) left path separator in %q", input, out)
+		}
+	})
+}
+
+

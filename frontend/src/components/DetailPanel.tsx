@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { cn, formatFileSize } from '../lib/format'
 import type { FileItem } from '../types/file'
 import { FileIcon } from './FileIcon'
@@ -57,6 +57,10 @@ export function DetailPanel({
   const base = apiClient.defaults.baseURL ?? '/api'
 
   const effectiveId = item?.target_id || item?.id
+  const itemRef = useRef(item)
+  useEffect(() => {
+    itemRef.current = item
+  }, [item])
 
   const isImage = item?.mime_type?.startsWith('image/') || (item?.name ? /\.(jpg|jpeg|png|webp|gif)$/i.test(item.name) : false)
   const isVideo = item?.mime_type?.startsWith('video/') || (item?.name ? /\.(mp4|webm|mov|mkv)$/i.test(item.name) : false)
@@ -84,23 +88,35 @@ export function DetailPanel({
     ? 'Shared with me'
     : currentLocationPath || 'My Drive'
 
+  const hasExistingAI = Boolean(item?.summary || item?.tags)
+  const canForceReanalyze = !item?.role || item.role === 'OWNER' || item.role === 'EDITOR'
+
   useEffect(() => {
-    if (isOpen && item && !item.is_directory && (isDoc || isImage) && !item.summary && effectiveId) {
+    if (isOpen && effectiveId && (!itemRef.current?.summary || !itemRef.current?.owner_email)) {
       apiClient.get<FileItem>(`/files/${effectiveId}`).then((res) => {
         if (res.data && (res.data.summary || res.data.tags || res.data.owner_email || res.data.role)) {
-          onItemUpdated?.({ ...item, ...res.data, id: item.id })
+          const current = itemRef.current
+          if (current) {
+            onItemUpdated?.({
+              ...current,
+              ...res.data,
+              id: current.id,
+              target_id: current.target_id,
+            })
+          }
         }
       }).catch(() => {})
     }
-  }, [isOpen, item?.id, effectiveId, isDoc, isImage, item?.summary, onItemUpdated])
+  }, [isOpen, item?.id, effectiveId, item?.summary, item?.owner_email, onItemUpdated])
 
   const handleGenerateAI = async () => {
     if (!item || !effectiveId) return
     setIsGenerating(true)
     setErrorMsg(null)
     try {
+      const query = hasExistingAI ? '?force=true' : ''
       const res = await apiClient.post<{ file_id: string; tags: string | null; summary: string | null }>(
-        `/files/${effectiveId}/ai-insights`
+        `/files/${effectiveId}/ai-insights${query}`
       )
       const updated: FileItem = {
         ...item,
@@ -194,7 +210,7 @@ export function DetailPanel({
                 </div>
 
                 {/* AI Actions */}
-                {canGenerateAI && (
+                {canGenerateAI && (!hasExistingAI || canForceReanalyze) && (
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wider flex items-center gap-1.5">
                       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-zinc-400">
@@ -221,7 +237,7 @@ export function DetailPanel({
                           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                             <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
                           </svg>
-                          {item.summary || item.tags ? 'Re-analyze' : 'Generate'}
+                          {hasExistingAI ? 'Re-analyze' : 'Generate'}
                         </>
                       )}
                     </button>

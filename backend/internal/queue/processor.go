@@ -160,9 +160,52 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 		p.log.Error("failed to set status to ACTIVE", "err", err)
 	}
 
+	// CAS Content-Addressable AI Deduplication Check:
+	// If the file already inherited AI metadata at upload completion, or another active unencrypted file
+	// has the exact same ordered SHA-256 block sequence, reuse its AI summary, tags, and RAG chunks
+	// instead of re-invoking the LLM.
+	aiAlreadyPopulated := (file.Summary != nil && strings.TrimSpace(*file.Summary) != "") ||
+		(file.Tags != nil && strings.TrimSpace(*file.Tags) != "")
+	if !aiAlreadyPopulated {
+		if casCopier, ok := p.files.(interface {
+			TryCopyAIMetadataFromCAS(ctx context.Context, fileID string) (string, *string, *string, bool, error)
+		}); ok {
+			if donorID, copiedTags, copiedSummary, copied, errCopy := casCopier.TryCopyAIMetadataFromCAS(ctx, msg.FileID); errCopy == nil && copied {
+				p.log.Info("reused AI metadata and RAG chunks from CAS deduplication donor", "file_id", msg.FileID, "donor_id", donorID)
+				aiAlreadyPopulated = true
+				if p.notifier != nil {
+					p.notifier.NotifyUser(msg.UserID, wsSync.NotificationEvent{
+						Type: wsSync.EventAIMetadataReady,
+						Payload: map[string]any{
+							"file_id": msg.FileID,
+							"tags":    copiedTags,
+							"summary": copiedSummary,
+						},
+					})
+					p.notifier.NotifyUser(msg.UserID, wsSync.NotificationEvent{
+						Type: wsSync.EventSyncDelta,
+						Payload: map[string]any{
+							"file_id": msg.FileID,
+							"action":  domain.ActionFileUpdated,
+						},
+					})
+				}
+			}
+		}
+	} else if p.notifier != nil {
+		// Notify connected clients that AI metadata is already ready from upload-time CAS deduplication
+		p.notifier.NotifyUser(msg.UserID, wsSync.NotificationEvent{
+			Type: wsSync.EventAIMetadataReady,
+			Payload: map[string]any{
+				"file_id": msg.FileID,
+				"tags":    file.Tags,
+				"summary": file.Summary,
+			},
+		})
+	}
+
 	if isSupportedImage(file.Name) {
 		imageBytes := fileBytes
-
 
 		thumbBytes, err := generateThumbnail(imageBytes)
 		if err == nil {
@@ -175,7 +218,8 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 							"file_id":       msg.FileID,
 							"thumbnail_url": fmt.Sprintf("/api/files/%s/thumbnail", msg.FileID),
 						},
-					})
+					},
+					)
 				}
 			} else {
 				p.log.Error("failed to put thumbnail object", "err", errPut)
@@ -184,7 +228,7 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 			p.log.Error("failed to generate thumbnail", "err", err)
 		}
 
-		if p.aiClient != nil {
+		if p.aiClient != nil && !aiAlreadyPopulated {
 			tags, errAI = p.aiClient.GenerateImageTags(ctx, imageBytes)
 			if errAI != nil {
 				p.log.Error("failed to generate image tags", "err", errAI)
@@ -216,7 +260,7 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 	}
 
 	var fileChunks []*domain.FileChunk
-	if p.aiClient != nil && (strings.HasSuffix(lowerName, ".txt") || strings.HasSuffix(lowerName, ".md") || strings.HasSuffix(lowerName, ".pdf")) {
+	if p.aiClient != nil && !aiAlreadyPopulated && (strings.HasSuffix(lowerName, ".txt") || strings.HasSuffix(lowerName, ".md") || strings.HasSuffix(lowerName, ".pdf")) {
 		var text string
 		if strings.HasSuffix(lowerName, ".pdf") {
 			r, err := pdf.NewReader(bytes.NewReader(fileBytes), int64(len(fileBytes)))

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -21,6 +22,25 @@ import (
 	"go-drive-clone/internal/service"
 	wsSync "go-drive-clone/internal/sync"
 )
+
+// sessionTouchCache debounces UPDATE user_sessions SET last_active = NOW() writes
+// to at most once per 60 seconds per session ID, preventing row-lock contention
+// during parallel thumbnail and chunk loads.
+var sessionTouchCache sync.Map
+
+func (s *Server) touchSessionDebounced(ctx context.Context, sessionID string) {
+	if sessionID == "" || s.sessions == nil {
+		return
+	}
+	now := time.Now()
+	if last, ok := sessionTouchCache.Load(sessionID); ok {
+		if lastTime, ok := last.(time.Time); ok && now.Sub(lastTime) < 60*time.Second {
+			return
+		}
+	}
+	sessionTouchCache.Store(sessionID, now)
+	_ = s.sessions.TouchSession(ctx, sessionID)
+}
 
 // ---------------------------------------------------------------------------
 // JWT-from-query helper (used by the download endpoint)
@@ -58,7 +78,7 @@ func (s *Server) userFromQueryToken(r *http.Request) (string, int, string) {
 		if _, err := s.sessions.GetSessionByID(r.Context(), claims.SessionID); err != nil {
 			return "", http.StatusUnauthorized, "session has been revoked or expired"
 		}
-		_ = s.sessions.TouchSession(r.Context(), claims.SessionID)
+		s.touchSessionDebounced(r.Context(), claims.SessionID)
 	}
 	return claims.UserID, 0, ""
 }
@@ -95,7 +115,7 @@ func (s *Server) userFromBearer(r *http.Request) (string, int, string) {
 		if _, err := s.sessions.GetSessionByID(r.Context(), claims.SessionID); err != nil {
 			return "", http.StatusUnauthorized, "session has been revoked or expired"
 		}
-		_ = s.sessions.TouchSession(r.Context(), claims.SessionID)
+		s.touchSessionDebounced(r.Context(), claims.SessionID)
 	}
 	return claims.UserID, 0, ""
 }
@@ -142,20 +162,36 @@ func (s *Server) HandleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If this item is a shortcut, resolve ownership and effective role against the underlying target file.
+	effectiveFileID := fileID
+	ownerUserID := file.UserID
+	if file.TargetID != nil && *file.TargetID != "" {
+		effectiveFileID = *file.TargetID
+	} else if file.ShortcutTargetID != nil && *file.ShortcutTargetID != "" {
+		effectiveFileID = *file.ShortcutTargetID
+	}
+	if effectiveFileID != fileID {
+		if targetFile, err := s.fileOps.GetFile(r.Context(), effectiveFileID); err == nil && targetFile != nil {
+			ownerUserID = targetFile.UserID
+		}
+	}
+
 	// Populate owner_email
-	if s.users != nil && file.UserID != "" {
-		if owner, err := s.users.GetByID(r.Context(), file.UserID); err == nil && owner != nil {
+	if s.users != nil && ownerUserID != "" {
+		if owner, err := s.users.GetByID(r.Context(), ownerUserID); err == nil && owner != nil {
 			file.OwnerEmail = &owner.Email
 		}
 	}
 
-	// If caller is not owner, resolve caller's role, who shared it, and when
-	if file.UserID != userID && s.users != nil && s.perms != nil {
+	// If caller is not owner of the effective file, resolve caller's role, who shared it, and when
+	if ownerUserID != userID && s.users != nil && s.perms != nil {
 		if u, err := s.users.GetByID(r.Context(), userID); err == nil && u != nil {
-			if role, err := s.fileOps.GetResolvedPermission(r.Context(), fileID, u.Email); err == nil {
+			if role, err := s.fileOps.GetResolvedPermission(r.Context(), effectiveFileID, u.Email); err == nil {
 				file.Role = role
+			} else {
+				file.Role = domain.RoleViewer
 			}
-			if perms, err := s.perms.GetPermissionsByFile(r.Context(), fileID); err == nil {
+			if perms, err := s.perms.GetPermissionsByFile(r.Context(), effectiveFileID); err == nil {
 				for _, p := range perms {
 					if strings.EqualFold(p.GranteeEmail, u.Email) {
 						file.SharedAt = &p.CreatedAt
@@ -172,7 +208,7 @@ func (s *Server) HandleGetFile(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-	} else if file.UserID == userID {
+	} else if ownerUserID == userID {
 		file.Role = domain.RoleOwner
 	}
 
@@ -458,6 +494,16 @@ func (s *Server) HandleUploadThumbnail(w http.ResponseWriter, r *http.Request) {
 	if fileID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file id"})
 		return
+	}
+
+	if s.files != nil {
+		if f, err := s.files.GetByID(r.Context(), fileID); err == nil && f != nil {
+			if f.TargetID != nil && *f.TargetID != "" {
+				fileID = *f.TargetID
+			} else if f.ShortcutTargetID != nil && *f.ShortcutTargetID != "" {
+				fileID = *f.ShortcutTargetID
+			}
+		}
 	}
 
 	// Verify caller has write permissions (EDITOR or OWNER)
@@ -833,11 +879,31 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 		}
 
 		// Periodic sanity check on long streams (every 16 blocks = 64MB)
-		if idx > startBlockIndex && (idx-startBlockIndex)%16 == 0 && s.files != nil {
-			f, checkErr := s.files.GetByID(r.Context(), file.ID)
-			if checkErr != nil || f == nil || f.DeletedAt != nil || f.Status == "TRASHED" {
-				logCtx.Warn("download aborted: file was deleted or revoked during streaming", "block_index", idx)
-				return
+		if idx > startBlockIndex && (idx-startBlockIndex)%16 == 0 {
+			if s.files != nil {
+				f, checkErr := s.files.GetByID(r.Context(), file.ID)
+				if checkErr != nil || f == nil || f.DeletedAt != nil || f.Status == "TRASHED" || f.Status == "QUARANTINED" {
+					logCtx.Warn("download aborted: file was deleted, trashed, or quarantined during streaming", "block_index", idx)
+					return
+				}
+			} else if s.fileOps != nil {
+				f, checkErr := s.fileOps.GetFileInfo(r.Context(), file.ID)
+				if checkErr != nil || f == nil || f.DeletedAt != nil || f.Status == "TRASHED" || f.Status == "QUARANTINED" {
+					logCtx.Warn("download aborted: file was deleted, trashed, or quarantined during streaming", "block_index", idx)
+					return
+				}
+			}
+			if userID, code, _ := s.userFromQueryToken(r); code == 0 && userID != "" && s.fileOps != nil {
+				if authErr := s.fileOps.AuthoriseRead(r.Context(), userID, file.ID); authErr != nil {
+					logCtx.Warn("download aborted: user read permission revoked during streaming", "block_index", idx, "user_id", userID)
+					return
+				}
+			}
+			if shareToken := chi.URLParam(r, "token"); shareToken != "" && s.shares != nil {
+				if link, lErr := s.shares.GetByToken(r.Context(), shareToken); lErr != nil || link == nil || (link.ExpiresAt != nil && time.Now().After(*link.ExpiresAt)) {
+					logCtx.Warn("download aborted: public share link revoked or expired during streaming", "block_index", idx)
+					return
+				}
 			}
 		}
 
@@ -978,15 +1044,13 @@ func (s *Server) HandleRecordView(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify the user has access to the file before recording view
-	allowed, err := s.perms.CheckUserPermission(r.Context(), fileID, "", []string{domain.RoleOwner, domain.RoleEditor, domain.RoleViewer})
-	if err != nil || !allowed {
+	if err := s.fileOps.AuthoriseRead(r.Context(), userID, fileID); err != nil {
 		// Just fail silently to prevent leakage
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
 		return
 	}
 
-	err = s.files.RecordView(r.Context(), userID, fileID)
-	if err != nil {
+	if err := s.files.RecordView(r.Context(), userID, fileID); err != nil {
 		s.log.Error("failed to record view", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to record view"})
 		return

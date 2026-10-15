@@ -3,7 +3,10 @@ package chunker
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
+	mrand "math/rand"
 	"testing"
 )
 
@@ -296,3 +299,120 @@ func BenchmarkFastCDC_Streaming_10MB(b *testing.B) {
 		}
 	}
 }
+
+// TestFastCDC_PropertyReassemblyAndDeterminism verifies three fundamental properties
+// across edge-case and randomized payload sizes:
+//  1. Determinism: Splitting the same byte stream twice yields identical cut points and hashes.
+//  2. Lossless Reassembly: Concatenating all chunks reproduces the exact original byte slice.
+//  3. Localized Edit Isolation: Mutating bytes in the middle of a multi-chunk file alters at most
+//     2 chunks around the mutation while all preceding and trailing chunks remain untouched.
+func TestFastCDC_PropertyReassemblyAndDeterminism(t *testing.T) {
+	cfg := Config{
+		MinSize: 16 * 1024,  // 16 KB
+		AvgSize: 64 * 1024,  // 64 KB
+		MaxSize: 128 * 1024, // 128 KB
+	}
+
+	rng := mrand.New(mrand.NewSource(20261012))
+
+	// Explicit edge sizes + 25 random payload sizes up to 1.5 MB
+	sizes := []int{
+		0,
+		1,
+		cfg.MinSize - 1,
+		cfg.MinSize,
+		cfg.MinSize + 1,
+		cfg.AvgSize,
+		cfg.MaxSize - 1,
+		cfg.MaxSize,
+		cfg.MaxSize + 1,
+	}
+	for i := 0; i < 25; i++ {
+		sizes = append(sizes, 1024+rng.Intn(1500*1024))
+	}
+
+	for idx, sz := range sizes {
+		payload := make([]byte, sz)
+		if sz > 0 {
+			_, _ = rng.Read(payload)
+		}
+
+		// Run 1: Split
+		chunks1, err := Split(payload, cfg)
+		if err != nil {
+			t.Fatalf("trial %d (size=%d): Split 1 failed: %v", idx, sz, err)
+		}
+		// Run 2: Split again to verify determinism
+		chunks2, err := Split(payload, cfg)
+		if err != nil {
+			t.Fatalf("trial %d (size=%d): Split 2 failed: %v", idx, sz, err)
+		}
+		if len(chunks1) != len(chunks2) {
+			t.Fatalf("trial %d: non-deterministic chunk count: %d vs %d", idx, len(chunks1), len(chunks2))
+		}
+
+		var reassembled bytes.Buffer
+		reassembled.Grow(sz)
+
+		var expectedOffset int64
+		for cIdx, c := range chunks1 {
+			c2 := chunks2[cIdx]
+			if c.Offset != c2.Offset || c.Length != c2.Length || c.SHA256 != c2.SHA256 {
+				t.Fatalf("trial %d chunk %d: non-deterministic cut: %+v vs %+v", idx, cIdx, c, c2)
+			}
+			if c.Offset != expectedOffset {
+				t.Fatalf("trial %d chunk %d: offset gap/overlap: got %d, want %d", idx, cIdx, c.Offset, expectedOffset)
+			}
+
+			slice := payload[c.Offset : c.Offset+int64(c.Length)]
+			sum := sha256.Sum256(slice)
+			if hex.EncodeToString(sum[:]) != c.SHA256 {
+				t.Fatalf("trial %d chunk %d: SHA-256 mismatch on slice", idx, cIdx)
+			}
+			reassembled.Write(slice)
+			expectedOffset += int64(c.Length)
+		}
+
+		if !bytes.Equal(reassembled.Bytes(), payload) {
+			t.Fatalf("trial %d (size=%d): reassembled chunks do NOT equal original payload", idx, sz)
+		}
+	}
+
+	// Property 3: Localized edit in the middle of a 2 MB file only affects nearby chunks
+	largePayload := make([]byte, 2*1024*1024)
+	_, _ = rng.Read(largePayload)
+	origChunks, err := Split(largePayload, cfg)
+	if err != nil || len(origChunks) < 10 {
+		t.Fatalf("expected >= 10 chunks on 2MB payload, got %d (err=%v)", len(origChunks), err)
+	}
+
+	origSet := make(map[string]bool, len(origChunks))
+	for _, c := range origChunks {
+		origSet[c.SHA256] = true
+	}
+
+	// Mutate 32 bytes right in the middle (at 1 MB)
+	mutated := make([]byte, len(largePayload))
+	copy(mutated, largePayload)
+	for i := 1024 * 1024; i < 1024*1024+32; i++ {
+		mutated[i] ^= 0xFF
+	}
+
+	mutChunks, err := Split(mutated, cfg)
+	if err != nil {
+		t.Fatalf("Split mutated: %v", err)
+	}
+
+	unchangedCount := 0
+	for _, c := range mutChunks {
+		if origSet[c.SHA256] {
+			unchangedCount++
+		}
+	}
+	// At least len(origChunks)-2 chunks must remain 100% identical
+	if unchangedCount < len(origChunks)-2 {
+		t.Fatalf("localized middle edit altered too many chunks: only %d/%d chunks remained identical",
+			unchangedCount, len(origChunks))
+	}
+}
+

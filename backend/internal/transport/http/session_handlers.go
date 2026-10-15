@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"go-drive-clone/internal/auth"
+	wsSync "go-drive-clone/internal/sync"
 )
 
 type revokeSessionRequest struct {
@@ -85,6 +86,13 @@ func (s *Server) HandleRevokeSession(w http.ResponseWriter, r *http.Request) {
 	if s.hub != nil {
 		s.hub.KickSession(req.SessionID)
 	}
+	s.notifyUser(userID, wsSync.NotificationEvent{
+		Type: wsSync.EventForceLogout,
+		Payload: map[string]any{
+			"session_id": req.SessionID,
+			"reason":     "Your session has been revoked from another device.",
+		},
+	})
 
 	isCurrentRevoked := (req.SessionID == currentSessionID)
 
@@ -109,12 +117,21 @@ func (s *Server) HandleRevokeAllOtherSessions(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Fetch active sessions to know which ones to kick
+	// Fetch active sessions to know which ones to kick across local and remote cluster nodes
 	sessions, err := s.sessions.GetSessionsByUserID(r.Context(), userID)
-	if err == nil && s.hub != nil {
+	if err == nil {
 		for _, sess := range sessions {
 			if sess.ID != currentSessionID {
-				s.hub.KickSession(sess.ID)
+				if s.hub != nil {
+					s.hub.KickSession(sess.ID)
+				}
+				s.notifyUser(userID, wsSync.NotificationEvent{
+					Type: wsSync.EventForceLogout,
+					Payload: map[string]any{
+						"session_id": sess.ID,
+						"reason":     "Your session has been revoked from another device.",
+					},
+				})
 			}
 		}
 	}
@@ -161,8 +178,8 @@ func (s *Server) userAndSessionFromBearer(r *http.Request) (string, string, int,
 		if _, err := s.sessions.GetSessionByID(r.Context(), claims.SessionID); err != nil {
 			return "", "", http.StatusUnauthorized, "session has been revoked or expired"
 		}
-		// Touch session last_seen_at
-		_ = s.sessions.TouchSession(r.Context(), claims.SessionID)
+		// Touch session last_seen_at (debounced to 60s)
+		s.touchSessionDebounced(r.Context(), claims.SessionID)
 	}
 	return claims.UserID, claims.SessionID, 0, ""
 }

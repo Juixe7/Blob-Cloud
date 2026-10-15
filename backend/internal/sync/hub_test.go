@@ -2,8 +2,11 @@ package sync
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
+	stdsync "sync"
 	"testing"
 	"time"
 )
@@ -212,3 +215,80 @@ func TestShutdownIsIdempotent(t *testing.T) {
 func TestNoopNotifierSatisfiesInterface(t *testing.T) {
 	var _ Notifier = NoopNotifier()
 }
+
+// TestHub_ConcurrentTortureAndGoroutineLeakCheck hammers the Actor-model Hub
+// from 60 concurrent goroutines performing simultaneous Register, Unregister,
+// KickSession, GetActiveConnCount, and NotifyUser calls (including slow consumers
+// whose Send buffers saturate), then shuts down and verifies zero leaked goroutines.
+func TestHub_ConcurrentTortureAndGoroutineLeakCheck(t *testing.T) {
+	runtime.GC()
+	time.Sleep(10 * time.Millisecond)
+	baselineGoroutines := runtime.NumGoroutine()
+
+	h := NewHub(discardLogger())
+	runExited := make(chan struct{})
+	go func() {
+		defer close(runExited)
+		h.Run()
+	}()
+
+	const workers = 60
+	var wg stdsync.WaitGroup
+	startGate := make(chan struct{})
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			<-startGate
+
+			userID := fmt.Sprintf("user-%d", id%10)
+			sessionID := fmt.Sprintf("sess-%d", id)
+			// Mix normal clients (cap 16) and slow clients (cap 1) to exercise full-buffer drop path
+			bufCap := 16
+			if id%3 == 0 {
+				bufCap = 1
+			}
+			client := &Client{
+				UserID:    userID,
+				SessionID: sessionID,
+				Send:      make(chan []byte, bufCap),
+			}
+
+			h.Register(client)
+			for j := 0; j < 5; j++ {
+				h.NotifyUser(userID, NotificationEvent{
+					Type:    EventSyncDelta,
+					Payload: map[string]int{"worker": id, "iter": j},
+				})
+				_ = h.GetActiveConnCount(userID)
+			}
+			if id%5 == 0 {
+				h.KickSession(sessionID)
+			}
+			h.Unregister(client)
+			// Double unregister must be a safe no-op
+			h.Unregister(client)
+		}(i)
+	}
+
+	// Release all 60 goroutines simultaneously
+	close(startGate)
+	wg.Wait()
+
+	h.Shutdown()
+	select {
+	case <-runExited:
+	case <-time.After(time.Second):
+		t.Fatal("Hub.Run() goroutine did not exit after Shutdown()")
+	}
+
+	// Allow runtime scheduler to reap exited goroutines and verify no goroutine leak
+	time.Sleep(20 * time.Millisecond)
+	runtime.GC()
+	afterGoroutines := runtime.NumGoroutine()
+	if afterGoroutines > baselineGoroutines+2 {
+		t.Fatalf("goroutine leak detected: baseline=%d, after=%d", baselineGoroutines, afterGoroutines)
+	}
+}
+

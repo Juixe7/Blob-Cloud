@@ -42,10 +42,11 @@ type backplaneEnvelope struct {
 // The Hub itself is unchanged; it remains the single owner of local WebSocket
 // connections. The backplane is purely an inter-node routing layer.
 type RedisBackplane struct {
-	nodeID string
-	client *redis.Client
-	hub    *Hub
-	log    *slog.Logger
+	nodeID    string
+	client    *redis.Client
+	hub       *Hub
+	log       *slog.Logger
+	publishFn func(channel string, payload []byte) error
 }
 
 func generateNodeID() string {
@@ -67,6 +68,12 @@ func NewRedisBackplane(client *redis.Client, hub *Hub, log *slog.Logger) *RedisB
 	}
 }
 
+// WithPublishFunc overrides the raw Redis PUBLISH step (used in multi-node cluster tests).
+func (b *RedisBackplane) WithPublishFunc(fn func(channel string, payload []byte) error) *RedisBackplane {
+	b.publishFn = fn
+	return b
+}
+
 // NodeID returns this backplane instance's unique cluster node identifier.
 func (b *RedisBackplane) NodeID() string {
 	return b.nodeID
@@ -76,14 +83,25 @@ func (b *RedisBackplane) NodeID() string {
 // it to Redis so peer nodes can also deliver it to their local connections.
 // Implements the Notifier interface — drop-in replacement for *Hub.
 func (b *RedisBackplane) NotifyUser(userID string, event NotificationEvent) {
-	// 1. Local delivery: serve tabs connected to this node immediately.
-	b.hub.NotifyUser(userID, event)
+	// 1. Local delivery: serve tabs connected to this node immediately (if a local Hub is attached).
+	if b.hub != nil {
+		b.hub.NotifyUser(userID, event)
+	}
 
 	// 2. Remote delivery: publish so other nodes can serve their local tabs.
 	env := backplaneEnvelope{NodeID: b.nodeID, UserID: userID, Event: event}
 	payload, err := json.Marshal(env)
 	if err != nil {
 		b.log.Error("backplane: marshal envelope failed", "user_id", userID, "err", err)
+		return
+	}
+	if b.publishFn != nil {
+		if err := b.publishFn(redisChannel, payload); err != nil {
+			b.log.Warn("backplane: publish failed (local delivery was successful)", "user_id", userID, "err", err)
+		}
+		return
+	}
+	if b.client == nil {
 		return
 	}
 	if err := b.client.Publish(context.Background(), redisChannel, payload).Err(); err != nil {
@@ -120,8 +138,17 @@ func (b *RedisBackplane) Run(ctx context.Context) error {
 	}
 }
 
+// DispatchPayload routes a raw Pub/Sub JSON envelope through echo suppression and into the local Hub.
+func (b *RedisBackplane) DispatchPayload(payload string) {
+	b.dispatch(payload)
+}
+
 // dispatch decodes one Redis message and routes it to the local Hub if not from this node.
 func (b *RedisBackplane) dispatch(payload string) {
+	if b.hub == nil {
+		return
+	}
+
 	var env backplaneEnvelope
 	if err := json.Unmarshal([]byte(payload), &env); err != nil {
 		b.log.Error("backplane: malformed envelope, skipping", "payload", payload, "err", err)
@@ -132,6 +159,15 @@ func (b *RedisBackplane) dispatch(payload string) {
 	// local connections again since NotifyUser already delivered it locally on publication.
 	if env.NodeID != "" && env.NodeID == b.nodeID {
 		return
+	}
+
+	if env.Event.Type == EventForceLogout {
+		if m, ok := env.Event.Payload.(map[string]any); ok {
+			if sid, ok := m["session_id"].(string); ok && sid != "" {
+				b.hub.KickSession(sid)
+				return
+			}
+		}
 	}
 
 	b.hub.NotifyUser(env.UserID, env.Event)

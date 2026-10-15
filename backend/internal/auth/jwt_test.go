@@ -96,6 +96,59 @@ func TestVerifySecret(t *testing.T) {
 	}
 }
 
+// TestAlgNoneRejected verifies that an unsigned JWT with {"alg":"none"} is strictly rejected.
+func TestAlgNoneRejected(t *testing.T) {
+	claims := Claims{
+		UserID: "user-admin",
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Subject:   "user-admin",
+		},
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodNone, claims)
+	unsignedStr, err := tok.SignedString(jwt.UnsafeAllowNoneSignatureType)
+	if err != nil {
+		t.Fatalf("failed to craft alg:none token: %v", err)
+	}
+
+	_, err = ValidateToken(testSecret, unsignedStr)
+	if err == nil {
+		t.Fatal("SECURITY FAILURE: ValidateToken accepted an unsigned alg:none JWT")
+	}
+}
+
+// TestRefreshTokenFlagSeparation verifies that refresh tokens carry IsRefresh=true
+// while access tokens carry IsRefresh=false so refresh tokens cannot be replayed as Bearer access tokens.
+func TestRefreshTokenFlagSeparation(t *testing.T) {
+	accessTok, err := CreateTokenWithSession(testSecret, "user-10", "sess-abc")
+	if err != nil {
+		t.Fatalf("CreateTokenWithSession: %v", err)
+	}
+	accessClaims, err := ValidateToken(testSecret, accessTok)
+	if err != nil {
+		t.Fatalf("ValidateToken access: %v", err)
+	}
+	if accessClaims.IsRefresh {
+		t.Fatal("access token must have IsRefresh=false")
+	}
+	if accessClaims.SessionID != "sess-abc" {
+		t.Fatalf("SessionID = %q, want sess-abc", accessClaims.SessionID)
+	}
+
+	refreshTok, err := CreateRefreshTokenWithSession(testSecret, "user-10", "sess-abc")
+	if err != nil {
+		t.Fatalf("CreateRefreshTokenWithSession: %v", err)
+	}
+	refreshClaims, err := ValidateToken(testSecret, refreshTok)
+	if err != nil {
+		t.Fatalf("ValidateToken refresh: %v", err)
+	}
+	if !refreshClaims.IsRefresh {
+		t.Fatal("refresh token must have IsRefresh=true")
+	}
+}
+
 // testSign signs claims with the test secret for test helper purposes.
 func testSign(t *testing.T, claims jwt.Claims) string {
 	t.Helper()

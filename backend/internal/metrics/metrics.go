@@ -1,4 +1,4 @@
-﻿// Package metrics holds the Prometheus instrumentation for the entire
+// Package metrics holds the Prometheus instrumentation for the entire
 // blob-cloud backend. Declaring all metrics here — rather than scattered
 // across packages — gives one canonical place to read the full observable
 // surface of the system.
@@ -13,10 +13,13 @@ package metrics
 
 import (
 	"net/http"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+var initOnce sync.Once
 
 // Registry is the Prometheus registry shared by all instrumented components.
 // Callers obtain the HTTP handler via Handler().
@@ -114,24 +117,26 @@ var WSActiveConnections = prometheus.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of WebSocket connections currently held open by the hub.",
 })
 
-// Init registers all metrics with the private registry. Call once from main
-// before the HTTP server starts.
+// Init registers all metrics with the private registry. Safe to call multiple
+// times across tests and server startup via sync.Once.
 func Init() {
-	Registry.MustRegister(
-		HTTPRequestDuration,
-		HTTPRequestsTotal,
-		BlockDedupHits,
-		BlockDedupMisses,
-		UploadsInitiated,
-		UploadsCompleted,
-		WorkerJobsProcessed,
-		WorkerJobErrors,
-		WorkerJobDuration,
-		WSActiveConnections,
-		// Standard Go runtime and process collectors.
-		prometheus.NewGoCollector(),
-		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
-	)
+	initOnce.Do(func() {
+		Registry.MustRegister(
+			HTTPRequestDuration,
+			HTTPRequestsTotal,
+			BlockDedupHits,
+			BlockDedupMisses,
+			UploadsInitiated,
+			UploadsCompleted,
+			WorkerJobsProcessed,
+			WorkerJobErrors,
+			WorkerJobDuration,
+			WSActiveConnections,
+			// Standard Go runtime and process collectors.
+			prometheus.NewGoCollector(),
+			prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
+		)
+	})
 }
 
 // Handler returns an HTTP handler that serves /metrics from the private registry.

@@ -3,8 +3,11 @@ package gc_test
 import (
 	"context"
 	"errors"
-	"log/slog"
+	"fmt"
 	"io"
+	"log/slog"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -203,3 +206,164 @@ func TestCollector_SweepsAbandonedStaging(t *testing.T) {
 		t.Errorf("total deleted: want 2, got %d", len(deleter.deleted))
 	}
 }
+
+// concurrent3TableState models the 3-table reference check (file_blocks,
+// file_versions, and active upload session_blocks) alongside S3 block storage
+// while concurrent upload sessions and GC sweeps run in parallel.
+type concurrent3TableState struct {
+	mu             sync.RWMutex
+	storageObjects map[string]bool // "blocks/<hash>" -> present
+	fileBlocks     map[string]bool // active file_blocks hashes
+	versionBlocks  map[string]bool // historical file_versions hashes
+	sessionBlocks  map[string]bool // in-flight upload session_blocks hashes
+	deletedKeys    []string
+}
+
+func (s *concurrent3TableState) ListBlockKeys(_ context.Context) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys := make([]string, 0, len(s.storageObjects))
+	for k := range s.storageObjects {
+		keys = append(keys, k)
+	}
+	return keys, nil
+}
+
+// AllBlockHashes mirrors the production 3-table UNION query across
+// file_blocks, file_versions, and upload session_blocks.
+func (s *concurrent3TableState) AllBlockHashes(_ context.Context) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	union := make(map[string]struct{})
+	for h := range s.fileBlocks {
+		union[h] = struct{}{}
+	}
+	for h := range s.versionBlocks {
+		union[h] = struct{}{}
+	}
+	for h := range s.sessionBlocks {
+		union[h] = struct{}{}
+	}
+	out := make([]string, 0, len(union))
+	for h := range union {
+		out = append(out, h)
+	}
+	return out, nil
+}
+
+func (s *concurrent3TableState) DeleteObject(_ context.Context, key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.storageObjects, key)
+	s.deletedKeys = append(s.deletedKeys, key)
+	return nil
+}
+
+// TestCollector_ConcurrentGCVsInFlightUploadSessionsSafety runs continuous GC
+// sweeps concurrently with 30 simulated upload workers that transition blocks from
+// in-flight session_blocks -> committed file_blocks -> archived file_versions.
+// Verifies under -race that GC deletes true orphans while NEVER deleting any block
+// referenced by an in-flight upload session, active file, or historical version.
+func TestCollector_ConcurrentGCVsInFlightUploadSessionsSafety(t *testing.T) {
+	state := &concurrent3TableState{
+		storageObjects: make(map[string]bool),
+		fileBlocks:     make(map[string]bool),
+		versionBlocks:  make(map[string]bool),
+		sessionBlocks:  make(map[string]bool),
+	}
+
+	// Seed 10 true orphan blocks in S3 storage (not in any of the 3 DB tables)
+	for i := 0; i < 10; i++ {
+		state.storageObjects[fmt.Sprintf("blocks/orphan-hash-%02d", i)] = true
+	}
+	// Seed 10 pre-existing in-flight upload blocks (referenced ONLY in session_blocks!)
+	for i := 0; i < 10; i++ {
+		h := fmt.Sprintf("inflight-hash-%02d", i)
+		state.sessionBlocks[h] = true
+		state.storageObjects["blocks/"+h] = true
+	}
+
+	collector := gc.New(state, state, state, gc.Config{DryRun: false, MinBlockAge: time.Hour}, silentLog())
+
+	var wg sync.WaitGroup
+	startGate := make(chan struct{})
+
+	// Spawn 30 concurrent upload workers registering new in-flight blocks and promoting them
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			<-startGate
+
+			h := fmt.Sprintf("worker-block-%02d", workerID)
+			// CRITICAL ORDER: Upload session registers the hash in session_blocks FIRST,
+			// then promotes the physical object into blocks/<hash> before committing to file_blocks.
+			state.mu.Lock()
+			state.sessionBlocks[h] = true
+			state.storageObjects["blocks/"+h] = true
+			state.mu.Unlock()
+
+			time.Sleep(time.Millisecond)
+
+			// Transition from in-flight session_blocks -> active file_blocks (or versionBlocks)
+			state.mu.Lock()
+			if workerID%2 == 0 {
+				state.fileBlocks[h] = true
+			} else {
+				state.versionBlocks[h] = true
+			}
+			delete(state.sessionBlocks, h)
+			state.mu.Unlock()
+		}(i)
+	}
+
+	// Spawn concurrent GC sweeps running simultaneously while uploads are in flight
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-startGate
+		for sweep := 0; sweep < 15; sweep++ {
+			if _, err := collector.Run(context.Background()); err != nil {
+				t.Errorf("concurrent GC sweep %d failed: %v", sweep, err)
+			}
+		}
+	}()
+
+	close(startGate)
+	wg.Wait()
+
+	// Final sweep to ensure all true orphans were collected
+	if _, err := collector.Run(context.Background()); err != nil {
+		t.Fatalf("final GC sweep: %v", err)
+	}
+
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+
+	// 1. Verify NO protected block (in-flight, active file, or version) was ever deleted by GC
+	for _, deletedKey := range state.deletedKeys {
+		if !strings.HasPrefix(deletedKey, "blocks/orphan-hash-") {
+			t.Fatalf("CRITICAL DATA LOSS: GC deleted protected block %s during concurrent upload!", deletedKey)
+		}
+	}
+
+	// 2. Verify all 10 pre-seeded in-flight blocks and all 30 worker blocks survived in storage
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("blocks/inflight-hash-%02d", i)
+		if !state.storageObjects[key] {
+			t.Fatalf("in-flight session block %s was missing from storage after GC", key)
+		}
+	}
+	for i := 0; i < 30; i++ {
+		key := fmt.Sprintf("blocks/worker-block-%02d", i)
+		if !state.storageObjects[key] {
+			t.Fatalf("worker block %s was missing from storage after GC", key)
+		}
+	}
+
+	// 3. Verify all 10 true orphans were deleted
+	if len(state.deletedKeys) != 10 {
+		t.Fatalf("expected exactly 10 true orphans deleted, got %d (%v)", len(state.deletedKeys), state.deletedKeys)
+	}
+}
+

@@ -26,11 +26,18 @@ func (s *Server) HandleFileHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Auth gate — must be logged in.
-	_, code, msg := s.userFromBearer(r)
+	// Auth gate — must be logged in and authorised to read the file.
+	userID, code, msg := s.userFromBearer(r)
 	if code != 0 {
 		writeJSON(w, code, map[string]string{"error": msg})
 		return
+	}
+
+	if s.fileOps != nil {
+		if err := s.fileOps.AuthoriseRead(r.Context(), userID, fileID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
+			return
+		}
 	}
 
 	limit := 50

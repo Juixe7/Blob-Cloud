@@ -186,7 +186,7 @@ func (s *Server) HandleListPermissions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, code, msg := s.userFromBearer(r)
+	userID, code, msg := s.userFromBearer(r)
 	if code != 0 {
 		writeJSON(w, code, map[string]string{"error": msg})
 		return
@@ -196,6 +196,13 @@ func (s *Server) HandleListPermissions(w http.ResponseWriter, r *http.Request) {
 	if fileID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file id"})
 		return
+	}
+
+	if s.fileOps != nil {
+		if err := s.fileOps.AuthoriseRead(r.Context(), userID, fileID); err != nil {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
+			return
+		}
 	}
 
 	perms, err := s.perms.GetPermissionsByFile(r.Context(), fileID)

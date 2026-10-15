@@ -1,239 +1,123 @@
 package main
 
 import (
-	"crypto/rand"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"time"
+	"io"
+	"math/rand"
 
 	"go-drive-clone/internal/chunker"
 )
 
-// Scenario represents an edit pattern applied to a file.
-type Scenario struct {
-	Name        string
-	Description string
-	Mutate      func(base []byte) []byte
+// Simple chunk representation for testing deduplication
+type block struct {
+	hash string
+	size int
 }
 
-type ChunkerResult struct {
-	Strategy       string
-	TotalChunks    int
-	MatchedChunks  int
-	DedupRatio     float64
-	BandwidthSaved int64
-	TotalBytes     int64
-	Duration       time.Duration
-	ThroughputMBps float64
+// splitFixed slices data into fixed 4 MB blocks (standard S3 multipart style)
+func splitFixed(data []byte, blockSize int) []block {
+	var out []block
+	for i := 0; i < len(data); i += blockSize {
+		end := i + blockSize
+		if end > len(data) {
+			end = len(data)
+		}
+		sum := sha256.Sum256(data[i:end])
+		out = append(out, block{hash: hex.EncodeToString(sum[:]), size: end - i})
+	}
+	return out
+}
+
+// splitFastCDC slices data using our production FastCDC config (1 MB min, 4 MB avg, 8 MB max)
+func splitFastCDC(data []byte) []block {
+	c, err := chunker.NewChunker(bytes.NewReader(data), chunker.DefaultConfig())
+	if err != nil {
+		panic(err)
+	}
+	var out []block
+	for {
+		ch, err := c.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, block{hash: ch.SHA256, size: ch.Length})
+	}
+	return out
+}
+
+// measureReuse checks how many bytes of the edited file already exist in the CAS map
+func measureReuse(base, edited []block) (reusedChunks, totalChunks int, pctSaved float64, uploadedMB float64) {
+	cas := make(map[string]bool, len(base))
+	for _, b := range base {
+		cas[b.hash] = true
+	}
+
+	var savedBytes, totalBytes int
+	for _, b := range edited {
+		totalBytes += b.size
+		if cas[b.hash] {
+			reusedChunks++
+			savedBytes += b.size
+		}
+	}
+	pctSaved = float64(savedBytes) / float64(totalBytes) * 100
+	uploadedMB = float64(totalBytes-savedBytes) / (1024 * 1024)
+	return reusedChunks, len(edited), pctSaved, uploadedMB
 }
 
 func main() {
-	fmt.Println("================================================================================")
-	fmt.Println("📊 FastCDC vs Fixed-Size Chunking: Empirical Deduplication Benchmark")
-	fmt.Println("================================================================================")
-	fmt.Println("Evaluating shift-resistance, chunk alignment, and bandwidth savings across file edits.")
-	fmt.Println()
+	const mb = 1024 * 1024
+	rng := rand.New(rand.NewSource(42))
 
-	// Base file: 10 MiB of realistic pseudorandom data
-	fileSize := 10 * 1024 * 1024
-	baseData := make([]byte, fileSize)
-	if _, err := rand.Read(baseData); err != nil {
-		panic(err)
-	}
+	// Create a 100 MB base file
+	baseFile := make([]byte, 100*mb)
+	rng.Read(baseFile)
 
-	scenarios := []Scenario{
+	insertData := make([]byte, 64*1024) // 64 KB edit
+	rng.Read(insertData)
+
+	baseFixed := splitFixed(baseFile, 4*mb)
+	baseCDC := splitFastCDC(baseFile)
+
+	cases := []struct {
+		name string
+		data []byte
+	}{
 		{
-			Name:        "1-Byte Prepend (Byte-Shift Fallacy)",
-			Description: "Insert 1 byte at the start of a 10MB file (e.g. typing a character at top of file)",
-			Mutate: func(base []byte) []byte {
-				return append([]byte{0x58}, base...)
-			},
+			name: "1. Prepend 64 KB at start of 100 MB file",
+			data: append(append([]byte{}, insertData...), baseFile...),
 		},
 		{
-			Name:        "10-Byte Insertion (Mid-File)",
-			Description: "Insert a 10-byte code statement at offset 2MB",
-			Mutate: func(base []byte) []byte {
-				out := make([]byte, 0, len(base)+10)
-				out = append(out, base[:2*1024*1024]...)
-				out = append(out, []byte("// INSERT\n")...)
-				out = append(out, base[2*1024*1024:]...)
-				return out
-			},
+			name: "2. Insert 64 KB in middle (at 50 MB) of 100 MB file",
+			data: append(append([]byte{}, baseFile[:50*mb]...), append(insertData, baseFile[50*mb:]...)...),
 		},
 		{
-			Name:        "64-KB Block Replacement",
-			Description: "Replace a 64KB block in the middle (e.g. refactoring a function)",
-			Mutate: func(base []byte) []byte {
-				out := make([]byte, len(base))
-				copy(out, base)
-				patch := make([]byte, 64*1024)
-				_, _ = rand.Read(patch)
-				copy(out[4*1024*1024:], patch)
-				return out
-			},
-		},
-		{
-			Name:        "1-MB Append (EOF Growth)",
-			Description: "Append 1MB of new data to end of file (e.g. growing log file)",
-			Mutate: func(base []byte) []byte {
-				tail := make([]byte, 1024*1024)
-				_, _ = rand.Read(tail)
-				return append(base, tail...)
-			},
+			name: "3. Overwrite 64 KB in-place (at 50 MB) of 100 MB file",
+			data: func() []byte {
+				cp := make([]byte, len(baseFile))
+				copy(cp, baseFile)
+				copy(cp[50*mb:], insertData)
+				return cp
+			}(),
 		},
 	}
 
-	for _, s := range scenarios {
-		fmt.Printf("▶ SCENARIO: %s\n", s.Name)
-		fmt.Printf("  Context: %s\n", s.Description)
+	fmt.Println("=== 100 MB File Deduplication Test (Fixed 4MB vs FastCDC 1-8MB) ===")
+	for _, tc := range cases {
+		fmt.Printf("\n%s\n", tc.name)
 
-		mutated := s.Mutate(baseData)
+		fReused, fTotal, fPct, fUp := measureReuse(baseFixed, splitFixed(tc.data, 4*mb))
+		fmt.Printf("  Fixed 4MB : %2d/%2d chunks reused | %5.1f%% bandwidth saved | Re-uploaded: %5.1f MB\n",
+			fReused, fTotal, fPct, fUp)
 
-		// 1. Run Fixed Chunking (64KB and 4MB)
-		fixedRes := evalFixedChunking(baseData, mutated, 64*1024)
-		fixed4MRes := evalFixedChunking(baseData, mutated, 4*1024*1024)
-
-		// 2. Run FastCDC (Default: Min 1MB, Avg 4MB, Max 8MB)
-		fastcdcConfig := chunker.Config{
-			MinSize: 16 * 1024,
-			AvgSize: 64 * 1024,
-			MaxSize: 128 * 1024,
-		}
-		fastcdcRes := evalFastCDC(baseData, mutated, fastcdcConfig)
-
-		// Print comparison table
-		printTable([]ChunkerResult{fixedRes, fixed4MRes, fastcdcRes})
-		fmt.Println()
+		cReused, cTotal, cPct, cUp := measureReuse(baseCDC, splitFastCDC(tc.data))
+		fmt.Printf("  FastCDC   : %2d/%2d chunks reused | %5.1f%% bandwidth saved | Re-uploaded: %5.1f MB\n",
+			cReused, cTotal, cPct, cUp)
 	}
-
-	fmt.Println("================================================================================")
-	fmt.Println("🎯 Benchmark Summary & Architectural Takeaway")
-	fmt.Println("================================================================================")
-	fmt.Println("1. Fixed-Size Chunking collapses to 0.0% deduplication whenever an insertion or")
-	fmt.Println("   deletion causes a byte-shift, forcing 100% full re-uploads of subsequent blocks.")
-	fmt.Println("2. FastCDC Content-Defined Chunking with rolling Gear hashing quickly resynchronizes")
-	fmt.Println("   at the nearest content boundary, preserving > 95% of chunks across edits.")
-	fmt.Println("3. Result: Massive cloud storage egress, S3 PUT, and bandwidth cost reductions.")
-	fmt.Println("================================================================================")
-}
-
-func evalFixedChunking(base, mutated []byte, chunkSize int) ChunkerResult {
-	start := time.Now()
-
-	// Chunk base file
-	baseHashes := make(map[string]bool)
-	for i := 0; i < len(base); i += chunkSize {
-		end := i + chunkSize
-		if end > len(base) {
-			end = len(base)
-		}
-		h := sha256.Sum256(base[i:end])
-		baseHashes[hex.EncodeToString(h[:])] = true
-	}
-
-	// Chunk mutated file
-	var totalChunks, matchedChunks int
-	var savedBytes int64
-	for i := 0; i < len(mutated); i += chunkSize {
-		end := i + chunkSize
-		if end > len(mutated) {
-			end = len(mutated)
-		}
-		size := int64(end - i)
-		h := sha256.Sum256(mutated[i:end])
-		hexHash := hex.EncodeToString(h[:])
-		totalChunks++
-		if baseHashes[hexHash] {
-			matchedChunks++
-			savedBytes += size
-		}
-	}
-
-	duration := time.Since(start)
-	ratio := 0.0
-	if totalChunks > 0 {
-		ratio = (float64(matchedChunks) / float64(totalChunks)) * 100
-	}
-	throughput := (float64(len(mutated)) / (1024 * 1024)) / duration.Seconds()
-
-	strategy := fmt.Sprintf("Fixed-Size (%s)", formatBytes(int64(chunkSize)))
-	return ChunkerResult{
-		Strategy:       strategy,
-		TotalChunks:    totalChunks,
-		MatchedChunks:  matchedChunks,
-		DedupRatio:     ratio,
-		BandwidthSaved: savedBytes,
-		TotalBytes:     int64(len(mutated)),
-		Duration:       duration,
-		ThroughputMBps: throughput,
-	}
-}
-
-func evalFastCDC(base, mutated []byte, cfg chunker.Config) ChunkerResult {
-	start := time.Now()
-
-	baseChunks, _ := chunker.Split(base, cfg)
-	baseHashes := make(map[string]bool, len(baseChunks))
-	for _, c := range baseChunks {
-		baseHashes[c.SHA256] = true
-	}
-
-	mutatedChunks, _ := chunker.Split(mutated, cfg)
-	var matchedChunks int
-	var savedBytes int64
-	for _, c := range mutatedChunks {
-		if baseHashes[c.SHA256] {
-			matchedChunks++
-			savedBytes += int64(c.Length)
-		}
-	}
-
-	duration := time.Since(start)
-	ratio := 0.0
-	if len(mutatedChunks) > 0 {
-		ratio = (float64(matchedChunks) / float64(len(mutatedChunks))) * 100
-	}
-	throughput := (float64(len(mutated)) / (1024 * 1024)) / duration.Seconds()
-
-	return ChunkerResult{
-		Strategy:       "FastCDC (Gear Hash)",
-		TotalChunks:    len(mutatedChunks),
-		MatchedChunks:  matchedChunks,
-		DedupRatio:     ratio,
-		BandwidthSaved: savedBytes,
-		TotalBytes:     int64(len(mutated)),
-		Duration:       duration,
-		ThroughputMBps: throughput,
-	}
-}
-
-func printTable(results []ChunkerResult) {
-	fmt.Println("  ┌──────────────────────┬─────────────┬─────────────┬─────────────┬────────────────┬──────────────┐")
-	fmt.Println("  │ Strategy             │ Chunks Total│ CAS Hits    │ Dedup Ratio │ Bandwidth Saved│ Throughput   │")
-	fmt.Println("  ├──────────────────────┼─────────────┼─────────────┼─────────────┼────────────────┼──────────────┤")
-	for _, r := range results {
-		strat := fmt.Sprintf("%-20s", r.Strategy)
-		cTotal := fmt.Sprintf("%-11d", r.TotalChunks)
-		cHit := fmt.Sprintf("%-11d", r.MatchedChunks)
-		ratio := fmt.Sprintf("%-11.1f%%", r.DedupRatio)
-		saved := fmt.Sprintf("%-14s", formatBytes(r.BandwidthSaved))
-		tp := fmt.Sprintf("%-12.1f MB/s", r.ThroughputMBps)
-
-		fmt.Printf("  │ %s │ %s │ %s │ %s │ %s │ %s │\n", strat, cTotal, cHit, ratio, saved, tp)
-	}
-	fmt.Println("  └──────────────────────┴─────────────┴─────────────┴─────────────┴────────────────┴──────────────┘")
-}
-
-func formatBytes(b int64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }

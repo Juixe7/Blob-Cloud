@@ -225,7 +225,10 @@ func (h *Hub) handleNotify(msg notify) {
 
 // Register adds a client to the hub. Safe to call from any goroutine.
 func (h *Hub) Register(c *Client) {
-	h.register <- register{client: c}
+	select {
+	case h.register <- register{client: c}:
+	case <-h.done:
+	}
 }
 
 // Unregister removes a client. Double-unregister is a no-op.
@@ -239,12 +242,18 @@ func (h *Hub) Unregister(c *Client) {
 // NotifyUser sends an event to every active connection for userID.
 // Implements the Notifier interface.
 func (h *Hub) NotifyUser(userID string, event NotificationEvent) {
-	h.notify <- notify{userIDs: []string{userID}, event: event}
+	select {
+	case h.notify <- notify{userIDs: []string{userID}, event: event}:
+	case <-h.done:
+	}
 }
 
 // KickSession sends a FORCE_LOGOUT event to the specific session.
 func (h *Hub) KickSession(sessionID string) {
-	h.kickSession <- kickSession{sessionID: sessionID}
+	select {
+	case h.kickSession <- kickSession{sessionID: sessionID}:
+	case <-h.done:
+	}
 }
 
 // GetActiveConnCount returns the number of active WebSocket connections for userID.

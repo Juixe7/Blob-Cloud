@@ -1,9 +1,11 @@
-﻿package ratelimit_test
+package ratelimit_test
 
 import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -212,3 +214,57 @@ func TestMiddleware_IPIsolation(t *testing.T) {
 		t.Fatalf("2.2.2.2 first request: want 200, got %d", got)
 	}
 }
+
+// TestInMemoryLimiter_ConcurrentAtomicityUnderRace fires 100 goroutines at the
+// exact same instant against a token bucket with limit=20 for a single IP.
+// Verifies under -race that exactly 20 requests pass (200 OK) and 80 are rejected (429),
+// proving zero check-then-act race conditions in token deduction.
+func TestInMemoryLimiter_ConcurrentAtomicityUnderRace(t *testing.T) {
+	const limit = 20
+	const totalGoroutines = 100
+
+	l := ratelimit.NewInMemoryLimiter(limit, time.Hour)
+	cfg := ratelimit.NewZoneConfig(limit, time.Hour)
+	mw := ratelimit.Middleware(l, cfg)
+	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var allowedCount atomic.Int32
+	var deniedCount atomic.Int32
+	var wg sync.WaitGroup
+	startGate := make(chan struct{})
+
+	for i := 0; i < totalGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startGate
+
+			req := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+			req.RemoteAddr = "203.0.113.99:54321"
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			switch w.Code {
+			case http.StatusOK:
+				allowedCount.Add(1)
+			case http.StatusTooManyRequests:
+				deniedCount.Add(1)
+			default:
+				t.Errorf("unexpected status code: %d", w.Code)
+			}
+		}()
+	}
+
+	close(startGate)
+	wg.Wait()
+
+	if got := int(allowedCount.Load()); got != limit {
+		t.Fatalf("concurrent rate limiter atomicity failed: allowed=%d, want exactly %d", got, limit)
+	}
+	if got := int(deniedCount.Load()); got != totalGoroutines-limit {
+		t.Fatalf("concurrent rate limiter atomicity failed: denied=%d, want %d", got, totalGoroutines-limit)
+	}
+}
+

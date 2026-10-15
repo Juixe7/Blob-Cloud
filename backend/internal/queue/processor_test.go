@@ -23,12 +23,23 @@ import (
 // fakeFileRepo satisfies fileGetter. It returns a configured file for a known
 // id, or an error otherwise.
 type fakeFileRepo struct {
-	files         map[string]*domain.File
-	err           error // when set, GetByID always fails
-	updatedStatus map[string]string
+	files          map[string]*domain.File
+	err            error // when set, GetByID always fails
+	updatedStatus  map[string]string
+	updatedTags    map[string]*string
+	updatedSummary map[string]*string
+	insertedChunks map[string][]*domain.FileChunk
 }
 
 func (f *fakeFileRepo) UpdateAIMetadata(ctx context.Context, id string, tags, summary *string, embedding []float32) error {
+	if f.updatedTags == nil {
+		f.updatedTags = make(map[string]*string)
+	}
+	if f.updatedSummary == nil {
+		f.updatedSummary = make(map[string]*string)
+	}
+	f.updatedTags[id] = tags
+	f.updatedSummary[id] = summary
 	return nil
 }
 
@@ -41,6 +52,12 @@ func (f *fakeFileRepo) UpdateStatus(ctx context.Context, id string, status strin
 }
 
 func (f *fakeFileRepo) InsertFileChunks(ctx context.Context, chunks []*domain.FileChunk) error {
+	if f.insertedChunks == nil {
+		f.insertedChunks = make(map[string][]*domain.FileChunk)
+	}
+	if len(chunks) > 0 {
+		f.insertedChunks[chunks[0].FileID] = chunks
+	}
 	return nil
 }
 
@@ -415,5 +432,111 @@ func TestProcessMessage_NonImageNonDocSkipsAssembly(t *testing.T) {
 	}
 	if fakeFiles.updatedStatus["zip-1"] != "ACTIVE" {
 		t.Fatalf("expected status to be set to ACTIVE, got: %s", fakeFiles.updatedStatus["zip-1"])
+	}
+}
+
+type fakeAIClient struct {
+	summary          string
+	tags             []string
+	embedding        []float32
+	calledDocSummary bool
+}
+
+func (m *fakeAIClient) GetTextEmbedding(_ context.Context, _ string) ([]float32, error) {
+	return m.embedding, nil
+}
+func (m *fakeAIClient) GenerateImageTags(_ context.Context, _ []byte) ([]string, error) {
+	return m.tags, nil
+}
+func (m *fakeAIClient) GenerateDocumentSummary(_ context.Context, text string) (string, []string, error) {
+	m.calledDocSummary = true
+	return m.summary, m.tags, nil
+}
+
+func TestProcessMessage_DocumentWithAIClientGeneratesSummaryAndTags(t *testing.T) {
+	fakeFiles := &fakeFileRepo{
+		files: map[string]*domain.File{
+			"doc-1": {
+				ID:        "doc-1",
+				UserID:    "u1",
+				Name:      "thesis.txt",
+				SizeBytes: 100,
+			},
+		},
+	}
+	storage := newMemStorage()
+	storage.objects["blocks/hash-doc"] = []byte("Quantum computing leverages superposition and entanglement to perform calculations.")
+	fakeBlocks := &fakeBlockRepo{hashes: map[string][]string{"doc-1": {"hash-doc"}}}
+	mockAI := &fakeAIClient{
+		summary:   "A detailed overview of quantum computing and superposition.",
+		tags:      []string{"quantum", "physics"},
+		embedding: []float32{0.1, 0.2, 0.3},
+	}
+
+	proc := &FileProcessor{
+		files:    fakeFiles,
+		blocks:   fakeBlocks,
+		storage:  storage,
+		aiClient: mockAI,
+		log:      testLogger(),
+	}
+
+	err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "doc-1", UserID: "u1"})
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	if !mockAI.calledDocSummary {
+		t.Fatal("expected GenerateDocumentSummary to be called, but it was not")
+	}
+
+	gotSummary := fakeFiles.updatedSummary["doc-1"]
+	if gotSummary == nil || *gotSummary != mockAI.summary {
+		t.Fatalf("expected summary %q, got %v", mockAI.summary, gotSummary)
+	}
+
+	gotTags := fakeFiles.updatedTags["doc-1"]
+	if gotTags == nil || *gotTags != "quantum, physics" {
+		t.Fatalf("expected tags 'quantum, physics', got %v", gotTags)
+	}
+
+	chunks := fakeFiles.insertedChunks["doc-1"]
+	if len(chunks) == 0 {
+		t.Fatal("expected RAG chunks to be inserted, got 0")
+	}
+}
+
+func TestProcessMessage_MissingAIClientLeavesSummaryNull(t *testing.T) {
+	fakeFiles := &fakeFileRepo{
+		files: map[string]*domain.File{
+			"doc-2": {
+				ID:        "doc-2",
+				UserID:    "u1",
+				Name:      "resume.pdf",
+				SizeBytes: 100,
+			},
+		},
+	}
+	storage := newMemStorage()
+	storage.objects["blocks/hash-pdf"] = []byte("%PDF-1.4 dummy pdf bytes")
+	fakeBlocks := &fakeBlockRepo{hashes: map[string][]string{"doc-2": {"hash-pdf"}}}
+
+	// Note: aiClient is nil (exactly like when GEMINI_API_KEY is not configured in Lambda)
+	proc := &FileProcessor{
+		files:    fakeFiles,
+		blocks:   fakeBlocks,
+		storage:  storage,
+		aiClient: nil,
+		log:      testLogger(),
+	}
+
+	err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "doc-2", UserID: "u1"})
+	if err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+
+	// Because aiClient was nil, UpdateAIMetadata was never invoked and summary is NOT set
+	if fakeFiles.updatedSummary["doc-2"] != nil {
+		t.Fatalf("expected summary to remain nil when aiClient is nil, got %v", *fakeFiles.updatedSummary["doc-2"])
 	}
 }

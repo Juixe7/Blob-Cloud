@@ -4,6 +4,7 @@
 package httpx
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,13 @@ import (
 // the audit package directly (keeps the dependency graph clean).
 type auditLogger = audit.Logger
 
+// JournalStore abstracts the delta-sync journal repository for HTTP handlers.
+// *postgresrepo.JournalRepository satisfies this interface directly.
+type JournalStore interface {
+	GetLatestCursor(ctx context.Context, userID string) (int64, error)
+	ListSince(ctx context.Context, userID string, sinceCursor int64, limit int) ([]*domain.JournalEntry, int64, bool, error)
+}
+
 // Server bundles handler dependencies. It is passed to route registration so
 // every handler shares the same injected storage provider and logger.
 type Server struct {
@@ -37,16 +45,16 @@ type Server struct {
 	// Phase 3: orchestration + sharing. These are nil when the DB is
 	// unavailable (dev, storage-only mode); the upload/share handlers then
 	// return 503 Service Unavailable.
-	uploads *service.UploadService
-	perms   *postgresrepo.PermissionRepository
-	users   *postgresrepo.UserRepository
+	uploads  *service.UploadService
+	perms    *postgresrepo.PermissionRepository
+	users    *postgresrepo.UserRepository
 	sessions *postgresrepo.SessionRepository
 	// Phase 7.4: file operations (rename, move, delete, download). nil when
 	// the DB is unavailable.
 	fileOps *service.FileService
-	files    *postgresrepo.FileRepository
-	blocks   *postgresrepo.BlockRepository
-	zipOps   *service.ZipService
+	files   *postgresrepo.FileRepository
+	blocks  *postgresrepo.BlockRepository
+	zipOps  *service.ZipService
 	shares  *postgresrepo.ShareableLinkRepository
 	// Phase 6: real-time layer. hub is nil when WS notifications aren't
 	// configured; the WS handler then returns 503.
@@ -60,8 +68,8 @@ type Server struct {
 	// Tier 2F: structured audit log. Falls back to audit.NoopLogger{} when
 	// the DB is absent so handlers always have a non-nil logger to call.
 	auditLog auditLogger
-	// Phase 2: Delta Sync Engine journal repository
-	journal *postgresrepo.JournalRepository
+	// Phase 2: Delta Sync Engine journal store
+	journal JournalStore
 }
 
 // NewServer constructs a Server with its dependencies injected.
@@ -170,7 +178,7 @@ func (s *Server) WithAudit(l audit.Logger) *Server {
 }
 
 // WithJournal wires the delta sync journal repository.
-func (s *Server) WithJournal(journal *postgresrepo.JournalRepository) *Server {
+func (s *Server) WithJournal(journal JournalStore) *Server {
 	s.journal = journal
 	return s
 }

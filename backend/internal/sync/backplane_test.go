@@ -1,4 +1,4 @@
-﻿package sync_test
+package sync_test
 
 import (
 	"context"
@@ -135,3 +135,80 @@ func TestHub_NotifyUser_UnknownUser(t *testing.T) {
 		t.Fatal("NotifyUser for unknown user blocked or panicked")
 	}
 }
+
+// TestBackplane_MultiNodeClusterEchoSuppressionAndFanout simulates a 3-node API cluster
+// (Node A, Node B, Node C) connected over a shared Pub/Sub bus where every published message
+// is broadcast to ALL 3 nodes (including the sender node).
+// Verifies under -race that:
+//  1. Each node's unique node_id suppresses self-echoes (tabs on the publishing node receive 1 message, not 2).
+//  2. Peer nodes receive and forward the event to their local tabs.
+//  3. Concurrent cross-node broadcasts deliver the exact expected count with zero duplicates or drops.
+func TestBackplane_MultiNodeClusterEchoSuppressionAndFanout(t *testing.T) {
+	hubA := newTestHub(t)
+	hubB := newTestHub(t)
+	hubC := newTestHub(t)
+
+	bpA := wsSync.NewRedisBackplane(nil, hubA, discardLogger())
+	bpB := wsSync.NewRedisBackplane(nil, hubB, discardLogger())
+	bpC := wsSync.NewRedisBackplane(nil, hubC, discardLogger())
+
+	if bpA.NodeID() == "" || bpA.NodeID() == bpB.NodeID() || bpB.NodeID() == bpC.NodeID() {
+		t.Fatalf("expected 3 distinct non-empty node IDs, got %q, %q, %q", bpA.NodeID(), bpB.NodeID(), bpC.NodeID())
+	}
+
+	nodes := []*wsSync.RedisBackplane{bpA, bpB, bpC}
+	// Shared in-memory Pub/Sub bus: every PUBLISH fans out to all 3 nodes (including the publisher!)
+	busPublish := func(_ string, payload []byte) error {
+		raw := string(payload)
+		for _, n := range nodes {
+			n.DispatchPayload(raw)
+		}
+		return nil
+	}
+	bpA.WithPublishFunc(busPublish)
+	bpB.WithPublishFunc(busPublish)
+	bpC.WithPublishFunc(busPublish)
+
+	// Register 1 WebSocket tab for "user-cluster" on each of the 3 nodes
+	clientA := &wsSync.Client{UserID: "user-cluster", Send: make(chan []byte, 128)}
+	clientB := &wsSync.Client{UserID: "user-cluster", Send: make(chan []byte, 128)}
+	clientC := &wsSync.Client{UserID: "user-cluster", Send: make(chan []byte, 128)}
+	hubA.Register(clientA)
+	hubB.Register(clientB)
+	hubC.Register(clientC)
+	time.Sleep(15 * time.Millisecond)
+
+	// Fire 30 concurrent events (10 published on Node A, 10 on Node B, 10 on Node C)
+	const eventsPerNode = 10
+	done := make(chan struct{}, len(nodes)*eventsPerNode)
+	for _, bp := range nodes {
+		node := bp
+		for i := 0; i < eventsPerNode; i++ {
+			go func(seq int) {
+				node.NotifyUser("user-cluster", wsSync.NotificationEvent{
+					Type:    wsSync.EventSyncDelta,
+					Payload: map[string]int{"seq": seq},
+				})
+				done <- struct{}{}
+			}(i)
+		}
+	}
+
+	for i := 0; i < len(nodes)*eventsPerNode; i++ {
+		<-done
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	wantTotal := len(nodes) * eventsPerNode // 30 total events
+	for name, ch := range map[string]chan []byte{
+		"NodeA-client": clientA.Send,
+		"NodeB-client": clientB.Send,
+		"NodeC-client": clientC.Send,
+	} {
+		got := len(ch)
+		if got != wantTotal {
+			t.Fatalf("%s received %d messages, want %d (echo suppression or fan-out broken)", name, got, wantTotal)
+		}
+	}
+}
+

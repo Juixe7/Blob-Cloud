@@ -19,11 +19,11 @@ jobs:
       with:
         go-version: '1.23' # Matches standard backend compilation targets
 
-    - name: Run Go Tests
+    - name: Run Go Tests (with Race Detector)
       run: |
         cd backend
         go vet ./...
-        go test -v ./... # Runs all unit tests (automatically skips integration tests requiring live DB)
+        go test -race -v ./... # Runs all unit, security, concurrency & latency tests under Go ThreadSanitizer (-race)
 
     # --- Frontend CI ---
     - name: Set up Node.js

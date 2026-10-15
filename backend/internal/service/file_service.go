@@ -18,15 +18,55 @@ import (
 	wsSync "go-drive-clone/internal/sync"
 )
 
+// UserStore defines the user lookup operations used by FileService.
+type UserStore interface {
+	GetByID(ctx context.Context, id string) (*domain.User, error)
+}
+
+// FileStore defines the file metadata persistence operations used by FileService.
+type FileStore interface {
+	GetByID(ctx context.Context, id string) (*domain.File, error)
+	GetResolvedPermission(ctx context.Context, fileID string, userEmail string) (string, error)
+	GetFileByNameAndParent(ctx context.Context, userID, name string, parentID *string) (*domain.File, error)
+	GetFolderByNameAndParent(ctx context.Context, userID, name string, parentID *string) (*domain.File, error)
+	Create(ctx context.Context, file *domain.File) error
+	Update(ctx context.Context, file *domain.File) error
+	SoftDelete(ctx context.Context, id, userID string) error
+	Restore(ctx context.Context, id, userID string) error
+	ListTrash(ctx context.Context, userID string) ([]*domain.File, error)
+	DeleteRecursive(ctx context.Context, rootID, userID string) (int64, []string, error)
+	ListDirectory(ctx context.Context, userID string, parentID *string) ([]*domain.File, error)
+	ListSharedWithUser(ctx context.Context, userEmail string, userID string) ([]*domain.File, error)
+	GetUserStorageUsage(ctx context.Context, userID string) (*domain.UserStorageUsage, error)
+	BulkSoftDelete(ctx context.Context, ids []string, userID string) error
+	BulkRestore(ctx context.Context, ids []string, userID string) error
+	BulkMove(ctx context.Context, ids []string, parentID *string, userID string) error
+	BulkHardDelete(ctx context.Context, ids []string, userID string) (int64, []string, error)
+	WithTx(tx postgresrepo.DBTX) *postgresrepo.FileRepository
+}
+
+// BlockStore defines the block listing operations used by FileService.
+type BlockStore interface {
+	ListFileBlockHashes(ctx context.Context, fileID string) ([]string, error)
+	ListFileBlocks(ctx context.Context, fileID string) ([]*domain.Block, error)
+}
+
+// PermissionStore defines the permission verification operations used by FileService.
+type PermissionStore interface {
+	CheckUserPermission(ctx context.Context, fileID, userEmail string, requiredRoles []string) (bool, error)
+	FindCollaboratorUserIDs(ctx context.Context, fileID string) ([]string, error)
+	WithTx(tx postgresrepo.DBTX) *postgresrepo.PermissionRepository
+}
+
 // FileService orchestrates file-level operations: rename, move, delete, and
 // download. It validates permissions before mutating metadata and handles
 // garbage collection of orphaned S3 blocks after recursive deletes.
 type FileService struct {
 	db       *sql.DB
-	users    *postgresrepo.UserRepository
-	files    *postgresrepo.FileRepository
-	blocks   *postgresrepo.BlockRepository
-	perms    *postgresrepo.PermissionRepository
+	users    UserStore
+	files    FileStore
+	blocks   BlockStore
+	perms    PermissionStore
 	storage  domain.StorageProvider
 	journal  *postgresrepo.JournalRepository
 	notifier wsSync.Notifier
@@ -36,10 +76,10 @@ type FileService struct {
 // NewFileService wires the service with all the repositories it needs.
 func NewFileService(
 	db *sql.DB,
-	users *postgresrepo.UserRepository,
-	files *postgresrepo.FileRepository,
-	blocks *postgresrepo.BlockRepository,
-	perms *postgresrepo.PermissionRepository,
+	users UserStore,
+	files FileStore,
+	blocks BlockStore,
+	perms PermissionStore,
 	storage domain.StorageProvider,
 	log *slog.Logger,
 ) *FileService {
@@ -561,7 +601,7 @@ func (s *FileService) CreateFolder(ctx context.Context, userID, name string, par
 	return folder, wasNew, nil
 }
 
-// ListDirectory returns the immediate children of parentID (or the user's root
+// // ListDirectory returns the immediate children of parentID (or the user's root
 // when parentID is nil). Folders are returned first, then files, alphabetically
 // — the ordering is enforced by the repository's ORDER BY clause.
 func (s *FileService) ListDirectory(ctx context.Context, userID string, parentID *string) ([]*domain.File, error) {
@@ -571,6 +611,9 @@ func (s *FileService) ListDirectory(ctx context.Context, userID string, parentID
 
 	var targetParentID = parentID
 	if parentID != nil {
+		if err := s.AuthoriseRead(ctx, userID, *parentID); err != nil {
+			return nil, err
+		}
 		parent, err := s.files.GetByID(ctx, *parentID)
 		if err == nil {
 			if parent.TargetID != nil && *parent.TargetID != "" {
@@ -591,6 +634,10 @@ func (s *FileService) ListDirectory(ctx context.Context, userID string, parentID
 		user, err := s.users.GetByID(ctx, userID)
 		if err == nil {
 			role, err := s.files.GetResolvedPermission(ctx, *targetParentID, user.Email)
+			if err != nil && errors.Is(err, domain.ErrPermissionNotFound) {
+				role = domain.RoleViewer
+				err = nil
+			}
 			if err == nil {
 				for _, item := range items {
 					item.Role = role
@@ -766,7 +813,7 @@ func logNilStr(s *string) string {
 // checking permissions. It is used by the HTTP handlers so the
 // permission-check boilerplate stays DRY.
 
-// AuthoriseRead checks that userID holds VIEWER, EDITOR, or OWNER on fileID (directly or via parent inheritance).
+// AuthoriseRead checks that userID holds VIEWER, EDITOR, or OWNER on fileID (directly, via parent inheritance, or via an active public link shortcut).
 func (s *FileService) AuthoriseRead(ctx context.Context, userID, fileID string) error {
 	file, err := s.files.GetByID(ctx, fileID)
 	if err == nil {
@@ -781,6 +828,10 @@ func (s *FileService) AuthoriseRead(ctx context.Context, userID, fileID string) 
 		if file.UserID == userID {
 			return nil
 		}
+		// If a non-owner tries to access a soft-deleted or quarantined target file, deny immediately.
+		if file.DeletedAt != nil || file.Status == "TRASHED" || file.Status == "QUARANTINED" {
+			return fmt.Errorf("access denied: file is unavailable")
+		}
 	}
 
 	user, err := s.users.GetByID(ctx, userID)
@@ -791,6 +842,13 @@ func (s *FileService) AuthoriseRead(ctx context.Context, userID, fileID string) 
 	role, err := s.files.GetResolvedPermission(ctx, fileID, user.Email)
 	if err != nil {
 		if errors.Is(err, domain.ErrPermissionNotFound) {
+			if linkChecker, ok := s.files.(interface {
+				HasPublicLinkOrShortcutAccess(ctx context.Context, userID, fileID string) (bool, error)
+			}); ok {
+				if allowed, lErr := linkChecker.HasPublicLinkOrShortcutAccess(ctx, userID, fileID); lErr == nil && allowed {
+					return nil
+				}
+			}
 			return fmt.Errorf("access denied: %s", user.Email)
 		}
 		return fmt.Errorf("permission check: %w", err)
