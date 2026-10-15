@@ -639,9 +639,13 @@ func (s *FileService) ListDirectory(ctx context.Context, userID string, parentID
 				err = nil
 			}
 			if err == nil {
-				for _, item := range items {
-					item.Role = role
+				cloned := make([]*domain.File, len(items))
+				for i, item := range items {
+					c := *item
+					c.Role = role
+					cloned[i] = &c
 				}
+				items = cloned
 			}
 		}
 	}

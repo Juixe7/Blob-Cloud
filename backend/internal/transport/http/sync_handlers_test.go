@@ -554,11 +554,18 @@ func TestMetadataAndSyncRead_5msP95LatencyAndPrometheusBucketProof(t *testing.T)
 	t.Logf("Prometheus histogram verification: %.0f / %.0f (%.2f%%) of GET /api/sync/delta requests fell in le=\"0.005\" (<=5ms) bucket",
 		syncBucket5ms, syncTotalCount, under5msRatio)
 
-	if under5msRatio < 90.0 {
-		t.Fatalf("expected >= 90%% of GET /api/sync/delta requests in Prometheus le=\"0.005\" (<=5ms) bucket, got %.2f%%", under5msRatio)
+	minRatio := 90.0
+	maxP95 := 25 * time.Millisecond
+	if raceDetectorEnabled {
+		minRatio = 70.0
+		maxP95 = 150 * time.Millisecond
 	}
-	if syncP95 > 25*time.Millisecond {
-		t.Fatalf("GET /api/sync/delta outer p95 exceeded bound under parallel test load: got %v", syncP95)
+
+	if under5msRatio < minRatio {
+		t.Fatalf("expected >= %.0f%% of GET /api/sync/delta requests in Prometheus le=\"0.005\" (<=5ms) bucket, got %.2f%%", minRatio, under5msRatio)
+	}
+	if syncP95 > maxP95 {
+		t.Fatalf("GET /api/sync/delta outer p95 exceeded bound under parallel test load: got %v (max allowed: %v)", syncP95, maxP95)
 	}
 }
 
