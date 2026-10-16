@@ -12,14 +12,15 @@ import (
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 )
 
-// ZipService handles on-the-fly zip packaging and block-by-block streaming.
+// ZipService coordinates on-the-fly ZIP archive packaging and block-by-block streaming.
+// It bypasses temporary disk spooling, streaming Deflate-compressed streams directly to clients.
 type ZipService struct {
 	files   *postgresrepo.FileRepository
 	blocks  *postgresrepo.BlockRepository
 	storage domain.StorageProvider
 }
 
-// NewZipService constructs a ZipService with its dependencies.
+// NewZipService constructs a ZipService wired with its metadata and storage dependencies.
 func NewZipService(
 	files *postgresrepo.FileRepository,
 	blocks *postgresrepo.BlockRepository,
@@ -32,7 +33,23 @@ func NewZipService(
 	}
 }
 
-// StreamItemsZip aggregates multiple files and folders recursively, compresses them, and streams the ZIP file to w in real-time.
+// StreamItemsZip recursively aggregates multiple files and directory hierarchies, Deflate-compresses
+// their underlying CAS blocks sequentially, and streams the resulting ZIP archive directly to w in real-time.
+//
+// Streaming Performance & Memory Safety:
+//   - Zero Disk Spooling: Avoids intermediate file creation on server local storage.
+//   - Constant Memory Bound: Reads blocks in small buffers (typically 64 KiB), maintaining an $O(1)$ memory footprint
+//     regardless of whether the aggregated archive is 10 MiB or 50 GiB.
+//   - Shortcut Transparency: Seamlessly dereferences virtual shortcut entities to stream target file blocks.
+//
+// Parameters:
+//   - ctx: Context carrying client disconnection and deadline cancellations.
+//   - ids: Slice of file or directory UUIDs selected for batch download.
+//   - userID: Authenticated user ID whose permissions govern subtree access.
+//   - w: Target io.Writer (typically an http.ResponseWriter configured with chunked transfer).
+//
+// Returns:
+//   - error: Nil on successful stream completion, or an error if client disconnects or block read fails.
 func (s *ZipService) StreamItemsZip(ctx context.Context, ids []string, userID string, w io.Writer) error {
 	// 1. Retrieve the list of ZippableItem items for the target folder.
 	zippables, err := s.files.GetSubtreeForItems(ctx, ids, userID)

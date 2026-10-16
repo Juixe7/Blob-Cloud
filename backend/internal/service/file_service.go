@@ -228,21 +228,58 @@ func (r *RenameMoveRequest) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// GetFile exposes the file repository's GetByID method.
+// GetFile fetches a single file or folder metadata record by its unique ID.
+// Note: This is an internal lookup primitive that bypasses permission checks.
+// Callers must use AuthoriseRead or AuthoriseWrite before exposing data to clients.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - id: Primary key UUID of the target file or directory.
+//
+// Returns:
+//   - *domain.File: Populated file domain model.
+//   - error: Nil on success, or domain.ErrFileNotFound if the record does not exist.
 func (s *FileService) GetFile(ctx context.Context, id string) (*domain.File, error) {
 	return s.files.GetByID(ctx, id)
 }
 
-// GetResolvedPermission exposes the file repository's GetResolvedPermission method.
+// GetResolvedPermission traverses the directory tree upward to determine the effective ACL role
+// granted to a user on a given file or folder (evaluating direct grants, parent inheritance, and ownership).
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - fileID: Target file or folder UUID.
+//   - userEmail: Normalized email address of the user whose permissions are evaluated.
+//
+// Returns:
+//   - string: Effective role constant (domain.RoleOwner, domain.RoleEditor, or domain.RoleViewer).
+//   - error: Nil on success, or domain.ErrPermissionNotFound if no access has been granted.
 func (s *FileService) GetResolvedPermission(ctx context.Context, fileID string, userEmail string) (string, error) {
 	return s.files.GetResolvedPermission(ctx, fileID, userEmail)
 }
 
-// RenameMove changes a file/folder's name and/or parent_id after verifying the
-// requesting user holds EDITOR or OWNER permissions. It also guards against
-// parent-cycle corruption (moving a folder into itself or a descendant).
+// RenameMove changes a file/folder's display name and/or relocates it to a new parent folder.
 //
-// Returns the updated File metadata on success.
+// Architecture & Business Rules:
+//  1. Permissions: Validates that the requesting user holds OWNER or EDITOR permissions.
+//  2. Golden Rule Fallback: If a non-owner (or EDITOR moving a folder) attempts a physical move
+//     on a shared file, the system creates a personalized shortcut in the user's destination
+//     rather than disrupting the canonical hierarchy for collaborators.
+//  3. Cycle Rejection: Disallows moving a directory into itself or any of its descendants ($O(1)$ prefix check).
+//  4. Materialized Path Updates: Relocating a folder atomically updates the path prefix of all
+//     descendants via a single substring replacement SQL query without recursive locks.
+//  5. Transactional Outbox: Commits the metadata mutation and emits a monotonic journal event
+//     with real-time WebSocket notification to all active collaborators.
+//
+// Parameters:
+//   - ctx: Context carrying request deadlines and cancellation signals.
+//   - userID: Authenticated user ID executing the request.
+//   - fileID: Target file or directory UUID.
+//   - req: RenameMoveRequest specifying new name and/or parent folder target.
+//
+// Returns:
+//   - *domain.File: The modified file entity (or newly created shortcut in Golden Rule fallback).
+//   - error: Nil on success, or validation/authorization/conflict error on failure.
 func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req RenameMoveRequest) (*domain.File, error) {
 	if userID == "" || fileID == "" {
 		return nil, fmt.Errorf("user_id and file_id are required")
@@ -374,9 +411,21 @@ type DeleteResult struct {
 	GCBlocks int `json:"gc_blocks,omitempty"`
 }
 
-// SoftDelete soft-deletes a file/folder/shortcut and all descendants (setting deleted_at = CURRENT_TIMESTAMP).
-// If the requesting user owns the record (file.UserID == userID), permission is granted directly.
-// Otherwise, verifies that the requesting user holds OWNER or EDITOR permission on the shared file.
+// SoftDelete moves a file, directory, or shortcut (and all its descendants) to the Trash
+// by stamping `deleted_at = CURRENT_TIMESTAMP`. Physical storage blocks in S3 remain intact.
+//
+// Authorization:
+//   - If the caller is the direct owner (file.UserID == userID), soft delete is granted immediately.
+//   - If the file is shared, the caller must hold OWNER or EDITOR permissions.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID requesting the soft delete.
+//   - fileID: Target file or directory UUID.
+//
+// Returns:
+//   - *DeleteResult: Operation outcome payload.
+//   - error: Nil on success, or authorization/not-found error.
 func (s *FileService) SoftDelete(ctx context.Context, userID, fileID string) (*DeleteResult, error) {
 	if userID == "" || fileID == "" {
 		return nil, fmt.Errorf("user_id and file_id are required")
@@ -417,9 +466,21 @@ func (s *FileService) SoftDelete(ctx context.Context, userID, fileID string) (*D
 	}, nil
 }
 
-// Restore restores a soft-deleted file/folder and all descendants (setting deleted_at = NULL).
-// If the requesting user owns the record (file.UserID == userID), permission is granted directly.
-// Otherwise, verifies that the requesting user holds OWNER or EDITOR permission on the shared file.
+// Restore recovers a soft-deleted file, folder, or shortcut (and all its descendants)
+// from the Trash by resetting `deleted_at = NULL`.
+//
+// Authorization:
+//   - If the caller owns the file, restore is granted immediately.
+//   - For shared files, the caller must hold OWNER or EDITOR permissions.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID executing the restoration.
+//   - fileID: Target file or folder UUID to restore.
+//
+// Returns:
+//   - *DeleteResult: Confirmation status payload.
+//   - error: Nil on success, or domain.ErrFileNotFound / permission error.
 func (s *FileService) Restore(ctx context.Context, userID, fileID string) (*DeleteResult, error) {
 	if userID == "" || fileID == "" {
 		return nil, fmt.Errorf("user_id and file_id are required")
@@ -460,7 +521,15 @@ func (s *FileService) Restore(ctx context.Context, userID, fileID string) (*Dele
 	}, nil
 }
 
-// ListTrash returns soft-deleted items owned by the user.
+// ListTrash returns all active soft-deleted items (files, folders, shortcuts) owned by userID.
+//
+// Parameters:
+//   - ctx: Context carrying request tracing.
+//   - userID: Authenticated user ID whose trash contents are retrieved.
+//
+// Returns:
+//   - []*domain.File: Slices of soft-deleted file entities ordered by deleted_at DESC.
+//   - error: Nil on success, or database query error.
 func (s *FileService) ListTrash(ctx context.Context, userID string) ([]*domain.File, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("user_id is required")
@@ -468,13 +537,27 @@ func (s *FileService) ListTrash(ctx context.Context, userID string) ([]*domain.F
 	return s.files.ListTrash(ctx, userID)
 }
 
-// Delete is an alias for SoftDelete to support standard delete routes.
+// Delete is a semantic alias for SoftDelete supporting standard HTTP DELETE routes.
 func (s *FileService) Delete(ctx context.Context, userID, fileID string) (*DeleteResult, error) {
 	return s.SoftDelete(ctx, userID, fileID)
 }
 
-// PermanentDelete recursively removes a file/folder and all descendants from DB and storage
-// after verifying the requesting user holds OWNER permission (or directly owns the record).
+// PermanentDelete permanently purges a file or folder and all descendants from PostgreSQL
+// and schedules physical S3 block garbage collection for any content hashes that are no longer
+// referenced by any other file version or user in the system.
+//
+// Authorization & Safety:
+//   - Requires direct ownership or explicit OWNER permission.
+//   - Emits asynchronous outbox events before triggering non-blocking background S3 block deletions.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID executing the purge.
+//   - fileID: Target file or directory UUID to be destroyed.
+//
+// Returns:
+//   - *DeleteResult: Count of purged file rows and number of unreferenced blocks scheduled for GC.
+//   - error: Nil on success, or authorization/database error on failure.
 func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string) (*DeleteResult, error) {
 	if userID == "" || fileID == "" {
 		return nil, fmt.Errorf("user_id and file_id are required")
@@ -533,8 +616,25 @@ func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string
 	}, nil
 }
 
-// CreateFolder inserts a new directory row or returns an existing one (idempotent).
-// Returns (folder, created, error) where created is true if a new folder was inserted.
+// CreateFolder creates a directory under parentID or idempotently returns an existing
+// folder with the same name and parent for the user.
+//
+// Concurrency & Atomicity:
+//   - Executes inside an explicit PostgreSQL transaction (RunInTx).
+//   - Employs a double-checked locking idiom (checks before and inside the transaction)
+//     to prevent duplicate directory creation races under concurrent requests.
+//   - Automatically creates an OWNER permission row for the creator.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID creating the folder.
+//   - name: Folder display name.
+//   - parentID: Optional pointer to the parent folder UUID (nil for drive root).
+//
+// Returns:
+//   - *domain.File: The newly created or existing directory entity.
+//   - bool: wasNew flag (true if a new row was inserted, false if reused).
+//   - error: Nil on success, or validation/database error.
 func (s *FileService) CreateFolder(ctx context.Context, userID, name string, parentID *string) (*domain.File, bool, error) {
 	if userID == "" || name == "" {
 		return nil, false, fmt.Errorf("user_id and name are required")
@@ -601,9 +701,24 @@ func (s *FileService) CreateFolder(ctx context.Context, userID, name string, par
 	return folder, wasNew, nil
 }
 
-// // ListDirectory returns the immediate children of parentID (or the user's root
-// when parentID is nil). Folders are returned first, then files, alphabetically
-// — the ordering is enforced by the repository's ORDER BY clause.
+// ListDirectory returns the immediate children of parentID (or the user's root folder when parentID is nil).
+// Folders are returned first, then files, sorted alphabetically.
+//
+// Features & Concurrency Guarantees:
+//   - Shortcut Transparency: If parentID points to a shortcut, transparently lists the canonical target folder.
+//   - Authorization: Verifies the caller holds VIEWER, EDITOR, or OWNER rights on the folder.
+//   - Role Inheritance: Populates the effective ACL role for all returned items.
+//   - Thread-Safe Memory Isolation: Shallow-clones all returned *domain.File pointers before mutating
+//     their Role field, guaranteeing zero data races when mock stores or concurrent requests share memory.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID querying the directory.
+//   - parentID: Optional parent folder UUID (nil queries the root directory).
+//
+// Returns:
+//   - []*domain.File: Isolated slice of child file/folder models.
+//   - error: Nil on success, or domain.ErrPermissionDenied / database error.
 func (s *FileService) ListDirectory(ctx context.Context, userID string, parentID *string) ([]*domain.File, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("user_id is required")
@@ -652,7 +767,16 @@ func (s *FileService) ListDirectory(ctx context.Context, userID string, parentID
 	return items, nil
 }
 
-// ListSharedFiles returns all files/folders that have been shared with the user.
+// ListSharedFiles returns all files and folders that have been directly shared with the user
+// or inherited through shared parent directories.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID querying their shared file inventory.
+//
+// Returns:
+//   - []*domain.File: Slice of shared file records populated with their inherited roles.
+//   - error: Nil on success, or user resolution / repository query error.
 func (s *FileService) ListSharedFiles(ctx context.Context, userID string) ([]*domain.File, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("user_id is required")
@@ -668,7 +792,16 @@ func (s *FileService) ListSharedFiles(ctx context.Context, userID string) ([]*do
 	return items, nil
 }
 
-// GetUserStorage calculates real total byte usage and category breakdown for a user.
+// GetUserStorage calculates accurate aggregate storage consumption and category breakdown
+// (images, videos, documents, audio, archives, and others) for the specified user account.
+//
+// Parameters:
+//   - ctx: Context carrying request tracing.
+//   - userID: Authenticated user ID whose quota and usage are queried.
+//
+// Returns:
+//   - *domain.UserStorageUsage: DTO containing TotalBytesUsed, TotalFiles, QuotaBytes, and CategoryBytes.
+//   - error: Nil on success, or database aggregation error.
 func (s *FileService) GetUserStorage(ctx context.Context, userID string) (*domain.UserStorageUsage, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("user_id is required")
@@ -676,8 +809,17 @@ func (s *FileService) GetUserStorage(ctx context.Context, userID string) (*domai
 	return s.files.GetUserStorageUsage(ctx, userID)
 }
 
-// GetDownloadInfo returns the ordered block hashes and the File metadata needed
-// to stream a download. The caller verifies permissions before calling this.
+// GetDownloadInfo returns the ordered physical SHA-256 block hashes and the File metadata
+// needed by transport handlers to stream a full file download.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - fileID: Target file UUID.
+//
+// Returns:
+//   - *domain.File: File metadata model.
+//   - []string: Sequentially ordered block content SHA-256 hashes.
+//   - error: Nil on success, or domain.ErrFileNotFound / validation error.
 func (s *FileService) GetDownloadInfo(ctx context.Context, fileID string) (*domain.File, []string, error) {
 	f, err := s.files.GetByID(ctx, fileID)
 	if err != nil {
@@ -694,8 +836,17 @@ func (s *FileService) GetDownloadInfo(ctx context.Context, fileID string) (*doma
 	return f, hashes, nil
 }
 
-// GetDownloadInfoWithBlocks returns the ordered domain.Block list and the File metadata needed
-// to stream a download. The caller verifies permissions before calling this.
+// GetDownloadInfoWithBlocks returns the ordered domain.Block entities (with individual byte lengths)
+// and File metadata needed for dynamic byte-range streaming (RFC 7233).
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - fileID: Target file UUID.
+//
+// Returns:
+//   - *domain.File: File metadata model.
+//   - []*domain.Block: Ordered slice of Block models with sequence number, hash, and byte length.
+//   - error: Nil on success, or domain.ErrFileNotFound / database error.
 func (s *FileService) GetDownloadInfoWithBlocks(ctx context.Context, fileID string) (*domain.File, []*domain.Block, error) {
 	f, err := s.files.GetByID(ctx, fileID)
 	if err != nil {
@@ -712,8 +863,12 @@ func (s *FileService) GetDownloadInfoWithBlocks(ctx context.Context, fileID stri
 	return f, blocks, nil
 }
 
-// garbageCollectBlocks deletes orphaned physical blocks from storage. Each
-// deletion is best-effort; a failure is logged but not propagated.
+// garbageCollectBlocks performs best-effort asynchronous deletion of orphaned physical blocks from S3/storage.
+// An orphan block is one whose reference count in the file_blocks join table has dropped to zero.
+//
+// Parameters:
+//   - ctx: Detached context (typically context.Background()).
+//   - hashes: List of SHA-256 block hashes to delete from the blocks/ namespace.
 func (s *FileService) garbageCollectBlocks(ctx context.Context, hashes []string) {
 	for _, h := range hashes {
 		key := "blocks/" + h
@@ -726,7 +881,16 @@ func (s *FileService) garbageCollectBlocks(ctx context.Context, hashes []string)
 	}
 }
 
-// BulkSoftDelete soft-deletes multiple file/folder roots for userID in a single atomic transaction.
+// BulkSoftDelete moves an arbitrary array of files and folders to the Trash in a single atomic SQL transaction.
+// For every item in req.IDs, verifies that the user holds OWNER or EDITOR permissions.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID executing the batch operation.
+//   - req: BulkDeleteRequest containing slice of target UUIDs.
+//
+// Returns:
+//   - error: Nil on success, or validation/authorization/DB error.
 func (s *FileService) BulkSoftDelete(ctx context.Context, userID string, req domain.BulkDeleteRequest) error {
 	if userID == "" || len(req.IDs) == 0 {
 		return nil
@@ -754,7 +918,15 @@ func (s *FileService) BulkSoftDelete(ctx context.Context, userID string, req dom
 	return s.files.BulkSoftDelete(ctx, req.IDs, userID)
 }
 
-// BulkRestore restores multiple file/folder roots for userID in a single atomic transaction.
+// BulkRestore recovers multiple soft-deleted files and folders from the Trash in an atomic transaction.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID executing the batch restore.
+//   - req: BulkRestoreRequest containing array of target UUIDs.
+//
+// Returns:
+//   - error: Nil on success, or authorization/database error.
 func (s *FileService) BulkRestore(ctx context.Context, userID string, req domain.BulkRestoreRequest) error {
 	if userID == "" || len(req.IDs) == 0 {
 		return nil
@@ -782,7 +954,15 @@ func (s *FileService) BulkRestore(ctx context.Context, userID string, req domain
 	return s.files.BulkRestore(ctx, req.IDs, userID)
 }
 
-// BulkMove updates parent_id for multiple file IDs for userID in a single atomic transaction.
+// BulkMove updates the parent folder pointer for multiple files/directories in a single transaction.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals.
+//   - userID: Authenticated user ID owning the items.
+//   - req: BulkMoveRequest containing list of file IDs and destination parentID.
+//
+// Returns:
+//   - error: Nil on success, or database update error.
 func (s *FileService) BulkMove(ctx context.Context, userID string, req domain.BulkMoveRequest) error {
 	if userID == "" || len(req.IDs) == 0 {
 		return nil
@@ -790,7 +970,17 @@ func (s *FileService) BulkMove(ctx context.Context, userID string, req domain.Bu
 	return s.files.BulkMove(ctx, req.IDs, req.ParentID, userID)
 }
 
-// BulkHardDelete hard-deletes multiple file/folder roots for userID in a single transaction and triggers S3 block GC.
+// BulkHardDelete permanently removes multiple files/directories and cascades through their subtrees,
+// calculating orphaned physical CAS blocks and triggering background garbage collection in storage.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals.
+//   - userID: Authenticated user ID executing the purge.
+//   - req: BulkDeleteRequest containing slice of target UUIDs.
+//
+// Returns:
+//   - int64: Total count of database file rows purged.
+//   - error: Nil on success, or database error.
 func (s *FileService) BulkHardDelete(ctx context.Context, userID string, req domain.BulkDeleteRequest) (int64, error) {
 	if userID == "" || len(req.IDs) == 0 {
 		return 0, nil
@@ -817,7 +1007,24 @@ func logNilStr(s *string) string {
 // checking permissions. It is used by the HTTP handlers so the
 // permission-check boilerplate stays DRY.
 
-// AuthoriseRead checks that userID holds VIEWER, EDITOR, or OWNER on fileID (directly, via parent inheritance, or via an active public link shortcut).
+// AuthoriseRead verifies that the requesting user holds VIEWER, EDITOR, or OWNER rights
+// on fileID.
+//
+// Resolution Rules:
+//  1. Recursive Shortcut Dereferencing: If fileID is a shortcut, recursively checks permissions
+//     on the target file or folder entity.
+//  2. Direct Ownership: If file.UserID == userID, access is granted immediately.
+//  3. Status Checks: Denies read access if non-owners attempt to access soft-deleted or quarantined files.
+//  4. Materialized ACL Traversal: Traverses up the directory materialized path to check inherited permissions.
+//  5. Public Link Shortcuts: Grants access if the user has created or accessed a valid public link shortcut.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID requesting read access.
+//   - fileID: Target file, directory, or shortcut UUID.
+//
+// Returns:
+//   - error: Nil if authorized, or domain.ErrPermissionDenied / access denied error.
 func (s *FileService) AuthoriseRead(ctx context.Context, userID, fileID string) error {
 	file, err := s.files.GetByID(ctx, fileID)
 	if err == nil {
@@ -864,7 +1071,16 @@ func (s *FileService) AuthoriseRead(ctx context.Context, userID, fileID string) 
 	return fmt.Errorf("access denied: %s", user.Email)
 }
 
-// AuthoriseWrite checks that userID holds EDITOR or OWNER on fileID (directly or via parent inheritance).
+// AuthoriseWrite verifies that the requesting user holds EDITOR or OWNER permissions on fileID
+// (directly or inherited via parent directories).
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID requesting write access.
+//   - fileID: Target file or directory UUID.
+//
+// Returns:
+//   - error: Nil if authorized, or access denied error.
 func (s *FileService) AuthoriseWrite(ctx context.Context, userID, fileID string) error {
 	// 1. If file is owned directly by the user, bypass check and grant access.
 	file, err := s.files.GetByID(ctx, fileID)
@@ -891,8 +1107,14 @@ func (s *FileService) AuthoriseWrite(ctx context.Context, userID, fileID string)
 	return fmt.Errorf("access denied: %s", user.Email)
 }
 
-// SanitiseFilename strips path separators and control characters from a
-// filename so Content-Disposition can't be abused for header injection.
+// SanitiseFilename cleans a filename by replacing path separators ('/' and '\') with underscores,
+// mitigating HTTP header injection and path traversal vulnerabilities in Content-Disposition headers.
+//
+// Parameters:
+//   - name: Raw untrusted filename string.
+//
+// Returns:
+//   - string: Sanitized filename safe for HTTP headers and filesystem operations.
 func SanitiseFilename(name string) string {
 	// Fast path: nothing dangerous.
 	if !strings.ContainsAny(name, `/\`) {
@@ -909,13 +1131,30 @@ func SanitiseFilename(name string) string {
 	return b.String()
 }
 
-// CreateShortcutRequest represents the body of POST /api/files/shortcut
+// CreateShortcutRequest defines the payload for creating a virtual pointer to a target file or folder.
 type CreateShortcutRequest struct {
-	FileID   string  `json:"file_id"`
+	// FileID is the unique identifier of the target file or directory being referenced.
+	FileID string `json:"file_id"`
+	// ParentID is the destination folder where the shortcut will reside (nil for root).
 	ParentID *string `json:"parent_id"`
 }
 
-// CreateShortcut creates a shortcut to a file/folder in the user's drive.
+// CreateShortcut generates a lightweight virtual pointer entity pointing to an existing file or directory.
+//
+// Business Logic:
+//   - Verification: Validates that the user holds at least VIEWER rights on the target file.
+//   - Pointer Flattening: If the target is already a shortcut, dereferences it to point directly
+//     to the canonical target file, preventing unbounded pointer chaining.
+//   - Zero Byte Consumption: Shortcuts have size_bytes = 0 and consume no user storage quota.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals and request tracing.
+//   - userID: Authenticated user ID creating the shortcut.
+//   - req: CreateShortcutRequest specifying target file ID and destination parent folder.
+//
+// Returns:
+//   - *domain.File: Populated shortcut file domain entity.
+//   - error: Nil on success, or validation/authorization error.
 func (s *FileService) CreateShortcut(ctx context.Context, userID string, req CreateShortcutRequest) (*domain.File, error) {
 	if userID == "" || req.FileID == "" {
 		return nil, fmt.Errorf("user_id and file_id are required")
@@ -979,29 +1218,56 @@ func (s *FileService) CreateShortcut(ctx context.Context, userID string, req Cre
 	return shortcut, nil
 }
 
-// GetFileInfo fetches a file's metadata by ID.
+// GetFileInfo fetches a file's metadata entity by its primary key UUID.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals.
+//   - fileID: Target file UUID.
+//
+// Returns:
+//   - *domain.File: File domain model.
+//   - error: Nil on success, or domain.ErrFileNotFound if absent.
 func (s *FileService) GetFileInfo(ctx context.Context, fileID string) (*domain.File, error) {
 	return s.files.GetByID(ctx, fileID)
 }
 
+// BlockSize defines the legacy fixed 4 MiB block boundary constant (4,194,304 bytes).
 const BlockSize int64 = 4194304
 
-// CalculateRangeBlockOffset calculates the starting block index and offset inside that block
-// given a global start byte offset.
-// BlockSize is 4,194,304 bytes (4MB).
+// CalculateRangeBlockOffset computes the 0-based starting block index and internal byte offset
+// for legacy fixed 4 MiB blocks given a global file seek position.
+//
+// Parameters:
+//   - startByte: Absolute seek offset in bytes.
+//
+// Returns:
+//   - startBlockIndex: 0-based index of the first block containing the range.
+//   - blockOffset: Intra-block byte offset where streaming should begin.
 func (s *FileService) CalculateRangeBlockOffset(startByte int64) (startBlockIndex int64, blockOffset int64) {
 	startBlockIndex = startByte / BlockSize
 	blockOffset = startByte % BlockSize
 	return startBlockIndex, blockOffset
 }
 
-// CalculateRangeBlockOffset calculates startBlockIndex and blockOffset from a startByte.
+// CalculateRangeBlockOffset computes startBlockIndex and blockOffset from startByte using fixed 4 MiB blocks.
 func CalculateRangeBlockOffset(startByte int64) (int64, int64) {
 	return startByte / BlockSize, startByte % BlockSize
 }
 
 // CalculateDynamicRangeBlockOffset dynamically calculates the starting block index and intra-block offset
-// given arbitrary variable-sized FastCDC blocks.
+// given arbitrary variable-sized FastCDC content-defined blocks.
+//
+// Complexity & Algorithmic Design:
+//   - Iterates through the ordered slice of variable-sized blocks, accumulating block sizes.
+//   - Determines the exact boundary block and offset in $O(N)$ where $N$ is block count (typically < 100).
+//
+// Parameters:
+//   - blocks: Ordered slice of Block models representing the sequential file stream.
+//   - startByte: Absolute 0-based byte offset requested in the HTTP Range header.
+//
+// Returns:
+//   - startBlockIndex: 0-based index of the first block containing startByte.
+//   - blockOffset: Intra-block offset in bytes where reading begins.
 func CalculateDynamicRangeBlockOffset(blocks []*domain.Block, startByte int64) (startBlockIndex int, blockOffset int64) {
 	if len(blocks) == 0 || startByte <= 0 {
 		return 0, 0
@@ -1017,14 +1283,23 @@ func CalculateDynamicRangeBlockOffset(blocks []*domain.Block, startByte int64) (
 	return len(blocks) - 1, 0
 }
 
-// CalculateDynamicRangeBlockOffset dynamically calculates the starting block index and intra-block offset.
+// CalculateDynamicRangeBlockOffset delegates to the standalone CalculateDynamicRangeBlockOffset function.
 func (s *FileService) CalculateDynamicRangeBlockOffset(blocks []*domain.Block, startByte int64) (startBlockIndex int, blockOffset int64) {
 	return CalculateDynamicRangeBlockOffset(blocks, startByte)
 }
 
-
-// CreateShortcutFromPublicLink creates a shortcut directly bypassing normal explicit database permissions,
-// because authorization has already been established via the public link token.
+// CreateShortcutFromPublicLink creates a shortcut directly for a user from an authorized public share token,
+// bypassing standard ACL checks because access has been cryptographically validated via the public share token.
+//
+// Parameters:
+//   - ctx: Context carrying cancellation signals.
+//   - userID: Authenticated user ID adding the shared file to their drive.
+//   - targetID: Canonical target file or folder UUID.
+//   - parentID: Optional destination folder in the user's drive (nil for root).
+//
+// Returns:
+//   - *domain.File: The newly created shortcut entity.
+//   - error: Nil on success, or database error.
 func (s *FileService) CreateShortcutFromPublicLink(ctx context.Context, userID, targetID string, parentID *string) (*domain.File, error) {
 	if userID == "" || targetID == "" {
 		return nil, fmt.Errorf("user_id and target_id are required")
