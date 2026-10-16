@@ -14,6 +14,51 @@
 
 ---
 
+## Table of Contents
+
+- [1. Executive Summary](#1-executive-summary)
+  - [1.1 Core Problem Solved](#11-core-problem-solved)
+  - [1.2 Technical Philosophy](#12-technical-philosophy)
+  - [1.3 High-Level Tech Stack](#13-high-level-tech-stack)
+- [2. Architecture Overview](#2-architecture-overview)
+  - [2.1 Tier Architecture Diagram](#2-architecture-overview)
+  - [2.2 Separation of Concerns Matrix](#separation-of-concerns-matrix)
+- [3. Project Structure](#3-project-structure)
+  - [3.1 Directory Tree Structure](#3-project-structure)
+  - [3.2 Module Responsibility Breakdown](#module-responsibility-breakdown)
+- [4. Core Features & Subsystems](#4-core-features--subsystems)
+  - [4.1 FastCDC Content-Defined Chunking](#41-fastcdc-content-defined-chunking-99-shift-resistant-deduplication)
+  - [4.2 Client-Side Zero-Trust Encryption](#42-client-side-zero-trust-encryption-aes-256-gcm-framing)
+  - [4.3 Dynamic RFC 7233 HTTP 206 Partial Content Streaming](#43-dynamic-rfc-7233-http-206-partial-content-streaming)
+  - [4.4 Dropbox-Grade Monotonic Delta Sync Engine](#44-dropbox-grade-monotonic-delta-sync-engine-o1-catch-up)
+  - [4.5 Materialized Path Directory Hierarchy](#45-materialized-path-directory-hierarchy-o1-subtree-relocations)
+  - [4.6 Serverless Asynchronous Compute Plane & CAS Deduplication](#46-serverless-asynchronous-compute-plane--cas-ai-deduplication)
+  - [4.7 Enterprise ACL Sharing & Golden Rule Engine](#47-enterprise-acl-sharing--golden-rule-engine)
+- [5. Service Layer Documentation](#5-service-layer-documentation)
+  - [5.1 FileService](#51-fileservice)
+  - [5.2 UploadService](#52-uploadservice)
+  - [5.3 ZipService](#53-zipservice)
+- [6. API Documentation](#6-api-documentation)
+  - [6.1 Authentication Endpoints (`/api/auth`)](#61-authentication-endpoints-apiauth)
+  - [6.2 File & Folder Management (`/api/files`)](#62-file--folder-management-apifiles)
+  - [6.3 Resumable Chunked Uploads (`/api/upload`)](#63-resumable-chunked-uploads-apiupload)
+  - [6.4 Streaming, Downloads & Compression](#64-streaming-downloads--compression)
+  - [6.5 Delta Sync & WebSockets](#65-delta-sync--websockets)
+- [7. Configuration Reference](#7-configuration-reference)
+- [8. Deployment & Setup Guide](#8-deployment--setup-guide)
+  - [8.1 Local Bare-Metal Development](#81-local-bare-metal-development)
+  - [8.2 Containerized Production Deployment (Docker Compose)](#82-containerized-production-deployment-docker-compose)
+  - [8.3 AWS Lambda Worker Packaging (`cmd/worker-lambda`)](#83-aws-lambda-worker-packaging-cmdworker-lambda)
+- [9. Workflow Diagrams](#9-workflow-diagrams)
+  - [9.1 FastCDC Chunking & Resumable Upload Sequence](#91-fastcdc-chunking--resumable-upload-sequence)
+  - [9.2 RFC 7233 Multi-Block Byte Range Streaming](#92-rfc-7233-multi-block-byte-range-streaming)
+- [10. Troubleshooting Guide](#10-troubleshooting-guide)
+- [11. Verification & Testing Suite](#11-verification--testing-suite)
+- [12. License](#12-license)
+
+---
+
+<a id="1-executive-summary"></a>
 ## 1. Executive Summary
 
 ### 1.1 Core Problem Solved
@@ -42,6 +87,7 @@ Blob-Cloud was engineered from first principles to resolve these architectural l
 
 ---
 
+<a id="2-architecture-overview"></a>
 ## 2. Architecture Overview
 
 Blob-Cloud enforces a strict layered tier architecture with unidirectional dependencies. The transport layer delegates directly to domain services, which govern business invariants and transactional boundaries across repositories and storage drivers.
@@ -124,6 +170,7 @@ flowchart TD
 
 ---
 
+<a id="3-project-structure"></a>
 ## 3. Project Structure
 
 ```
@@ -203,6 +250,7 @@ flowchart TD
 
 ---
 
+<a id="4-core-features--subsystems"></a>
 ## 4. Core Features & Subsystems
 
 ### 4.1 FastCDC Content-Defined Chunking (>99% Shift-Resistant Deduplication)
@@ -352,6 +400,7 @@ WHERE user_id = $3 AND (path = $4 OR path LIKE $5 ESCAPE '\');
 
 ---
 
+<a id="5-service-layer-documentation"></a>
 ## 5. Service Layer Documentation
 
 The service layer encapsulates all business invariants, permission checks, and transaction boundaries.
@@ -425,6 +474,7 @@ classDiagram
 
 ---
 
+<a id="6-api-documentation"></a>
 ## 6. API Documentation
 
 All API requests (except public links and health checks) require an `Authorization: Bearer <JWT_ACCESS_TOKEN>` header.
@@ -480,6 +530,7 @@ All API requests (except public links and health checks) require an `Authorizati
 
 ---
 
+<a id="7-configuration-reference"></a>
 ## 7. Configuration Reference
 
 All configurations are managed via environment variables and loaded through `backend/internal/config`.
@@ -501,6 +552,7 @@ All configurations are managed via environment variables and loaded through `bac
 
 ---
 
+<a id="8-deployment--setup-guide"></a>
 ## 8. Deployment & Setup Guide
 
 ### 8.1 Local Bare-Metal Development
@@ -577,6 +629,7 @@ aws lambda update-function-code \
 
 ---
 
+<a id="9-workflow-diagrams"></a>
 ## 9. Workflow Diagrams
 
 ### 9.1 FastCDC Chunking & Resumable Upload Sequence
@@ -650,6 +703,7 @@ sequenceDiagram
 
 ---
 
+<a id="10-troubleshooting-guide"></a>
 ## 10. Troubleshooting Guide
 
 | Symptom / Error | Root Cause | Technical Remediation |
@@ -663,6 +717,7 @@ sequenceDiagram
 
 ---
 
+<a id="11-verification--testing-suite"></a>
 ## 11. Verification & Testing Suite
 
 Blob-Cloud enforces a zero-warning quality gate across all backend and frontend modules:
@@ -686,5 +741,6 @@ npm run build
 
 ---
 
+<a id="12-license"></a>
 ## 12. License
 Blob-Cloud is released under the open-source [MIT License](LICENSE).
