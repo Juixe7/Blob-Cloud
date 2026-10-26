@@ -17,7 +17,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23' # Matches standard backend compilation targets
+        go-version: '1.26.2' # Matches backend/go.mod
 
     - name: Run Go Tests (with Race Detector)
       run: |
@@ -52,7 +52,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.23'
+        go-version: '1.26.2'
 
     - name: Compile Go Binary (Linux AMD64)
       run: |

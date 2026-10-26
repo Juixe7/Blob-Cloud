@@ -6,7 +6,7 @@
 #   - gc: Orphaned Block Garbage Collector CronJob
 # ==============================================================================
 
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26.2-alpine AS builder
 
 WORKDIR /app
 
@@ -34,7 +34,6 @@ RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 
 COPY --from=builder /bin/api /app/api
-COPY db/migrations /app/db/migrations
 
 # Run as non-root user
 USER nobody:nobody
@@ -51,7 +50,6 @@ RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 
 COPY --from=builder /bin/worker /app/worker
-COPY db/migrations /app/db/migrations
 
 USER nobody:nobody
 

@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+docs/
+tmp/
+*.exe
+*.zip
+*.test
+*.out
+coverage.txt
+*.coverprofile
