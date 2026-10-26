@@ -20,6 +20,10 @@ import (
 //
 //	limit — number of entries to return (default 50, max 100)
 func (s *Server) HandleFileHistory(w http.ResponseWriter, r *http.Request) {
+	if s.fileOps == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "file authorization unavailable"})
+		return
+	}
 	fileID := chi.URLParam(r, "id")
 	if fileID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file id"})
@@ -33,11 +37,9 @@ func (s *Server) HandleFileHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.fileOps != nil {
-		if err := s.fileOps.AuthoriseRead(r.Context(), userID, fileID); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
-			return
-		}
+	if err := s.fileOps.AuthoriseRead(r.Context(), userID, fileID); err != nil {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
+		return
 	}
 
 	limit := 50

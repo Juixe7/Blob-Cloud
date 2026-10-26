@@ -28,11 +28,11 @@ var s3BlockPrefix = "blocks"
 // service like Cloudflare R2). It generates presigned PUT URLs for direct
 // client-to-S3 uploads and optionally rewrites the hostname to a CDN domain.
 type S3Storage struct {
-	client       *s3.Client
-	presigner    *s3.PresignClient
-	bucket       string
-	cdndomain    string // empty = no rewrite; set = replace bucket host with this
-	log          *slog.Logger
+	client    *s3.Client
+	presigner *s3.PresignClient
+	bucket    string
+	cdndomain string // empty = no rewrite; set = replace bucket host with this
+	log       *slog.Logger
 }
 
 // Compile-time check.
@@ -112,38 +112,11 @@ func NewS3Storage(ctx context.Context, cfg appcfg.Config, log *slog.Logger) (*S3
 	return s, nil
 }
 
-// GenerateUploadURL returns a presigned PUT URL the client uses to upload a
-// block directly to S3 (or R2). If a CDN domain is configured the hostname in
-// the returned URL is rewritten while the signature query parameters are left
-// untouched.
-func (s *S3Storage) GenerateUploadURL(ctx context.Context, blockHash string, expires time.Duration) (string, error) {
-	if blockHash == "" {
-		return "", fmt.Errorf("blockHash must not be empty")
-	}
-	key := s3BlockPrefix + "/" + blockHash
-
-	presigned, err := s.presigner.PresignPutObject(ctx, &s3.PutObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	}, func(po *s3.PresignOptions) {
-		po.Expires = expires
-	})
-	if err != nil {
-		return "", fmt.Errorf("presign put object: %w", err)
-	}
-
-	rawURL := presigned.URL
-	if s.cdndomain != "" {
-		rawURL = rewriteHost(rawURL, s.cdndomain)
-	}
-	return rawURL, nil
-}
-
 // GenerateStagingUploadURL returns a presigned PUT URL for direct upload to an isolated
 // staging prefix (e.g. staging/{session_id}/{index}).
 func (s *S3Storage) GenerateStagingUploadURL(ctx context.Context, stagingKey string, expires time.Duration) (string, error) {
-	if stagingKey == "" {
-		return "", fmt.Errorf("stagingKey must not be empty")
+	if err := validateStagingKey(stagingKey); err != nil {
+		return "", err
 	}
 
 	presigned, err := s.presigner.PresignPutObject(ctx, &s3.PutObjectInput{
@@ -254,6 +227,12 @@ func (s *S3Storage) DeleteObject(ctx context.Context, key string) error {
 // This moves the verified object from staging to CAS storage (e.g. blocks/<hash>)
 // directly inside the AWS data plane with zero egress bandwidth charges.
 func (s *S3Storage) PromoteObject(ctx context.Context, srcKey, destKey string) error {
+	if err := validateStagingKey(srcKey); err != nil {
+		return err
+	}
+	if err := validateCASKey(destKey); err != nil {
+		return err
+	}
 	copySource := url.PathEscape(s.bucket + "/" + srcKey)
 	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(s.bucket),
@@ -321,6 +300,33 @@ func (s *S3Storage) ListBlockKeys(ctx context.Context) ([]string, error) {
 	return keys, nil
 }
 
+// ListBlockObjects returns paginated block keys with S3 LastModified metadata.
+func (s *S3Storage) ListBlockObjects(ctx context.Context) ([]domain.StorageObject, error) {
+	prefix := s3BlockPrefix + "/"
+	var objects []domain.StorageObject
+	var continuationToken *string
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), ContinuationToken: continuationToken})
+		if err != nil {
+			return nil, fmt.Errorf("s3 list block object metadata: %w", err)
+		}
+		for _, obj := range out.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			if obj.LastModified == nil {
+				return nil, fmt.Errorf("s3 object %q has no LastModified metadata", *obj.Key)
+			}
+			objects = append(objects, domain.StorageObject{Key: *obj.Key, LastModified: *obj.LastModified})
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated || out.NextContinuationToken == nil {
+			break
+		}
+		continuationToken = out.NextContinuationToken
+	}
+	return objects, nil
+}
+
 // ListStagingKeys pages through S3 ListObjectsV2 under the "staging/" prefix.
 // Satisfies the gc.StagingLister interface.
 func (s *S3Storage) ListStagingKeys(ctx context.Context) ([]string, error) {
@@ -350,6 +356,33 @@ func (s *S3Storage) ListStagingKeys(ctx context.Context) ([]string, error) {
 	return keys, nil
 }
 
+// ListStagingObjects returns paginated staging keys with S3 LastModified metadata.
+func (s *S3Storage) ListStagingObjects(ctx context.Context) ([]domain.StorageObject, error) {
+	prefix := "staging/"
+	var objects []domain.StorageObject
+	var continuationToken *string
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(s.bucket), Prefix: aws.String(prefix), ContinuationToken: continuationToken})
+		if err != nil {
+			return nil, fmt.Errorf("s3 list staging object metadata: %w", err)
+		}
+		for _, obj := range out.Contents {
+			if obj.Key == nil {
+				continue
+			}
+			if obj.LastModified == nil {
+				return nil, fmt.Errorf("s3 staging object %q has no LastModified metadata", *obj.Key)
+			}
+			objects = append(objects, domain.StorageObject{Key: *obj.Key, LastModified: *obj.LastModified})
+		}
+		if out.IsTruncated == nil || !*out.IsTruncated || out.NextContinuationToken == nil {
+			break
+		}
+		continuationToken = out.NextContinuationToken
+	}
+	return objects, nil
+}
+
 // ── MultipartUploadProvider implementation (Tier 3G) ─────────────────────────
 //
 // S3Storage satisfies domain.MultipartUploadProvider in addition to
@@ -359,10 +392,13 @@ func (s *S3Storage) ListStagingKeys(ctx context.Context) ([]string, error) {
 // Compile-time check: S3Storage implements both interfaces.
 var _ domain.MultipartUploadProvider = (*S3Storage)(nil)
 
-// CreateMultipartUpload initiates an S3 MPU and returns its upload ID.
+// CreateMultipartUpload initiates an S3 MPU in the staging namespace and returns its upload ID.
 // The returned ID must be threaded through all subsequent part calls and the
 // final CompleteMultipartUpload / AbortMultipartUpload.
 func (s *S3Storage) CreateMultipartUpload(ctx context.Context, key string) (string, error) {
+	if err := validateStagingKey(key); err != nil {
+		return "", err
+	}
 	out, err := s.client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
 		Bucket:      aws.String(s.bucket),
 		Key:         aws.String(key),
@@ -380,6 +416,9 @@ func (s *S3Storage) CreateMultipartUpload(ctx context.Context, key string) (stri
 // PresignUploadPart returns a presigned PUT URL for one MPU part.
 // partNumber is 1-indexed per the S3 spec (valid range 1–10 000).
 func (s *S3Storage) PresignUploadPart(ctx context.Context, key, uploadID string, partNumber int32, expires time.Duration) (string, error) {
+	if err := validateStagingKey(key); err != nil {
+		return "", err
+	}
 	presigned, err := s.presigner.PresignUploadPart(ctx, &s3.UploadPartInput{
 		Bucket:     aws.String(s.bucket),
 		Key:        aws.String(key),
@@ -402,6 +441,9 @@ func (s *S3Storage) PresignUploadPart(ctx context.Context, key, uploadID string,
 // final S3 object. etags must be the ETag values returned by each part PUT
 // response (surrounding quotes are normalised automatically).
 func (s *S3Storage) CompleteMultipartUpload(ctx context.Context, key, uploadID string, etags []string) error {
+	if err := validateStagingKey(key); err != nil {
+		return err
+	}
 	parts := make([]s3types.CompletedPart, len(etags))
 	for i, etag := range etags {
 		e := strings.Trim(etag, "\"")
@@ -427,6 +469,9 @@ func (s *S3Storage) CompleteMultipartUpload(ctx context.Context, key, uploadID s
 // AbortMultipartUpload cancels an in-progress MPU and frees partial-part
 // storage. Always call this on any error path after CreateMultipartUpload.
 func (s *S3Storage) AbortMultipartUpload(ctx context.Context, key, uploadID string) error {
+	if err := validateStagingKey(key); err != nil {
+		return err
+	}
 	_, err := s.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
 		Bucket:   aws.String(s.bucket),
 		Key:      aws.String(key),

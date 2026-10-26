@@ -29,10 +29,6 @@ func newFakeMPUStorage() *fakeMPUStorage {
 
 // ─ StorageProvider methods ────────────────────────────────────────────────────
 
-func (f *fakeMPUStorage) GenerateUploadURL(_ context.Context, blockHash string, _ time.Duration) (string, error) {
-	return "https://s3.example.com/blocks/" + blockHash, nil
-}
-
 func (f *fakeMPUStorage) PutObject(_ context.Context, _ string, _ io.Reader, _ int64, _ string) error {
 	return nil
 }
@@ -104,8 +100,8 @@ type noMPUStorage struct{ fakeMPUStorage }
 // TestMPUThresholdConstant verifies the threshold and part-size constants are
 // set to their documented values. Any accidental change is caught immediately.
 func TestMPUThresholdConstant(t *testing.T) {
-	const wantThreshold = int64(5) * 1024 * 1024 * 1024  // 5 GiB
-	const wantPartSize = int64(100) * 1024 * 1024         // 100 MiB
+	const wantThreshold = int64(5) * 1024 * 1024 * 1024 // 5 GiB
+	const wantPartSize = int64(100) * 1024 * 1024       // 100 MiB
 	if domain.MPUBlockThreshold != wantThreshold {
 		t.Errorf("MPUBlockThreshold: want %d, got %d", wantThreshold, domain.MPUBlockThreshold)
 	}
@@ -167,11 +163,11 @@ func TestInitiate_SmallBlock_GetsSingleURL(t *testing.T) {
 	if blockSize > domain.MPUBlockThreshold {
 		t.Fatal("test setup error: blockSize should be below threshold")
 	}
-	url, err := st.GenerateUploadURL(ctx, "abc123", 30*time.Minute)
+	uploadURL, err := st.GenerateStagingUploadURL(ctx, "staging/test-session/0", 30*time.Minute)
 	if err != nil {
-		t.Fatalf("GenerateUploadURL: %v", err)
+		t.Fatalf("GenerateStagingUploadURL: %v", err)
 	}
-	if url == "" {
+	if uploadURL == "" {
 		t.Error("expected a non-empty upload URL for small block")
 	}
 	if len(st.createdMPUs) != 0 {
@@ -187,7 +183,7 @@ func TestInitiate_LargeBlock_GetsMPU(t *testing.T) {
 
 	// Simulate a 6 GiB block (above the 5 GiB threshold).
 	blockSize := int64(6) * 1024 * 1024 * 1024
-	key := "blocks/deadbeef"
+	key := "staging/test-session/0"
 
 	if blockSize <= domain.MPUBlockThreshold {
 		t.Fatal("test setup error: blockSize must exceed threshold")

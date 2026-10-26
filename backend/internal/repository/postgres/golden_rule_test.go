@@ -3,10 +3,47 @@ package postgresrepo_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"go-drive-clone/internal/domain"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 )
+
+func TestProcessingStatusRejectsStaleScanResult(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	user := &domain.User{Email: "scan-state@example.com"}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+	file := &domain.File{UserID: user.ID, Name: "pending.txt", Status: "PROCESSING"}
+	if err := files.Create(ctx, file); err != nil {
+		t.Fatal(err)
+	}
+	stale := file.UpdatedAt
+	time.Sleep(2 * time.Millisecond)
+	if err := files.UpdateStatus(ctx, file.ID, "PROCESSING"); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := files.UpdateProcessingStatus(ctx, file.ID, stale, "ACTIVE")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated {
+		t.Fatal("stale scan result changed file state")
+	}
+	current, err := files.GetByID(ctx, file.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != "PROCESSING" {
+		t.Fatalf("status = %q, want PROCESSING", current.Status)
+	}
+}
 
 func TestGoldenRule_ViewerCreatesShortcutInsteadOfMove(t *testing.T) {
 	db := openDB(t)
@@ -150,6 +187,54 @@ func TestGoldenRule_EditorMovesFilePreservesOwnership(t *testing.T) {
 	}
 	if after.UserID != userA.ID {
 		t.Errorf("expected user_id to remain %s, got %s", userA.ID, after.UserID)
+	}
+}
+
+func TestBulkMove_RejectsDestinationWithoutWritePermission(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	permissions := postgresrepo.NewPermissionRepository(db)
+
+	alice := &domain.User{Email: "bulk-move-alice@example.com"}
+	bob := &domain.User{Email: "bulk-move-bob@example.com"}
+	for _, user := range []*domain.User{alice, bob} {
+		if err := users.Create(ctx, user); err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+	}
+	source := &domain.File{UserID: alice.ID, Name: "source.txt"}
+	destination := &domain.File{UserID: bob.ID, Name: "destination", IsDirectory: true}
+	for _, file := range []*domain.File{source, destination} {
+		if err := files.Create(ctx, file); err != nil {
+			t.Fatalf("create file fixture: %v", err)
+		}
+	}
+
+	if err := files.BulkMove(ctx, []string{source.ID}, &destination.ID, alice.ID); err == nil {
+		t.Fatal("move into a foreign folder without a grant should fail")
+	}
+	if err := permissions.GrantPermission(ctx, &domain.Permission{FileID: destination.ID, GranteeEmail: alice.Email, Role: domain.RoleViewer}); err != nil {
+		t.Fatalf("grant viewer: %v", err)
+	}
+	if err := files.BulkMove(ctx, []string{source.ID}, &destination.ID, alice.ID); err == nil {
+		t.Fatal("move into a viewer-only folder should fail")
+	}
+	if err := permissions.UpdatePermission(ctx, destination.ID, alice.Email, domain.RoleEditor); err != nil {
+		t.Fatalf("promote to editor: %v", err)
+	}
+	if err := files.BulkMove(ctx, []string{source.ID}, &destination.ID, alice.ID); err != nil {
+		t.Fatalf("editor should move into the destination: %v", err)
+	}
+	moved, err := files.GetByID(ctx, source.ID)
+	if err != nil {
+		t.Fatalf("get moved source: %v", err)
+	}
+	if moved.ParentID == nil || *moved.ParentID != destination.ID {
+		t.Fatalf("source parent = %v, want %s", moved.ParentID, destination.ID)
 	}
 }
 

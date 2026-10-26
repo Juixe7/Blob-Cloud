@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 
 	"go-drive-clone/internal/domain"
 )
@@ -62,6 +63,26 @@ func (r *UploadSessionRepository) createSessionInline(
 	blocks []domain.SessionBlock,
 	sessionQ, blockQ string,
 ) error {
+	// Acquire the same per-hash lock used by GC before the session row can
+	// advertise an upload reference. Sorted acquisition prevents deadlocks when
+	// two sessions contain overlapping block sets in different orders.
+	hashes := make([]string, 0, len(blocks))
+	seenHashes := make(map[string]struct{}, len(blocks))
+	for _, block := range blocks {
+		if _, exists := seenHashes[block.BlockHash]; exists {
+			continue
+		}
+		seenHashes[block.BlockHash] = struct{}{}
+		hashes = append(hashes, block.BlockHash)
+	}
+	sort.Strings(hashes)
+	for _, hash := range hashes {
+		lockKey := "blobcloud:block:" + hash
+		if _, err := r.db.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+			return fmt.Errorf("lock block for upload session: %w", err)
+		}
+	}
+
 	row := r.db.QueryRowContext(ctx, sessionQ,
 		session.UserID, session.Filename, session.ParentID,
 		session.TotalSize, session.Status)
@@ -122,14 +143,17 @@ func (r *UploadSessionRepository) GetSessionByID(ctx context.Context, id string)
 
 // UpdateSessionStatus transitions a session (e.g. INITIATED -> COMPLETED).
 func (r *UploadSessionRepository) UpdateSessionStatus(ctx context.Context, id string, status string) error {
-	const q = `UPDATE upload_sessions SET status = $1 WHERE id = $2`
-	res, err := r.db.ExecContext(ctx, q, status, id)
+	if status != domain.SessionStatusCompleted && status != domain.SessionStatusAborted {
+		return fmt.Errorf("update session status: invalid terminal status %q", status)
+	}
+	const q = `UPDATE upload_sessions SET status = $1 WHERE id = $2 AND status = $3`
+	res, err := r.db.ExecContext(ctx, q, status, id, domain.SessionStatusInitiated)
 	if err != nil {
 		return fmt.Errorf("update session status: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("update session status: session %q: %w", id, sql.ErrNoRows)
+		return fmt.Errorf("update session status: session %q is missing or no longer active: %w", id, sql.ErrNoRows)
 	}
 	return nil
 }
@@ -137,9 +161,17 @@ func (r *UploadSessionRepository) UpdateSessionStatus(ctx context.Context, id st
 // MarkBlockUploaded flips one chunk's is_uploaded flag after the client PUT.
 func (r *UploadSessionRepository) MarkBlockUploaded(ctx context.Context, sessionID string, seqNum int) error {
 	const q = `
-		UPDATE session_blocks
-		SET is_uploaded = TRUE
-		WHERE session_id = $1 AND sequence_number = $2
+		WITH marked AS (
+			UPDATE session_blocks sb
+			SET is_uploaded = TRUE
+			FROM upload_sessions us
+			WHERE sb.session_id = $1 AND sb.sequence_number = $2
+			  AND us.id = sb.session_id AND us.status = 'INITIATED'
+			RETURNING sb.session_id
+		)
+		UPDATE upload_sessions
+		SET updated_at = CURRENT_TIMESTAMP
+		WHERE id IN (SELECT session_id FROM marked)
 	`
 	res, err := r.db.ExecContext(ctx, q, sessionID, seqNum)
 	if err != nil {

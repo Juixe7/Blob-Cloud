@@ -224,12 +224,12 @@ func (r *BlockRepository) LinkBlocksToFile(ctx context.Context, fileID string, b
 // ReplaceBlocksForFile atomically deletes existing file_blocks and inserts new ones.
 func (r *BlockRepository) ReplaceBlocksForFile(ctx context.Context, fileID string, blockIDsWithSeq []domain.BlockSequence) error {
 	qDelete := `DELETE FROM file_blocks WHERE file_id = $1`
-	
+
 	execRebuild := func(tx DBTX) error {
 		if _, err := tx.ExecContext(ctx, qDelete, fileID); err != nil {
 			return fmt.Errorf("delete old file_blocks: %w", err)
 		}
-		
+
 		if len(blockIDsWithSeq) > 0 {
 			qInsert := `
 				INSERT INTO file_blocks (file_id, block_id, sequence_number)
@@ -243,11 +243,11 @@ func (r *BlockRepository) ReplaceBlocksForFile(ctx context.Context, fileID strin
 		}
 		return nil
 	}
-	
+
 	if _, ok := r.db.(txCommitter); ok {
 		return execRebuild(r.db)
 	}
-	
+
 	db, ok := r.db.(*sql.DB)
 	if !ok {
 		return fmt.Errorf("ReplaceBlocksForFile: unsupported DBTX type %T", r.db)
@@ -259,8 +259,23 @@ func (r *BlockRepository) ReplaceBlocksForFile(ctx context.Context, fileID strin
 // for stable iteration. Used exclusively by the GC collector to build the
 // authoritative set of known blocks and identify orphans in storage.
 func (r *BlockRepository) AllBlockHashes(ctx context.Context) ([]string, error) {
-	const q = `SELECT sha256 FROM blocks ORDER BY sha256`
-	rows, err := r.db.QueryContext(ctx, q)
+	const q = `
+		SELECT DISTINCT b.sha256
+		FROM blocks b
+		WHERE EXISTS (SELECT 1 FROM file_blocks fb WHERE fb.block_id = b.id)
+		   OR EXISTS (SELECT 1 FROM file_versions fv WHERE b.sha256 = ANY(fv.chunk_hashes))
+		   OR EXISTS (SELECT 1 FROM session_blocks sb JOIN upload_sessions us ON us.id = sb.session_id
+		             WHERE sb.block_hash = b.sha256 AND us.status = 'INITIATED'
+	               AND us.updated_at > CURRENT_TIMESTAMP - ($1 * INTERVAL '1 second'))
+		UNION
+		SELECT sb.block_hash
+		FROM session_blocks sb
+		JOIN upload_sessions us ON us.id = sb.session_id
+		WHERE us.status = 'INITIATED'
+		  AND us.updated_at > CURRENT_TIMESTAMP - ($1 * INTERVAL '1 second')
+		ORDER BY sha256
+	`
+	rows, err := r.db.QueryContext(ctx, q, domain.UploadSessionMaxAge.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("query all block hashes: %w", err)
 	}
@@ -275,4 +290,131 @@ func (r *BlockRepository) AllBlockHashes(ctx context.Context) ([]string, error) 
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// WithBlockCandidate serializes GC against upload-session creation for this
+// hash. The transaction-scoped advisory lock remains held until storage deletion
+// completes, so a new session cannot start referencing the object mid-sweep.
+func (r *BlockRepository) WithBlockCandidate(ctx context.Context, hash string, dryRun bool, deleteObject func() error) (bool, error) {
+	db, ok := r.db.(*sql.DB)
+	if !ok {
+		return false, fmt.Errorf("WithBlockCandidate requires a database pool, got %T", r.db)
+	}
+	eligible := false
+	err := RunInTx(ctx, db, func(tx DBTX) error {
+		lockKey := "blobcloud:block:" + hash
+		if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockKey); err != nil {
+			return fmt.Errorf("lock block for GC: %w", err)
+		}
+		if !dryRun {
+			if _, err := tx.ExecContext(ctx, `
+			UPDATE upload_sessions us SET status = 'ABORTED'
+			WHERE us.status = 'INITIATED'
+			  AND us.updated_at <= CURRENT_TIMESTAMP - ($2 * INTERVAL '1 second')
+			  AND EXISTS (SELECT 1 FROM session_blocks sb WHERE sb.session_id = us.id AND sb.block_hash = $1)
+			`, hash, domain.UploadSessionMaxAge.Seconds()); err != nil {
+				return fmt.Errorf("expire stale upload sessions for block: %w", err)
+			}
+		}
+		inUse, err := r.WithTx(tx).isBlockReferenced(ctx, hash)
+		if err != nil {
+			return err
+		}
+		if inUse {
+			return nil
+		}
+		if !dryRun {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM blocks WHERE sha256 = $1`, hash); err != nil {
+				return fmt.Errorf("remove orphan block metadata: %w", err)
+			}
+		}
+		eligible = true
+		if err := deleteObject(); err != nil {
+			return err
+		}
+		return nil
+	})
+	return eligible, err
+}
+
+// ExpireStaleUploadSessions transitions inactive upload sessions to ABORTED.
+// This invalidates their completion path before GC removes any associated data.
+func (r *BlockRepository) ExpireStaleUploadSessions(ctx context.Context, dryRun bool) (int64, error) {
+	const cutoff = `CURRENT_TIMESTAMP - ($1 * INTERVAL '1 second')`
+	if dryRun {
+		var count int64
+		if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM upload_sessions WHERE status = 'INITIATED' AND updated_at <= `+cutoff, domain.UploadSessionMaxAge.Seconds()).Scan(&count); err != nil {
+			return 0, fmt.Errorf("count stale upload sessions: %w", err)
+		}
+		return count, nil
+	}
+	const q = `
+		UPDATE upload_sessions
+		SET status = 'ABORTED'
+		WHERE status = 'INITIATED'
+		  AND updated_at <= CURRENT_TIMESTAMP - ($1 * INTERVAL '1 second')
+	`
+	result, err := r.db.ExecContext(ctx, q, domain.UploadSessionMaxAge.Seconds())
+	if err != nil {
+		return 0, fmt.Errorf("expire stale upload sessions: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count expired upload sessions: %w", err)
+	}
+	return count, nil
+}
+
+func (r *BlockRepository) isBlockReferenced(ctx context.Context, hash string) (bool, error) {
+	const q = `
+		SELECT EXISTS (
+		        SELECT 1 FROM file_blocks fb JOIN blocks b ON b.id = fb.block_id WHERE b.sha256 = $1
+		    ) OR EXISTS (SELECT 1 FROM file_versions fv WHERE $1 = ANY(fv.chunk_hashes))
+		      OR EXISTS (
+				SELECT 1 FROM session_blocks sb
+				JOIN upload_sessions us ON us.id = sb.session_id
+				WHERE sb.block_hash = $1 AND us.status = 'INITIATED'
+				  AND us.updated_at > CURRENT_TIMESTAMP - ($2 * INTERVAL '1 second')
+			)
+	`
+	var inUse bool
+	if err := r.db.QueryRowContext(ctx, q, hash, domain.UploadSessionMaxAge.Seconds()).Scan(&inUse); err != nil {
+		return false, fmt.Errorf("check block usage: %w", err)
+	}
+	return inUse, nil
+}
+
+// WithStagingCandidate locks the upload session row across staging deletion.
+// Active sessions are preserved; terminal or missing sessions can be collected
+// after the configured object-age grace period.
+func (r *BlockRepository) WithStagingCandidate(ctx context.Context, sessionID string, dryRun bool, deleteObject func() error) (bool, error) {
+	db, ok := r.db.(*sql.DB)
+	if !ok {
+		return false, fmt.Errorf("WithStagingCandidate requires a database pool, got %T", r.db)
+	}
+	eligible := false
+	err := RunInTx(ctx, db, func(tx DBTX) error {
+		var status string
+		var fresh bool
+		err := tx.QueryRowContext(ctx, `SELECT status, updated_at > CURRENT_TIMESTAMP - ($2 * INTERVAL '1 second') FROM upload_sessions WHERE id = $1 FOR UPDATE`, sessionID, domain.UploadSessionMaxAge.Seconds()).Scan(&status, &fresh)
+		if errors.Is(err, sql.ErrNoRows) {
+			status = ""
+		} else if err != nil {
+			return fmt.Errorf("lock upload session for staging GC: %w", err)
+		}
+		if status == "INITIATED" && fresh {
+			return nil
+		}
+		if status == "INITIATED" && !dryRun {
+			if _, err := tx.ExecContext(ctx, `UPDATE upload_sessions SET status = 'ABORTED' WHERE id = $1 AND status = 'INITIATED'`, sessionID); err != nil {
+				return fmt.Errorf("expire stale upload session: %w", err)
+			}
+		}
+		eligible = true
+		if err := deleteObject(); err != nil {
+			return err
+		}
+		return nil
+	})
+	return eligible, err
 }

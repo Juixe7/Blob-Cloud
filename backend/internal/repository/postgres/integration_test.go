@@ -14,14 +14,18 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	// Register the pgx driver under the name "pgx" for database/sql.
 	_ "github.com/jackc/pgx/v5/stdlib"
 
 	"go-drive-clone/internal/database"
 	"go-drive-clone/internal/domain"
+	"go-drive-clone/internal/queue"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
+	"go-drive-clone/internal/service"
 )
 
 // dsn returns the connection string to use: DB_DSN env var or the default that
@@ -97,6 +101,245 @@ func TestMigrations_Idempotent(t *testing.T) {
 	// Running migrations a second time must be a no-op, not an error.
 	if err := database.RunMigrations(context.Background(), db, log); err != nil {
 		t.Fatalf("second RunMigrations should be idempotent: %v", err)
+	}
+}
+
+func TestJournalCursorCommitOrderAndRollback(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	user := &domain.User{Email: "journal-order@example.com", PasswordHash: "test"}
+	if err := postgresrepo.NewUserRepository(db).Create(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+	journal := postgresrepo.NewJournalRepository(db)
+	firstTx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := &domain.JournalEntry{UserID: user.ID, FileID: "00000000-0000-4000-8000-000000000001", Action: domain.ActionFileCreated, Name: "first"}
+	firstCursor, err := journal.WithTx(firstTx).Record(ctx, first)
+	if err != nil {
+		_ = firstTx.Rollback()
+		t.Fatal(err)
+	}
+
+	secondResult := make(chan struct {
+		cursor int64
+		err    error
+	}, 1)
+	go func() {
+		entry := &domain.JournalEntry{UserID: user.ID, FileID: "00000000-0000-4000-8000-000000000002", Action: domain.ActionFileCreated, Name: "second"}
+		cursor, err := journal.Record(ctx, entry)
+		secondResult <- struct {
+			cursor int64
+			err    error
+		}{cursor, err}
+	}()
+	select {
+	case got := <-secondResult:
+		_ = firstTx.Rollback()
+		t.Fatalf("second writer passed the uncommitted cursor lock: %+v", got)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := firstTx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	second := <-secondResult
+	if second.err != nil || second.cursor <= firstCursor {
+		t.Fatalf("cursor order does not follow commit order: first=%d second=%+v", firstCursor, second)
+	}
+	entries, high, more, err := journal.ListSince(ctx, user.ID, firstCursor, 10)
+	if err != nil || more || high != second.cursor || len(entries) != 1 || entries[0].Cursor != second.cursor {
+		t.Fatalf("delta after first commit lost or reordered second event: entries=%+v high=%d more=%v err=%v", entries, high, more, err)
+	}
+
+	rollbackTx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghost := &domain.JournalEntry{UserID: user.ID, FileID: "00000000-0000-4000-8000-000000000003", Action: domain.ActionFileCreated, Name: "rolled-back"}
+	if _, err := journal.WithTx(rollbackTx).Record(ctx, ghost); err != nil {
+		_ = rollbackTx.Rollback()
+		t.Fatal(err)
+	}
+	if err := rollbackTx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, _, err = journal.ListSince(ctx, user.ID, 0, 10)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("rolled-back journal event became visible: entries=%+v err=%v", entries, err)
+	}
+}
+
+func TestJournalPaginationReplayAndUserIsolation(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	firstUser := &domain.User{Email: "journal-page-a@example.com", PasswordHash: "test"}
+	otherUser := &domain.User{Email: "journal-page-b@example.com", PasswordHash: "test"}
+	for _, user := range []*domain.User{firstUser, otherUser} {
+		if err := users.Create(ctx, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	journal := postgresrepo.NewJournalRepository(db)
+	for i := 1; i <= 3; i++ {
+		entry := &domain.JournalEntry{
+			UserID: firstUser.ID, FileID: fmt.Sprintf("00000000-0000-4000-8000-%012d", i),
+			Action: domain.ActionFileCreated, Name: fmt.Sprintf("file-%d", i),
+		}
+		if _, err := journal.Record(ctx, entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := journal.Record(ctx, &domain.JournalEntry{
+		UserID: otherUser.ID, FileID: "00000000-0000-4000-8000-000000000099",
+		Action: domain.ActionFileCreated, Name: "private",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var cursor int64
+	for expected := 1; expected <= 3; expected++ {
+		page, next, more, err := journal.ListSince(ctx, firstUser.ID, cursor, 1)
+		if err != nil || len(page) != 1 || page[0].Name != fmt.Sprintf("file-%d", expected) {
+			t.Fatalf("page %d incorrect: entries=%+v err=%v", expected, page, err)
+		}
+		if more != (expected < 3) {
+			t.Fatalf("page %d has_more=%v, want %v", expected, more, expected < 3)
+		}
+		cursor = next
+	}
+	replay, sameCursor, more, err := journal.ListSince(ctx, firstUser.ID, cursor, 1)
+	if err != nil || len(replay) != 0 || sameCursor != cursor || more {
+		t.Fatalf("replay from latest cursor was not empty: entries=%+v cursor=%d more=%v err=%v", replay, sameCursor, more, err)
+	}
+	otherPage, _, _, err := journal.ListSince(ctx, otherUser.ID, 0, 10)
+	if err != nil || len(otherPage) != 1 || otherPage[0].Name != "private" {
+		t.Fatalf("user-scoped journal query leaked or omitted rows: entries=%+v err=%v", otherPage, err)
+	}
+}
+
+func TestRenameAndJournalFailureRollbackTogether(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	user := &domain.User{Email: "journal-atomic@example.com", PasswordHash: "test"}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+	file := &domain.File{UserID: user.ID, Name: "before.txt", MimeType: "text/plain"}
+	if err := files.Create(ctx, file); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE FUNCTION reject_test_journal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected journal failure'; END; $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_test_journal BEFORE INSERT ON journal_entries FOR EACH ROW EXECUTE FUNCTION reject_test_journal()`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = db.ExecContext(context.Background(), `DROP TRIGGER IF EXISTS reject_test_journal ON journal_entries`)
+		_, _ = db.ExecContext(context.Background(), `DROP FUNCTION IF EXISTS reject_test_journal()`)
+	}()
+
+	svc := service.NewFileService(db, users, files, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).WithJournal(postgresrepo.NewJournalRepository(db))
+	if _, err := svc.RenameMove(ctx, user.ID, file.ID, service.RenameMoveRequest{Name: "after.txt"}); err == nil {
+		t.Fatal("expected injected journal failure")
+	}
+	got, err := files.GetByID(ctx, file.ID)
+	if err != nil || got.Name != "before.txt" {
+		t.Fatalf("file mutation escaped failed journal transaction: got=%+v err=%v", got, err)
+	}
+	entries, _, _, err := postgresrepo.NewJournalRepository(db).ListSince(ctx, user.ID, 0, 10)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("phantom journal event after rollback: entries=%+v err=%v", entries, err)
+	}
+}
+
+func TestProcessingStatusAndJournalCommitTogether(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	user := &domain.User{Email: "journal-processing@example.com", PasswordHash: "test"}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+	file := &domain.File{UserID: user.ID, Name: "encrypted.bin", IsEncrypted: true, Status: "PROCESSING"}
+	if err := files.Create(ctx, file); err != nil {
+		t.Fatal(err)
+	}
+	journal := postgresrepo.NewJournalRepository(db)
+	processor := queue.NewFileProcessor(files, nil, nil, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).
+		WithDatabase(db).WithJournal(journal)
+	if err := processor.ProcessMessage(ctx, queue.ThumbnailMessage{FileID: file.ID, UserID: user.ID}); err != nil {
+		t.Fatalf("process encrypted file: %v", err)
+	}
+	updated, err := files.GetByID(ctx, file.ID)
+	if err != nil || updated.Status != "ACTIVE" {
+		t.Fatalf("processing status not activated: file=%+v err=%v", updated, err)
+	}
+	entries, _, _, err := journal.ListSince(ctx, user.ID, 0, 10)
+	if err != nil || len(entries) != 1 || entries[0].FileID != file.ID || entries[0].Action != domain.ActionFileUpdated || entries[0].Status != "ACTIVE" {
+		t.Fatalf("processing transition missing from delta journal: entries=%+v err=%v", entries, err)
+	}
+}
+
+func TestBulkMoveSharedFolderJournalsCreatedShortcut(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
+	owner := &domain.User{Email: "bulk-move-owner@example.com", PasswordHash: "test"}
+	editor := &domain.User{Email: "bulk-move-editor@example.com", PasswordHash: "test"}
+	for _, user := range []*domain.User{owner, editor} {
+		if err := users.Create(ctx, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sharedFolder := &domain.File{UserID: owner.ID, Name: "shared-folder", IsDirectory: true}
+	if err := files.Create(ctx, sharedFolder); err != nil {
+		t.Fatal(err)
+	}
+	destination := &domain.File{UserID: editor.ID, Name: "destination", IsDirectory: true}
+	if err := files.Create(ctx, destination); err != nil {
+		t.Fatal(err)
+	}
+	if err := perms.GrantPermission(ctx, &domain.Permission{
+		FileID: sharedFolder.ID, GranteeEmail: editor.Email, Role: domain.RoleEditor,
+		Status: domain.PermissionStatusAccepted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	journal := postgresrepo.NewJournalRepository(db)
+	svc := service.NewFileService(db, users, files, nil, perms, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).WithJournal(journal)
+	if err := svc.BulkMove(ctx, editor.ID, domain.BulkMoveRequest{IDs: []string{sharedFolder.ID}, ParentID: &destination.ID}); err != nil {
+		t.Fatalf("bulk move shared folder: %v", err)
+	}
+	original, err := files.GetByID(ctx, sharedFolder.ID)
+	if err != nil || original.ParentID != nil {
+		t.Fatalf("shared canonical folder was moved: file=%+v err=%v", original, err)
+	}
+	items, err := files.ListDirectory(ctx, editor.ID, &destination.ID)
+	if err != nil || len(items) != 1 || items[0].TargetID == nil || *items[0].TargetID != sharedFolder.ID {
+		t.Fatalf("expected shortcut in destination: items=%+v err=%v", items, err)
+	}
+	entries, _, _, err := journal.ListSince(ctx, editor.ID, 0, 10)
+	if err != nil || len(entries) != 1 || entries[0].Action != domain.ActionFileCreated || entries[0].FileID != items[0].ID {
+		t.Fatalf("delta does not describe actual shortcut mutation: entries=%+v err=%v shortcut=%s", entries, err, items[0].ID)
 	}
 }
 
@@ -504,10 +747,241 @@ func TestPermission_RecursiveCTE(t *testing.T) {
 	}
 	// ...but it IS satisfied if EDITOR+OWNER are both acceptable.
 	allowed, _ = perms.CheckUserPermission(ctx, leaf.ID, "coworker@example.com", []string{domain.RoleViewer, domain.RoleEditor})
-		if !allowed {
-			t.Fatal("VIEWER should satisfy a [VIEWER,EDITOR] requirement")
+	if !allowed {
+		t.Fatal("VIEWER should satisfy a [VIEWER,EDITOR] requirement")
+	}
+}
+
+func TestPermission_DirectGrantOverridesInheritedGrant(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
+	owner := &domain.User{Email: fmt.Sprintf("acl-owner-%d@example.com", time.Now().UnixNano()), PasswordHash: "x"}
+	if err := users.Create(ctx, owner); err != nil {
+		t.Fatal(err)
+	}
+	folder := &domain.File{UserID: owner.ID, Name: "shared", IsDirectory: true}
+	if err := files.Create(ctx, folder); err != nil {
+		t.Fatal(err)
+	}
+	child := &domain.File{UserID: owner.ID, ParentID: &folder.ID, Name: "restricted.txt", Status: "ACTIVE"}
+	if err := files.Create(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	email := fmt.Sprintf("acl-recipient-%d@example.com", time.Now().UnixNano())
+	for _, grant := range []*domain.Permission{
+		{FileID: folder.ID, GranteeEmail: email, Role: domain.RoleEditor, Status: domain.PermissionStatusAccepted},
+		{FileID: child.ID, GranteeEmail: email, Role: domain.RoleViewer, Status: domain.PermissionStatusAccepted},
+	} {
+		if err := perms.GrantPermission(ctx, grant); err != nil {
+			t.Fatal(err)
 		}
 	}
+	role, err := files.GetResolvedPermission(ctx, child.ID, email)
+	if err != nil || role != domain.RoleViewer {
+		t.Fatalf("resolved role = %q, err=%v; want nearest VIEWER grant", role, err)
+	}
+	canRead, err := perms.CheckUserPermission(ctx, child.ID, email, []string{domain.RoleViewer, domain.RoleEditor, domain.RoleOwner})
+	if err != nil || !canRead {
+		t.Fatalf("read permission = %v, err=%v; want allowed", canRead, err)
+	}
+	canWrite, err := perms.CheckUserPermission(ctx, child.ID, email, []string{domain.RoleEditor, domain.RoleOwner})
+	if err != nil || canWrite {
+		t.Fatalf("write permission = %v, err=%v; nearest VIEWER grant must override inherited EDITOR", canWrite, err)
+	}
+	// Corrupt a test hierarchy into a cycle. Permission resolution must terminate
+	// and continue to honor the nearest file grant instead of recursing forever.
+	if _, err := db.ExecContext(ctx, `UPDATE files SET parent_id=$1 WHERE id=$2`, child.ID, folder.ID); err != nil {
+		t.Fatal(err)
+	}
+	role, err = files.GetResolvedPermission(ctx, child.ID, email)
+	if err != nil || role != domain.RoleViewer {
+		t.Fatalf("cycle-safe resolved role = %q, err=%v", role, err)
+	}
+	canWrite, err = perms.CheckUserPermission(ctx, child.ID, email, []string{domain.RoleEditor, domain.RoleOwner})
+	if err != nil || canWrite {
+		t.Fatalf("cycle-safe write permission = %v, err=%v; want denied", canWrite, err)
+	}
+}
+
+func TestNestedFileAuthorizationRoleMatrix(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
+	suffix := time.Now().UnixNano()
+	owner := &domain.User{Email: fmt.Sprintf("nested-owner-%d@example.com", suffix), PasswordHash: "x"}
+	editor := &domain.User{Email: fmt.Sprintf("nested-editor-%d@example.com", suffix), PasswordHash: "x"}
+	viewer := &domain.User{Email: fmt.Sprintf("nested-viewer-%d@example.com", suffix), PasswordHash: "x"}
+	foreign := &domain.User{Email: fmt.Sprintf("nested-foreign-%d@example.com", suffix), PasswordHash: "x"}
+	for _, user := range []*domain.User{owner, editor, viewer, foreign} {
+		if err := users.Create(ctx, user); err != nil {
+			t.Fatalf("create user %s: %v", user.Email, err)
+		}
+	}
+	root := &domain.File{UserID: owner.ID, Name: "shared-root", IsDirectory: true, Status: "ACTIVE"}
+	child := &domain.File{UserID: owner.ID, Name: "nested-folder", ParentID: &root.ID, IsDirectory: true, Status: "ACTIVE"}
+	leaf := &domain.File{UserID: owner.ID, Name: "nested-file.txt", ParentID: &child.ID, Status: "ACTIVE"}
+	for _, file := range []*domain.File{root, child, leaf} {
+		if err := files.Create(ctx, file); err != nil {
+			t.Fatalf("create nested resource %s: %v", file.Name, err)
+		}
+	}
+	for _, grant := range []*domain.Permission{
+		{FileID: root.ID, GranteeEmail: editor.Email, Role: domain.RoleEditor, Status: domain.PermissionStatusAccepted},
+		{FileID: root.ID, GranteeEmail: viewer.Email, Role: domain.RoleViewer, Status: domain.PermissionStatusAccepted},
+	} {
+		if err := perms.GrantPermission(ctx, grant); err != nil {
+			t.Fatalf("grant nested access: %v", err)
+		}
+	}
+	fileService := service.NewFileService(db, users, files, nil, perms, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	resources := []struct {
+		name string
+		id   string
+	}{
+		{"shared root folder", root.ID},
+		{"nested folder", child.ID},
+		{"nested file", leaf.ID},
+	}
+	actors := []struct {
+		name       string
+		user       *domain.User
+		read, write bool
+	}{
+		{"owner", owner, true, true},
+		{"editor", editor, true, true},
+		{"viewer", viewer, true, false},
+		{"foreign user", foreign, false, false},
+	}
+	for _, resource := range resources {
+		for _, actor := range actors {
+			t.Run(resource.name+"/"+actor.name, func(t *testing.T) {
+				readErr := fileService.AuthoriseRead(ctx, actor.user.ID, resource.id)
+				if got := readErr == nil; got != actor.read {
+					t.Errorf("read allowed=%v, want %v (err=%v)", got, actor.read, readErr)
+				}
+				writeErr := fileService.AuthoriseWrite(ctx, actor.user.ID, resource.id)
+				if got := writeErr == nil; got != actor.write {
+					t.Errorf("write allowed=%v, want %v (err=%v)", got, actor.write, writeErr)
+				}
+			})
+		}
+	}
+}
+
+func TestShortcutAuthorizationUsesCurrentCanonicalTargetAccess(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
+	owner := &domain.User{Email: fmt.Sprintf("shortcut-owner-%d@example.com", time.Now().UnixNano()), PasswordHash: "x"}
+	viewer := &domain.User{Email: fmt.Sprintf("shortcut-viewer-%d@example.com", time.Now().UnixNano()), PasswordHash: "x"}
+	for _, user := range []*domain.User{owner, viewer} {
+		if err := users.Create(ctx, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := &domain.File{UserID: owner.ID, Name: "shared-target.txt", Status: "ACTIVE"}
+	if err := files.Create(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := perms.GrantPermission(ctx, &domain.Permission{
+		FileID: target.ID, GranteeEmail: viewer.Email, Role: domain.RoleViewer,
+		Status: domain.PermissionStatusAccepted,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	targetID := target.ID
+	shortcut := &domain.File{
+		UserID: viewer.ID, Name: target.Name, TargetID: &targetID,
+		ShortcutTargetID: &targetID, MimeType: "application/vnd.google-apps.shortcut", Status: "ACTIVE",
+	}
+	if err := files.Create(ctx, shortcut); err != nil {
+		t.Fatal(err)
+	}
+	fileService := service.NewFileService(db, users, files, nil, perms, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := fileService.AuthoriseRead(ctx, viewer.ID, shortcut.ID); err != nil {
+		t.Fatalf("viewer should read target through shortcut before revoke: %v", err)
+	}
+	if err := fileService.AuthoriseWrite(ctx, viewer.ID, shortcut.ID); err == nil {
+		t.Fatal("owning a shortcut must not grant write access to a viewer-only target")
+	}
+	if err := perms.RevokePermission(ctx, target.ID, viewer.Email); err != nil {
+		t.Fatal(err)
+	}
+	if err := fileService.AuthoriseRead(ctx, viewer.ID, shortcut.ID); err == nil {
+		t.Fatal("shortcut continued to grant read access after target permission was revoked")
+	}
+
+	cycleA := &domain.File{UserID: viewer.ID, Name: "cycle-a", Status: "ACTIVE"}
+	cycleB := &domain.File{UserID: viewer.ID, Name: "cycle-b", Status: "ACTIVE"}
+	if err := files.Create(ctx, cycleA); err != nil {
+		t.Fatal(err)
+	}
+	if err := files.Create(ctx, cycleB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE files SET target_id=$1, shortcut_target_id=$1 WHERE id=$2", cycleB.ID, cycleA.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE files SET target_id=$1, shortcut_target_id=$1 WHERE id=$2", cycleA.ID, cycleB.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fileService.AuthoriseRead(ctx, viewer.ID, cycleA.ID); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("cyclic shortcuts should fail closed with a cycle error, got %v", err)
+	}
+}
+
+func TestPublicShortcutRequiresUnrevokedLinkInsideTransaction(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
+	owner := &domain.User{Email: fmt.Sprintf("public-owner-%d@example.com", time.Now().UnixNano()), PasswordHash: "x"}
+	viewer := &domain.User{Email: fmt.Sprintf("public-viewer-%d@example.com", time.Now().UnixNano()), PasswordHash: "x"}
+	for _, user := range []*domain.User{owner, viewer} {
+		if err := users.Create(ctx, user); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := &domain.File{UserID: owner.ID, Name: "link-target.txt", Status: "ACTIVE"}
+	if err := files.Create(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	linkRepo := postgresrepo.NewShareableLinkRepository(db)
+	link := &domain.ShareableLink{FileID: target.ID, LinkToken: fmt.Sprintf("valid-link-%d", time.Now().UnixNano()), AccessTier: domain.RoleViewer}
+	if err := linkRepo.Create(ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	fileService := service.NewFileService(db, users, files, nil, perms, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).WithJournal(postgresrepo.NewJournalRepository(db))
+	shortcut, err := fileService.CreateShortcutFromPublicLink(ctx, viewer.ID, target.ID, nil, link.LinkToken)
+	if err != nil {
+		t.Fatalf("create shortcut from active public link: %v", err)
+	}
+	if shortcut.TargetID == nil || *shortcut.TargetID != target.ID {
+		t.Fatalf("shortcut target = %v, want %s", shortcut.TargetID, target.ID)
+	}
+	if err := linkRepo.DeleteByFileAndToken(ctx, target.ID, link.LinkToken); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fileService.CreateShortcutFromPublicLink(ctx, viewer.ID, target.ID, nil, link.LinkToken); err == nil {
+		t.Fatal("revoked public link still allowed a new shortcut")
+	}
+}
 
 // ===========================================================================
 // Phase 7.4: Update (rename/move), IsDescendant, DeleteRecursive
@@ -859,5 +1333,3 @@ func TestFileRepository_DeleteRecursive_PreservesUnrelatedFiles(t *testing.T) {
 		t.Fatalf("file in_b should still exist: %v", err)
 	}
 }
-
-

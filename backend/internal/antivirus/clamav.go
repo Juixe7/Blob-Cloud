@@ -22,7 +22,7 @@ func NewClamAVClient(address string) *ClamAVClient {
 // It returns (isClean, virusName, error).
 func (c *ClamAVClient) ScanStream(ctx context.Context, reader io.Reader) (bool, string, error) {
 	if c.Address == "" {
-		return true, "", nil // Bypass if not configured
+		return false, "", errors.New("clamav address is not configured")
 	}
 
 	var d net.Dialer
@@ -33,9 +33,14 @@ func (c *ClamAVClient) ScanStream(ctx context.Context, reader io.Reader) (bool, 
 	defer conn.Close()
 
 	// Handle context cancellation to close connection early
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		conn.Close()
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
 	}()
 
 	// Send zINSTREAM command
@@ -84,7 +89,7 @@ func (c *ClamAVClient) ScanStream(ctx context.Context, reader io.Reader) (bool, 
 	response := strings.TrimRight(string(respBuf), "\000")
 	response = strings.TrimSpace(response)
 
-	if strings.Contains(response, "OK") {
+	if strings.HasSuffix(response, " OK") {
 		return true, "", nil
 	}
 

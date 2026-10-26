@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,6 +16,13 @@ type JournalRepository struct {
 	db DBTX
 }
 
+// journalCursorLockSeed derives stable transaction lock keys per recipient.
+// BIGSERIAL values are allocated before commit, so each recipient's writers
+// must hold a lock through commit to keep their visible cursor order gap-safe.
+// Per-user locks avoid serializing unrelated users; batch writers acquire them
+// in sorted order to avoid deadlocks.
+const journalCursorLockSeed int64 = 781245930124
+
 // NewJournalRepository constructs a JournalRepository bound to the given pool.
 func NewJournalRepository(db *sql.DB) *JournalRepository {
 	return &JournalRepository{db: db}
@@ -25,8 +33,40 @@ func (r *JournalRepository) WithTx(tx DBTX) *JournalRepository {
 	return &JournalRepository{db: tx}
 }
 
+func (r *JournalRepository) lockJournalUsers(ctx context.Context, userIDs ...string) error {
+	unique := make(map[string]struct{}, len(userIDs))
+	for _, id := range userIDs {
+		if id != "" {
+			unique[id] = struct{}{}
+		}
+	}
+	ordered := make([]string, 0, len(unique))
+	for id := range unique {
+		ordered = append(ordered, id)
+	}
+	sort.Strings(ordered)
+	for _, id := range ordered {
+		if _, err := r.db.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, $2))`, id, journalCursorLockSeed); err != nil {
+			return fmt.Errorf("lock journal cursor order for user: %w", err)
+		}
+	}
+	return nil
+}
+
 // Record inserts a new journal entry and returns the monotonic cursor generated.
 func (r *JournalRepository) Record(ctx context.Context, entry *domain.JournalEntry) (int64, error) {
+	if db, ok := r.db.(*sql.DB); ok {
+		var cursor int64
+		err := RunInTx(ctx, db, func(tx DBTX) error {
+			var err error
+			cursor, err = r.WithTx(tx).Record(ctx, entry)
+			return err
+		})
+		return cursor, err
+	}
+	if err := r.lockJournalUsers(ctx, entry.UserID); err != nil {
+		return 0, err
+	}
 	const q = `
 		INSERT INTO journal_entries (
 			user_id, file_id, action, parent_id, name,
@@ -61,12 +101,28 @@ func (r *JournalRepository) BatchRecord(ctx context.Context, entries []*domain.J
 	if len(entries) == 0 {
 		return nil, nil
 	}
+	if db, ok := r.db.(*sql.DB); ok {
+		var cursors []int64
+		err := RunInTx(ctx, db, func(tx DBTX) error {
+			var err error
+			cursors, err = r.WithTx(tx).BatchRecord(ctx, entries)
+			return err
+		})
+		return cursors, err
+	}
 	if len(entries) == 1 {
 		c, err := r.Record(ctx, entries[0])
 		if err != nil {
 			return nil, err
 		}
 		return []int64{c}, nil
+	}
+	userIDs := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		userIDs = append(userIDs, entry.UserID)
+	}
+	if err := r.lockJournalUsers(ctx, userIDs...); err != nil {
+		return nil, err
 	}
 
 	var b strings.Builder
@@ -99,7 +155,7 @@ func (r *JournalRepository) BatchRecord(ctx context.Context, entries []*domain.J
 			e.ThumbnailURL,
 		)
 	}
-	b.WriteString(" RETURNING cursor, created_at")
+	b.WriteString(" RETURNING cursor, created_at, user_id, file_id, action")
 
 	rows, err := r.db.QueryContext(ctx, b.String(), args...)
 	if err != nil {
@@ -107,22 +163,47 @@ func (r *JournalRepository) BatchRecord(ctx context.Context, entries []*domain.J
 	}
 	defer rows.Close()
 
-	cursors := make([]int64, 0, len(entries))
-	idx := 0
+	type returnedEntry struct {
+		cursor    int64
+		createdAt time.Time
+		userID    string
+		fileID    string
+		action    string
+	}
+	returned := make([]returnedEntry, 0, len(entries))
 	for rows.Next() {
-		var cursor int64
-		var createdAt time.Time
-		if err := rows.Scan(&cursor, &createdAt); err != nil {
+		var result returnedEntry
+		if err := rows.Scan(&result.cursor, &result.createdAt, &result.userID, &result.fileID, &result.action); err != nil {
 			return nil, fmt.Errorf("scan batch journal entry: %w", err)
 		}
-		if idx < len(entries) {
-			entries[idx].Cursor = cursor
-			entries[idx].CreatedAt = createdAt
-			idx++
-		}
-		cursors = append(cursors, cursor)
+		returned = append(returned, result)
 	}
-	return cursors, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(returned, func(i, j int) bool { return returned[i].cursor < returned[j].cursor })
+	type entryKey struct{ userID, fileID, action string }
+	byKey := make(map[entryKey][]*domain.JournalEntry, len(entries))
+	indexes := make(map[*domain.JournalEntry]int, len(entries))
+	for i, entry := range entries {
+		key := entryKey{entry.UserID, entry.FileID, entry.Action}
+		byKey[key] = append(byKey[key], entry)
+		indexes[entry] = i
+	}
+	cursors := make([]int64, len(entries))
+	for _, result := range returned {
+		key := entryKey{result.userID, result.fileID, result.action}
+		matching := byKey[key]
+		if len(matching) == 0 {
+			return nil, fmt.Errorf("batch journal returned an unexpected row")
+		}
+		entry := matching[0]
+		byKey[key] = matching[1:]
+		entry.Cursor = result.cursor
+		entry.CreatedAt = result.createdAt
+		cursors[indexes[entry]] = result.cursor
+	}
+	return cursors, nil
 }
 
 // ListSince retrieves up to `limit` entries with cursor > sinceCursor for a user.

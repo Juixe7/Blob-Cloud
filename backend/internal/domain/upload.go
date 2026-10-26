@@ -5,6 +5,16 @@ import (
 	"time"
 )
 
+// UploadSessionMaxAge is the inactivity window before GC expires an abandoned
+// upload. Upload progress refreshes updated_at, so active resumable sessions
+// remain protected while abandoned staging data can eventually be reclaimed.
+const UploadSessionMaxAge = 24 * time.Hour
+
+// StagingUploadURLLifetime is the maximum lifetime of a direct upload URL.
+// GC's production MinBlockAge must be at least this long so a still-valid
+// upload capability cannot race staging cleanup.
+const StagingUploadURLLifetime = 30 * time.Minute
+
 // ---------------------------------------------------------------------------
 // Upload session statuses. Stored as varchar in the DB; these constants keep
 // the spelling consistent across service, repository, and transport layers.
@@ -89,20 +99,20 @@ type Permission struct {
 
 // ShareInvitation represents the enriched view model displayed on the recipient's invitation card.
 type ShareInvitation struct {
-	ID          string     `json:"id"`
-	FileID      string     `json:"file_id"`
-	Role        string     `json:"role"`
-	Status      string     `json:"status"`
-	Message     *string    `json:"message,omitempty"`
-	ExpiresAt   time.Time  `json:"expires_at"`
-	CreatedAt   time.Time  `json:"created_at"`
-	FileName    string     `json:"file_name"`
-	IsDirectory bool       `json:"is_directory"`
-	SizeBytes   int64      `json:"size_bytes"`
-	MimeType    string     `json:"mime_type"`
-	Summary     *string    `json:"summary,omitempty"`
-	Tags        *string    `json:"tags,omitempty"`
-	SenderEmail string     `json:"sender_email"`
+	ID          string    `json:"id"`
+	FileID      string    `json:"file_id"`
+	Role        string    `json:"role"`
+	Status      string    `json:"status"`
+	Message     *string   `json:"message,omitempty"`
+	ExpiresAt   time.Time `json:"expires_at"`
+	CreatedAt   time.Time `json:"created_at"`
+	FileName    string    `json:"file_name"`
+	IsDirectory bool      `json:"is_directory"`
+	SizeBytes   int64     `json:"size_bytes"`
+	MimeType    string    `json:"mime_type"`
+	Summary     *string   `json:"summary,omitempty"`
+	Tags        *string   `json:"tags,omitempty"`
+	SenderEmail string    `json:"sender_email"`
 }
 
 // PermissionRepository abstracts persistence for sharing.

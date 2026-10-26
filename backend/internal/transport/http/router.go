@@ -56,9 +56,8 @@ func NewRouter(s *Server, rl RateLimiters) http.Handler {
 	// Prometheus metrics endpoint — not behind auth, accessed by scraper only.
 	r.Get("/metrics", metrics.Handler().ServeHTTP)
 
-	// --- Phase 1 & Phase 3: storage simulation + staging ---
+	// --- Local development staging upload endpoint. CAS writes are server-only. ---
 	r.Get("/health", s.HandleHealth)
-	r.Put("/local-storage/blocks/{hash}", s.HandlePutBlock)
 	r.Put("/local-storage/staging/{session_id}/{index}", s.HandlePutStagingBlock)
 
 	// --- Auth endpoints — strict rate limit (brute-force / credential stuffing) ---
@@ -132,6 +131,7 @@ func NewRouter(s *Server, rl RateLimiters) http.Handler {
 			r.Patch("/{id}/share/{email}", s.HandleUpdateShare)
 			r.Delete("/{id}/share/{email}", s.HandleRevokeShare)
 			r.Post("/{id}/links", s.HandleCreatePublicLink)
+			r.Delete("/{id}/links/{token}", s.HandleRevokePublicLink)
 			r.Post("/{id}/view", s.HandleRecordView)
 			r.Get("/{id}/permissions", s.HandleListPermissions)
 			r.Patch("/{id}", s.HandleRenameMove)

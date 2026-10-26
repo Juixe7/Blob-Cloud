@@ -196,7 +196,7 @@ func main() {
 			auditRepo := postgresrepo.NewAuditRepository(db, log)
 			srv = srv.WithAudit(auditRepo)
 			journal := postgresrepo.NewJournalRepository(db)
-			srv = srv.WithJournal(journal)
+			srv = srv.WithJournal(journal).WithDatabase(db)
 
 			// AI Client initialization (available for search, summarisation, and queue processing)
 			var aiClient ai.AIClient
@@ -214,7 +214,7 @@ func main() {
 			}
 
 			// Processor for thumbnail generation, virus scanning, and AI metadata extraction
-			processor := queue.NewFileProcessor(files, blocks, storageProvider, notifier, aiClient, clamClient, log)
+			processor := queue.NewFileProcessor(files, blocks, storageProvider, notifier, aiClient, clamClient, log).WithDatabase(db).WithJournal(journal).WithPermissions(perms)
 
 			// Queue & Worker Pool wiring:
 			// If SQS_QUEUE_URL is provided, use AWS SQS Publisher and WorkerPool.
@@ -246,6 +246,14 @@ func main() {
 				channelQueue.Start(workerCtx, &workerWg)
 				publisher = channelQueue
 				log.Info("in-process channel worker pool started (SQS not configured)", "workers", 2)
+			}
+			if publisher != nil {
+				outbox := queue.NewOutboxDispatcher(db, publisher, log)
+				workerWg.Add(1)
+				go func() {
+					defer workerWg.Done()
+					outbox.Run(workerCtx)
+				}()
 			}
 
 			uploadSvc := service.NewUploadService(db, users, files, blocks, sessions, perms, storageProvider, publisher, notifier, log).WithJournal(journal)

@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
+	"time"
 
 	"go-drive-clone/internal/domain"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
@@ -49,6 +51,10 @@ type FileStore interface {
 type BlockStore interface {
 	ListFileBlockHashes(ctx context.Context, fileID string) ([]string, error)
 	ListFileBlocks(ctx context.Context, fileID string) ([]*domain.Block, error)
+}
+
+type BlockGarbageCollector interface {
+	WithBlockCandidate(ctx context.Context, hash string, dryRun bool, deleteObject func() error) (bool, error)
 }
 
 // PermissionStore defines the permission verification operations used by FileService.
@@ -101,100 +107,108 @@ func (s *FileService) WithNotifier(notifier wsSync.Notifier) *FileService {
 	return s
 }
 
-func (s *FileService) recordAndNotify(ctx context.Context, userID, fileID, action string, file *domain.File, preResolvedRecipients ...string) {
-	if s.journal == nil && s.notifier == nil {
-		return
-	}
-
-	// 1. Resolve all recipients (actor + pre-resolved + collaborators & owners via DB)
-	recipientSet := make(map[string]struct{})
+// journalRecipients resolves the fan-out before a mutation transaction starts.
+// This keeps collaborator lookup out of the write transaction while allowing
+// the mutation and all resulting journal rows to commit atomically.
+func (s *FileService) journalRecipients(ctx context.Context, userID, fileID string, preResolved ...string) ([]string, error) {
+	set := make(map[string]struct{})
 	if userID != "" {
-		recipientSet[userID] = struct{}{}
+		set[userID] = struct{}{}
 	}
-	for _, r := range preResolvedRecipients {
-		if r != "" {
-			recipientSet[r] = struct{}{}
+	for _, id := range preResolved {
+		if id != "" {
+			set[id] = struct{}{}
 		}
 	}
-
-	if len(preResolvedRecipients) == 0 && s.perms != nil && fileID != "" {
-		if collabs, err := s.perms.FindCollaboratorUserIDs(ctx, fileID); err == nil {
-			for _, c := range collabs {
-				if c != "" {
-					recipientSet[c] = struct{}{}
-				}
+	if len(preResolved) == 0 && s.perms != nil && fileID != "" {
+		collaborators, err := s.perms.FindCollaboratorUserIDs(ctx, fileID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve sync recipients for %s: %w", fileID, err)
+		}
+		for _, id := range collaborators {
+			if id != "" {
+				set[id] = struct{}{}
 			}
-		} else {
-			s.log.Warn("failed to resolve collaborators for sync fanout", "file_id", fileID, "err", err)
 		}
 	}
+	ids := make([]string, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
 
-	if len(recipientSet) == 0 {
+func buildJournalEntries(recipients []string, fileID, action string, file *domain.File) []*domain.JournalEntry {
+	entries := make([]*domain.JournalEntry, 0, len(recipients))
+	for _, userID := range recipients {
+		entry := &domain.JournalEntry{UserID: userID, FileID: fileID, Action: action, Status: "ACTIVE"}
+		if file != nil {
+			entry.ParentID = file.ParentID
+			entry.Name = file.Name
+			entry.IsDirectory = file.IsDirectory
+			entry.SizeBytes = file.SizeBytes
+			entry.MimeType = file.MimeType
+			if file.Status != "" {
+				entry.Status = file.Status
+			}
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+func (s *FileService) recordJournalInTx(ctx context.Context, tx postgresrepo.DBTX, entries []*domain.JournalEntry) error {
+	if s.journal == nil || len(entries) == 0 {
+		return nil
+	}
+	if tx == nil {
+		return fmt.Errorf("sync journal requires a transaction")
+	}
+	if _, err := s.journal.WithTx(tx).BatchRecord(ctx, entries); err != nil {
+		return fmt.Errorf("record sync journal: %w", err)
+	}
+	return nil
+}
+
+func (s *FileService) runMutationTx(ctx context.Context, fn func(postgresrepo.DBTX) error) error {
+	if s.db == nil { // Lightweight service tests use in-memory stores without a database.
+		return fn(nil)
+	}
+	return postgresrepo.RunInTx(ctx, s.db, fn)
+}
+
+func (s *FileService) filesForTx(tx postgresrepo.DBTX) FileStore {
+	if tx == nil {
+		return s.files
+	}
+	return s.files.WithTx(tx)
+}
+
+func (s *FileService) requirePermissionInTx(ctx context.Context, tx postgresrepo.DBTX, fileID, userEmail string, roles []string) error {
+	perms := s.perms
+	if tx != nil {
+		perms = s.perms.WithTx(tx)
+	}
+	allowed, err := perms.CheckUserPermission(ctx, fileID, userEmail, roles)
+	if err != nil {
+		return fmt.Errorf("permission check: %w", err)
+	}
+	if !allowed {
+		return fmt.Errorf("access denied: %s", userEmail)
+	}
+	return nil
+}
+
+func (s *FileService) notifyJournalEntries(entries []*domain.JournalEntry) {
+	if s.notifier == nil {
 		return
 	}
-
-	name := ""
-	var parentID *string
-	isDir := false
-	var sizeBytes int64 = 0
-	status := "ACTIVE"
-	var mimeType string
-	if file != nil {
-		name = file.Name
-		parentID = file.ParentID
-		isDir = file.IsDirectory
-		sizeBytes = file.SizeBytes
-		status = file.Status
-		mimeType = file.MimeType
-	}
-
-	// 2. Prepare journal entries for batch insert
-	entries := make([]*domain.JournalEntry, 0, len(recipientSet))
-	for rUID := range recipientSet {
-		entries = append(entries, &domain.JournalEntry{
-			UserID:      rUID,
-			FileID:      fileID,
-			Action:      action,
-			ParentID:    parentID,
-			Name:        name,
-			IsDirectory: isDir,
-			SizeBytes:   sizeBytes,
-			MimeType:    mimeType,
-			Status:      status,
+	for _, entry := range entries {
+		s.notifier.NotifyUser(entry.UserID, wsSync.NotificationEvent{
+			Type:    wsSync.EventSyncDelta,
+			Payload: map[string]any{"cursor": entry.Cursor, "file_id": entry.FileID, "action": entry.Action},
 		})
-	}
-
-	if s.journal != nil {
-		cursors, err := s.journal.BatchRecord(ctx, entries)
-		if err != nil {
-			s.log.Error("failed to record journal entries", "file_id", fileID, "action", action, "err", err)
-		} else if s.notifier != nil {
-			for i, e := range entries {
-				cursor := int64(0)
-				if i < len(cursors) {
-					cursor = cursors[i]
-				}
-				s.notifier.NotifyUser(e.UserID, wsSync.NotificationEvent{
-					Type: wsSync.EventSyncDelta,
-					Payload: map[string]any{
-						"cursor":  cursor,
-						"file_id": fileID,
-						"action":  action,
-					},
-				})
-			}
-		}
-	} else if s.notifier != nil {
-		for rUID := range recipientSet {
-			s.notifier.NotifyUser(rUID, wsSync.NotificationEvent{
-				Type: wsSync.EventSyncDelta,
-				Payload: map[string]any{
-					"cursor":  0,
-					"file_id": fileID,
-					"action":  action,
-				},
-			})
-		}
 	}
 }
 
@@ -325,6 +339,11 @@ func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req
 			isMove = true
 		}
 	}
+	if isMove {
+		if err := s.validateWritableParent(ctx, userID, user.Email, newParentTarget); err != nil {
+			return nil, fmt.Errorf("validate destination: %w", err)
+		}
+	}
 
 	if isMove {
 		if role == domain.RoleViewer || (role == domain.RoleEditor && existing.IsDirectory) {
@@ -381,8 +400,39 @@ func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req
 		return nil, fmt.Errorf("an item named %q already exists in the destination folder", updated.Name)
 	}
 
-	// 5. Persist.
-	if err := s.files.Update(ctx, &updated); err != nil {
+	// Persist the metadata and its per-user delta rows in one transaction.
+	var entries []*domain.JournalEntry
+	recipients, err := s.journalRecipients(ctx, userID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	if updated.Name != existing.Name {
+		entries = append(entries, buildJournalEntries(recipients, fileID, domain.ActionFileRenamed, &updated)...)
+	}
+	if isMove {
+		entries = append(entries, buildJournalEntries(recipients, fileID, domain.ActionFileMoved, &updated)...)
+	}
+	if err := s.runMutationTx(ctx, func(tx postgresrepo.DBTX) error {
+		txFiles := s.filesForTx(tx)
+		current, err := txFiles.GetByID(ctx, fileID)
+		if err != nil {
+			return fmt.Errorf("reload source file: %w", err)
+		}
+		if current.UserID != userID {
+			if err := s.requirePermissionInTx(ctx, tx, fileID, user.Email, []string{domain.RoleOwner, domain.RoleEditor}); err != nil {
+				return err
+			}
+		}
+		if isMove {
+			if err := validateWritableParentStore(ctx, txFiles, userID, user.Email, newParentTarget); err != nil {
+				return fmt.Errorf("validate destination: %w", err)
+			}
+		}
+		if err := txFiles.Update(ctx, &updated); err != nil {
+			return fmt.Errorf("update file: %w", err)
+		}
+		return s.recordJournalInTx(ctx, tx, entries)
+	}); err != nil {
 		return nil, fmt.Errorf("update file: %w", err)
 	}
 
@@ -391,12 +441,7 @@ func (s *FileService) RenameMove(ctx context.Context, userID, fileID string, req
 		"new_name", updated.Name,
 		"new_parent_id", logNilStr(updated.ParentID))
 
-	if updated.Name != existing.Name {
-		s.recordAndNotify(ctx, userID, fileID, domain.ActionFileRenamed, &updated)
-	}
-	if isMove {
-		s.recordAndNotify(ctx, userID, fileID, domain.ActionFileMoved, &updated)
-	}
+	s.notifyJournalEntries(entries)
 
 	return &updated, nil
 }
@@ -436,6 +481,7 @@ func (s *FileService) SoftDelete(ctx context.Context, userID, fileID string) (*D
 		return nil, fmt.Errorf("file not found: %w", err)
 	}
 
+	var requesterEmail string
 	// If requesting user does not own this record, check shared permissions
 	if file.UserID != userID {
 		user, err := s.users.GetByID(ctx, userID)
@@ -451,14 +497,35 @@ func (s *FileService) SoftDelete(ctx context.Context, userID, fileID string) (*D
 		if !allowed {
 			return nil, fmt.Errorf("access denied: %s", user.Email)
 		}
+		requesterEmail = user.Email
 	}
 
-	if err := s.files.SoftDelete(ctx, fileID, file.UserID); err != nil {
+	recipients, err := s.journalRecipients(ctx, userID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	entries := buildJournalEntries(recipients, fileID, domain.ActionFileTrashed, file)
+	if err := s.runMutationTx(ctx, func(tx postgresrepo.DBTX) error {
+		txFiles := s.filesForTx(tx)
+		current, err := txFiles.GetByID(ctx, fileID)
+		if err != nil {
+			return err
+		}
+		if current.UserID != userID {
+			if err := s.requirePermissionInTx(ctx, tx, fileID, requesterEmail, []string{domain.RoleOwner, domain.RoleEditor}); err != nil {
+				return err
+			}
+		}
+		if err := txFiles.SoftDelete(ctx, fileID, current.UserID); err != nil {
+			return fmt.Errorf("soft delete: %w", err)
+		}
+		return s.recordJournalInTx(ctx, tx, entries)
+	}); err != nil {
 		return nil, fmt.Errorf("soft delete: %w", err)
 	}
 
 	s.log.Info("file soft deleted", "file_id", fileID, "user_id", userID)
-	s.recordAndNotify(ctx, userID, fileID, domain.ActionFileTrashed, nil)
+	s.notifyJournalEntries(entries)
 
 	return &DeleteResult{
 		Status:  "success",
@@ -491,6 +558,7 @@ func (s *FileService) Restore(ctx context.Context, userID, fileID string) (*Dele
 		return nil, fmt.Errorf("file not found: %w", err)
 	}
 
+	var requesterEmail string
 	if file.UserID != userID {
 		user, err := s.users.GetByID(ctx, userID)
 		if err != nil {
@@ -505,15 +573,41 @@ func (s *FileService) Restore(ctx context.Context, userID, fileID string) (*Dele
 		if !allowed {
 			return nil, fmt.Errorf("access denied: %s", user.Email)
 		}
+		requesterEmail = user.Email
 	}
 
-	if err := s.files.Restore(ctx, fileID, file.UserID); err != nil {
+	recipients, err := s.journalRecipients(ctx, userID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	var restoredFile *domain.File
+	var entries []*domain.JournalEntry
+	if err := s.runMutationTx(ctx, func(tx postgresrepo.DBTX) error {
+		files := s.filesForTx(tx)
+		current, err := files.GetByID(ctx, fileID)
+		if err != nil {
+			return err
+		}
+		if current.UserID != userID {
+			if err := s.requirePermissionInTx(ctx, tx, fileID, requesterEmail, []string{domain.RoleOwner, domain.RoleEditor}); err != nil {
+				return err
+			}
+		}
+		if err := files.Restore(ctx, fileID, file.UserID); err != nil {
+			return fmt.Errorf("restore file: %w", err)
+		}
+		restoredFile, err = files.GetByID(ctx, fileID)
+		if err != nil {
+			return fmt.Errorf("read restored file: %w", err)
+		}
+		entries = buildJournalEntries(recipients, fileID, domain.ActionFileRestored, restoredFile)
+		return s.recordJournalInTx(ctx, tx, entries)
+	}); err != nil {
 		return nil, fmt.Errorf("restore file: %w", err)
 	}
 
 	s.log.Info("file restored", "file_id", fileID, "user_id", userID)
-	restoredFile, _ := s.files.GetByID(ctx, fileID)
-	s.recordAndNotify(ctx, userID, fileID, domain.ActionFileRestored, restoredFile)
+	s.notifyJournalEntries(entries)
 
 	return &DeleteResult{
 		Status:  "success",
@@ -568,6 +662,7 @@ func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string
 		return nil, fmt.Errorf("file not found: %w", err)
 	}
 
+	var requesterEmail string
 	if file.UserID != userID {
 		user, err := s.users.GetByID(ctx, userID)
 		if err != nil {
@@ -583,17 +678,32 @@ func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string
 		if !allowed {
 			return nil, fmt.Errorf("access denied: %s", user.Email)
 		}
+		requesterEmail = user.Email
 	}
 
-	var preResolvedRecipients []string
-	if s.perms != nil {
-		if collabs, err := s.perms.FindCollaboratorUserIDs(ctx, fileID); err == nil {
-			preResolvedRecipients = collabs
-		}
-	}
-
-	deletedCount, orphanHashes, err := s.files.DeleteRecursive(ctx, fileID, file.UserID)
+	recipients, err := s.journalRecipients(ctx, userID, fileID)
 	if err != nil {
+		return nil, err
+	}
+	entries := buildJournalEntries(recipients, fileID, domain.ActionFileDeleted, file)
+	var deletedCount int64
+	var orphanHashes []string
+	if err := s.runMutationTx(ctx, func(tx postgresrepo.DBTX) error {
+		current, err := s.filesForTx(tx).GetByID(ctx, fileID)
+		if err != nil {
+			return err
+		}
+		if current.UserID != userID {
+			if err := s.requirePermissionInTx(ctx, tx, fileID, requesterEmail, []string{domain.RoleOwner}); err != nil {
+				return err
+			}
+		}
+		deletedCount, orphanHashes, err = s.filesForTx(tx).DeleteRecursive(ctx, fileID, file.UserID)
+		if err != nil {
+			return fmt.Errorf("delete recursive: %w", err)
+		}
+		return s.recordJournalInTx(ctx, tx, entries)
+	}); err != nil {
 		return nil, fmt.Errorf("delete recursive: %w", err)
 	}
 
@@ -606,7 +716,7 @@ func (s *FileService) PermanentDelete(ctx context.Context, userID, fileID string
 		"file_id", fileID, "user_id", userID,
 		"deleted_count", deletedCount,
 		"orphaned_blocks", len(orphanHashes))
-	s.recordAndNotify(ctx, userID, fileID, domain.ActionFileDeleted, nil, preResolvedRecipients...)
+	s.notifyJournalEntries(entries)
 
 	return &DeleteResult{
 		Status:       "success",
@@ -639,6 +749,14 @@ func (s *FileService) CreateFolder(ctx context.Context, userID, name string, par
 	if userID == "" || name == "" {
 		return nil, false, fmt.Errorf("user_id and name are required")
 	}
+	parentID = normalizeParentID(parentID)
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve user: %w", err)
+	}
+	if err := s.validateWritableParent(ctx, userID, user.Email, parentID); err != nil {
+		return nil, false, fmt.Errorf("validate destination: %w", err)
+	}
 
 	// 1. Idempotency check: if folder already exists, return 200 OK candidate
 	existing, err := s.files.GetFolderByNameAndParent(ctx, userID, name, parentID)
@@ -648,18 +766,17 @@ func (s *FileService) CreateFolder(ctx context.Context, userID, name string, par
 	}
 
 	// 2. Resolve creator's email so the OWNER permission row can be written.
-	user, err := s.users.GetByID(ctx, userID)
-	if err != nil {
-		return nil, false, fmt.Errorf("resolve user: %w", err)
-	}
-
 	var (
-		folder   *domain.File
-		wasNew   bool
+		folder  *domain.File
+		wasNew  bool
+		entries []*domain.JournalEntry
 	)
 	err = postgresrepo.RunInTx(ctx, s.db, func(tx postgresrepo.DBTX) error {
 		files := s.files.WithTx(tx)
 		perms := s.perms.WithTx(tx)
+		if err := validateWritableParentStore(ctx, files, userID, user.Email, parentID); err != nil {
+			return fmt.Errorf("validate destination: %w", err)
+		}
 
 		// Race-condition check inside Tx
 		if existing, err := files.GetFolderByNameAndParent(ctx, userID, name, parentID); err == nil && existing != nil {
@@ -686,7 +803,8 @@ func (s *FileService) CreateFolder(ctx context.Context, userID, name string, par
 		}
 		folder = f
 		wasNew = true
-		return nil
+		entries = buildJournalEntries([]string{userID}, f.ID, domain.ActionFileCreated, f)
+		return s.recordJournalInTx(ctx, tx, entries)
 	})
 	if err != nil {
 		return nil, false, fmt.Errorf("create folder: %w", err)
@@ -694,7 +812,7 @@ func (s *FileService) CreateFolder(ctx context.Context, userID, name string, par
 
 	if wasNew {
 		s.log.Info("folder created", "folder_id", folder.ID, "user_id", userID, "name", name)
-		s.recordAndNotify(ctx, userID, folder.ID, domain.ActionFileCreated, folder)
+		s.notifyJournalEntries(entries)
 	} else {
 		s.log.Info("folder reused", "folder_id", folder.ID, "user_id", userID, "name", name)
 	}
@@ -870,12 +988,20 @@ func (s *FileService) GetDownloadInfoWithBlocks(ctx context.Context, fileID stri
 //   - ctx: Detached context (typically context.Background()).
 //   - hashes: List of SHA-256 block hashes to delete from the blocks/ namespace.
 func (s *FileService) garbageCollectBlocks(ctx context.Context, hashes []string) {
+	gcStore, ok := s.blocks.(BlockGarbageCollector)
+	if !ok {
+		s.log.Error("GC: block repository does not support coordinated deletion")
+		return
+	}
 	for _, h := range hashes {
 		key := "blocks/" + h
-		if err := s.storage.DeleteObject(ctx, key); err != nil {
+		eligible, err := gcStore.WithBlockCandidate(ctx, h, false, func() error {
+			return s.storage.DeleteObject(ctx, key)
+		})
+		if err != nil {
 			s.log.Warn("GC: failed to delete orphaned block",
 				"hash", h, "err", err)
-		} else {
+		} else if eligible {
 			s.log.Debug("GC: deleted orphaned block", "hash", h)
 		}
 	}
@@ -915,7 +1041,40 @@ func (s *FileService) BulkSoftDelete(ctx context.Context, userID string, req dom
 			}
 		}
 	}
-	return s.files.BulkSoftDelete(ctx, req.IDs, userID)
+	entries := make([]*domain.JournalEntry, 0)
+	for _, id := range req.IDs {
+		file, err := s.files.GetByID(ctx, id)
+		if err != nil {
+			return fmt.Errorf("file not found: %w", err)
+		}
+		recipients, err := s.journalRecipients(ctx, userID, id)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, buildJournalEntries(recipients, id, domain.ActionFileTrashed, file)...)
+	}
+	if err := s.runMutationTx(ctx, func(tx postgresrepo.DBTX) error {
+		txFiles := s.filesForTx(tx)
+		for _, id := range req.IDs {
+			current, err := txFiles.GetByID(ctx, id)
+			if err != nil {
+				return err
+			}
+			if current.UserID != userID {
+				if err := s.requirePermissionInTx(ctx, tx, id, user.Email, []string{domain.RoleOwner, domain.RoleEditor}); err != nil {
+					return err
+				}
+			}
+		}
+		if err := txFiles.BulkSoftDelete(ctx, req.IDs, userID); err != nil {
+			return err
+		}
+		return s.recordJournalInTx(ctx, tx, entries)
+	}); err != nil {
+		return err
+	}
+	s.notifyJournalEntries(entries)
+	return nil
 }
 
 // BulkRestore recovers multiple soft-deleted files and folders from the Trash in an atomic transaction.
@@ -951,7 +1110,40 @@ func (s *FileService) BulkRestore(ctx context.Context, userID string, req domain
 			}
 		}
 	}
-	return s.files.BulkRestore(ctx, req.IDs, userID)
+	entries := make([]*domain.JournalEntry, 0)
+	for _, id := range req.IDs {
+		file, err := s.files.GetByID(ctx, id)
+		if err != nil {
+			return fmt.Errorf("file not found: %w", err)
+		}
+		recipients, err := s.journalRecipients(ctx, userID, id)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, buildJournalEntries(recipients, id, domain.ActionFileRestored, file)...)
+	}
+	if err := s.runMutationTx(ctx, func(tx postgresrepo.DBTX) error {
+		txFiles := s.filesForTx(tx)
+		for _, id := range req.IDs {
+			current, err := txFiles.GetByID(ctx, id)
+			if err != nil {
+				return err
+			}
+			if current.UserID != userID {
+				if err := s.requirePermissionInTx(ctx, tx, id, user.Email, []string{domain.RoleOwner, domain.RoleEditor}); err != nil {
+					return err
+				}
+			}
+		}
+		if err := txFiles.BulkRestore(ctx, req.IDs, userID); err != nil {
+			return err
+		}
+		return s.recordJournalInTx(ctx, tx, entries)
+	}); err != nil {
+		return err
+	}
+	s.notifyJournalEntries(entries)
+	return nil
 }
 
 // BulkMove updates the parent folder pointer for multiple files/directories in a single transaction.
@@ -967,7 +1159,163 @@ func (s *FileService) BulkMove(ctx context.Context, userID string, req domain.Bu
 	if userID == "" || len(req.IDs) == 0 {
 		return nil
 	}
-	return s.files.BulkMove(ctx, req.IDs, req.ParentID, userID)
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("resolve user: %w", err)
+	}
+	if err := s.validateWritableParent(ctx, userID, user.Email, req.ParentID); err != nil {
+		return fmt.Errorf("validate destination: %w", err)
+	}
+	entries := make([]*domain.JournalEntry, 0)
+	moveIDs := make([]string, 0, len(req.IDs))
+	shortcuts := make([]*domain.File, 0)
+	for _, id := range req.IDs {
+		file, err := s.files.GetByID(ctx, id)
+		if err != nil {
+			return fmt.Errorf("file not found: %w", err)
+		}
+		role := domain.RoleOwner
+		if file.UserID != userID {
+			role, err = s.files.GetResolvedPermission(ctx, id, user.Email)
+			if err != nil {
+				return fmt.Errorf("permission check for %s: %w", id, err)
+			}
+		}
+		targetParent := normalizeParentID(req.ParentID)
+		isMove := (file.ParentID == nil && targetParent != nil) ||
+			(file.ParentID != nil && targetParent == nil) ||
+			(file.ParentID != nil && targetParent != nil && *file.ParentID != *targetParent)
+		if isMove && (role == domain.RoleViewer || (role == domain.RoleEditor && file.IsDirectory)) {
+			realTargetID := file.ID
+			if file.TargetID != nil && *file.TargetID != "" {
+				realTargetID = *file.TargetID
+			}
+			target := realTargetID
+			shortcuts = append(shortcuts, &domain.File{
+				UserID: userID, Name: file.Name, ParentID: targetParent, IsDirectory: file.IsDirectory,
+				SizeBytes: file.SizeBytes, TargetID: &target, ShortcutTargetID: &target,
+				MimeType: "application/vnd.google-apps.shortcut",
+			})
+			continue
+		}
+		moveIDs = append(moveIDs, id)
+		if isMove {
+			moved := *file
+			moved.ParentID = targetParent
+			recipients, err := s.journalRecipients(ctx, userID, id)
+			if err != nil {
+				return err
+			}
+			entries = append(entries, buildJournalEntries(recipients, id, domain.ActionFileMoved, &moved)...)
+		}
+	}
+	if err := s.runMutationTx(ctx, func(tx postgresrepo.DBTX) error {
+		files := s.filesForTx(tx)
+		if err := validateWritableParentStore(ctx, files, userID, user.Email, req.ParentID); err != nil {
+			return fmt.Errorf("validate destination: %w", err)
+		}
+		for _, id := range moveIDs {
+			current, err := files.GetByID(ctx, id)
+			if err != nil {
+				return err
+			}
+			if current.UserID != userID {
+				if err := s.requirePermissionInTx(ctx, tx, id, user.Email, []string{domain.RoleOwner, domain.RoleEditor}); err != nil {
+					return err
+				}
+			}
+		}
+		for _, shortcut := range shortcuts {
+			if shortcut.TargetID != nil {
+				target, err := files.GetByID(ctx, *shortcut.TargetID)
+				if err != nil {
+					return err
+				}
+				if target.UserID != userID {
+					if err := s.requirePermissionInTx(ctx, tx, target.ID, user.Email, []string{domain.RoleOwner, domain.RoleEditor, domain.RoleViewer}); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		for _, shortcut := range shortcuts {
+			if err := files.Create(ctx, shortcut); err != nil {
+				return fmt.Errorf("create shortcut for shared move: %w", err)
+			}
+			entries = append(entries, buildJournalEntries([]string{userID}, shortcut.ID, domain.ActionFileCreated, shortcut)...)
+		}
+		if len(moveIDs) > 0 {
+			if err := files.BulkMove(ctx, moveIDs, normalizeParentID(req.ParentID), userID); err != nil {
+				return err
+			}
+		}
+		return s.recordJournalInTx(ctx, tx, entries)
+	}); err != nil {
+		return err
+	}
+	s.notifyJournalEntries(entries)
+	return nil
+}
+
+// validateWritableParent requires a live directory and write access to it.
+// The user's own drive root is represented by a nil, empty, or "root" ID.
+func (s *FileService) validateWritableParent(ctx context.Context, userID, userEmail string, parentID *string) error {
+	return validateWritableParentStore(ctx, s.files, userID, userEmail, parentID)
+}
+
+func validateWritableParentStore(ctx context.Context, files interface {
+	GetByID(context.Context, string) (*domain.File, error)
+	GetResolvedPermission(context.Context, string, string) (string, error)
+}, userID, userEmail string, parentID *string) error {
+	if parentID == nil || strings.TrimSpace(*parentID) == "" || strings.TrimSpace(*parentID) == "root" {
+		return nil
+	}
+	parent, err := files.GetByID(ctx, *parentID)
+	if err != nil {
+		return fmt.Errorf("destination folder not found: %w", err)
+	}
+	if !parent.IsDirectory {
+		return fmt.Errorf("destination parent is not a directory")
+	}
+	if parent.DeletedAt != nil {
+		return fmt.Errorf("destination folder is deleted")
+	}
+	if parent.UserID == userID {
+		return nil
+	}
+	role, err := files.GetResolvedPermission(ctx, parent.ID, userEmail)
+	if err != nil {
+		if errors.Is(err, domain.ErrPermissionNotFound) {
+			return fmt.Errorf("access denied: editor permission required on destination folder")
+		}
+		return fmt.Errorf("destination permission check: %w", err)
+	}
+	if role != domain.RoleOwner && role != domain.RoleEditor {
+		return fmt.Errorf("access denied: editor permission required on destination folder")
+	}
+	return nil
+}
+
+func (s *FileService) validateWritableParentForUser(ctx context.Context, userID string, parentID *string) error {
+	if parentID == nil || strings.TrimSpace(*parentID) == "" || strings.TrimSpace(*parentID) == "root" {
+		return nil
+	}
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("resolve user: %w", err)
+	}
+	return s.validateWritableParent(ctx, userID, user.Email, parentID)
+}
+
+func normalizeParentID(parentID *string) *string {
+	if parentID == nil {
+		return nil
+	}
+	parent := strings.TrimSpace(*parentID)
+	if parent == "" || parent == "root" {
+		return nil
+	}
+	return &parent
 }
 
 // BulkHardDelete permanently removes multiple files/directories and cascades through their subtrees,
@@ -1026,23 +1374,16 @@ func logNilStr(s *string) string {
 // Returns:
 //   - error: Nil if authorized, or domain.ErrPermissionDenied / access denied error.
 func (s *FileService) AuthoriseRead(ctx context.Context, userID, fileID string) error {
-	file, err := s.files.GetByID(ctx, fileID)
-	if err == nil {
-		// If file is a shortcut, recursively authorize read access on the underlying target
-		if file.TargetID != nil && *file.TargetID != "" && *file.TargetID != fileID {
-			return s.AuthoriseRead(ctx, userID, *file.TargetID)
-		}
-		if file.ShortcutTargetID != nil && *file.ShortcutTargetID != "" && *file.ShortcutTargetID != fileID {
-			return s.AuthoriseRead(ctx, userID, *file.ShortcutTargetID)
-		}
-		// 1. If file is owned directly by the user, bypass check and grant access.
-		if file.UserID == userID {
-			return nil
-		}
-		// If a non-owner tries to access a soft-deleted or quarantined target file, deny immediately.
-		if file.DeletedAt != nil || file.Status == "TRASHED" || file.Status == "QUARANTINED" {
-			return fmt.Errorf("access denied: file is unavailable")
-		}
+	file, err := s.resolveShortcutTarget(ctx, fileID)
+	if err != nil {
+		return err
+	}
+	// File availability applies equally to owners, collaborators, and link users.
+	if file.DeletedAt != nil || file.Status == "TRASHED" || file.Status == "QUARANTINED" || (file.Status != "" && file.Status != "ACTIVE") {
+		return fmt.Errorf("access denied: file is unavailable")
+	}
+	if file.UserID == userID {
+		return nil
 	}
 
 	user, err := s.users.GetByID(ctx, userID)
@@ -1050,13 +1391,13 @@ func (s *FileService) AuthoriseRead(ctx context.Context, userID, fileID string) 
 		return fmt.Errorf("resolve user: %w", err)
 	}
 
-	role, err := s.files.GetResolvedPermission(ctx, fileID, user.Email)
+	role, err := s.files.GetResolvedPermission(ctx, file.ID, user.Email)
 	if err != nil {
 		if errors.Is(err, domain.ErrPermissionNotFound) {
 			if linkChecker, ok := s.files.(interface {
 				HasPublicLinkOrShortcutAccess(ctx context.Context, userID, fileID string) (bool, error)
 			}); ok {
-				if allowed, lErr := linkChecker.HasPublicLinkOrShortcutAccess(ctx, userID, fileID); lErr == nil && allowed {
+				if allowed, lErr := linkChecker.HasPublicLinkOrShortcutAccess(ctx, userID, file.ID); lErr == nil && allowed {
 					return nil
 				}
 			}
@@ -1082,9 +1423,16 @@ func (s *FileService) AuthoriseRead(ctx context.Context, userID, fileID string) 
 // Returns:
 //   - error: Nil if authorized, or access denied error.
 func (s *FileService) AuthoriseWrite(ctx context.Context, userID, fileID string) error {
-	// 1. If file is owned directly by the user, bypass check and grant access.
-	file, err := s.files.GetByID(ctx, fileID)
-	if err == nil && file.UserID == userID {
+	file, err := s.resolveShortcutTarget(ctx, fileID)
+	if err != nil {
+		return err
+	}
+	if file.DeletedAt != nil || file.Status == "TRASHED" || file.Status == "QUARANTINED" || (file.Status != "" && file.Status != "ACTIVE") {
+		return fmt.Errorf("access denied: file is unavailable")
+	}
+	// Ownership and grants are evaluated on the canonical target, never the
+	// caller-owned shortcut record.
+	if file.UserID == userID {
 		return nil
 	}
 
@@ -1093,7 +1441,7 @@ func (s *FileService) AuthoriseWrite(ctx context.Context, userID, fileID string)
 		return fmt.Errorf("resolve user: %w", err)
 	}
 
-	role, err := s.files.GetResolvedPermission(ctx, fileID, user.Email)
+	role, err := s.files.GetResolvedPermission(ctx, file.ID, user.Email)
 	if err != nil {
 		if errors.Is(err, domain.ErrPermissionNotFound) {
 			return fmt.Errorf("access denied: %s", user.Email)
@@ -1105,6 +1453,38 @@ func (s *FileService) AuthoriseWrite(ctx context.Context, userID, fileID string)
 		return nil
 	}
 	return fmt.Errorf("access denied: %s", user.Email)
+}
+
+// resolveShortcutTarget follows shortcut pointers to their canonical file.
+// A visited set makes malformed cycles fail closed instead of recursing until
+// stack exhaustion. It is shared by read and write authorization so both use
+// identical target semantics.
+func (s *FileService) resolveShortcutTarget(ctx context.Context, fileID string) (*domain.File, error) {
+	if strings.TrimSpace(fileID) == "" {
+		return nil, fmt.Errorf("file_id is required")
+	}
+	seen := make(map[string]struct{})
+	currentID := fileID
+	for {
+		if _, exists := seen[currentID]; exists {
+			return nil, fmt.Errorf("access denied: shortcut target cycle")
+		}
+		seen[currentID] = struct{}{}
+		file, err := s.files.GetByID(ctx, currentID)
+		if err != nil {
+			return nil, fmt.Errorf("file not found: %w", err)
+		}
+		targetID := ""
+		if file.TargetID != nil && *file.TargetID != "" {
+			targetID = *file.TargetID
+		} else if file.ShortcutTargetID != nil && *file.ShortcutTargetID != "" {
+			targetID = *file.ShortcutTargetID
+		}
+		if targetID == "" {
+			return file, nil
+		}
+		currentID = targetID
+	}
 }
 
 // SanitiseFilename cleans a filename by replacing path separators ('/' and '\') with underscores,
@@ -1159,20 +1539,23 @@ func (s *FileService) CreateShortcut(ctx context.Context, userID string, req Cre
 	if userID == "" || req.FileID == "" {
 		return nil, fmt.Errorf("user_id and file_id are required")
 	}
+	req.ParentID = normalizeParentID(req.ParentID)
 
 	// 1. Get target file metadata first
 	target, err := s.files.GetByID(ctx, req.FileID)
 	if err != nil {
 		return nil, fmt.Errorf("get target file: %w", err)
 	}
+	if target.Status != "" && target.Status != "ACTIVE" {
+		return nil, fmt.Errorf("cannot create shortcut to unavailable file")
+	}
 
-	// 2. Authorize: If not owned by requesting user, must have at least VIEWER permission
+	// 2. Resolve identity for both the initial check and the transactional recheck.
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve user: %w", err)
+	}
 	if target.UserID != userID {
-		user, err := s.users.GetByID(ctx, userID)
-		if err != nil {
-			return nil, fmt.Errorf("resolve user: %w", err)
-		}
-
 		allowed, err := s.perms.CheckUserPermission(ctx, req.FileID, user.Email,
 			[]string{domain.RoleOwner, domain.RoleEditor, domain.RoleViewer})
 		if err != nil {
@@ -1204,16 +1587,39 @@ func (s *FileService) CreateShortcut(ctx context.Context, userID string, req Cre
 	}
 
 	// Normalise parent_id
-	if shortcut.ParentID != nil && *shortcut.ParentID == "" {
-		shortcut.ParentID = nil
+	if err := s.validateWritableParentForUser(ctx, userID, shortcut.ParentID); err != nil {
+		return nil, fmt.Errorf("validate shortcut destination: %w", err)
 	}
 
-	// 5. Persist
-	if err := s.files.Create(ctx, shortcut); err != nil {
+	entries := buildJournalEntries([]string{userID}, shortcut.ID, domain.ActionFileCreated, shortcut)
+	if err := s.runMutationTx(ctx, func(tx postgresrepo.DBTX) error {
+		txFiles := s.filesForTx(tx)
+		currentTarget, err := txFiles.GetByID(ctx, req.FileID)
+		if err != nil {
+			return fmt.Errorf("reload shortcut target: %w", err)
+		}
+		if currentTarget.DeletedAt != nil || (currentTarget.Status != "" && currentTarget.Status != "ACTIVE") {
+			return fmt.Errorf("shortcut target is unavailable")
+		}
+		if currentTarget.UserID != userID {
+			if err := s.requirePermissionInTx(ctx, tx, req.FileID, user.Email, []string{domain.RoleOwner, domain.RoleEditor, domain.RoleViewer}); err != nil {
+				return err
+			}
+		}
+		if err := validateWritableParentStore(ctx, txFiles, userID, user.Email, shortcut.ParentID); err != nil {
+			return fmt.Errorf("validate shortcut destination: %w", err)
+		}
+		if err := txFiles.Create(ctx, shortcut); err != nil {
+			return fmt.Errorf("create shortcut: %w", err)
+		}
+		entries = buildJournalEntries([]string{userID}, shortcut.ID, domain.ActionFileCreated, shortcut)
+		return s.recordJournalInTx(ctx, tx, entries)
+	}); err != nil {
 		return nil, fmt.Errorf("create shortcut: %w", err)
 	}
 
 	s.log.Info("shortcut created", "shortcut_id", shortcut.ID, "user_id", userID, "target_id", realTargetID)
+	s.notifyJournalEntries(entries)
 
 	return shortcut, nil
 }
@@ -1300,15 +1706,26 @@ func (s *FileService) CalculateDynamicRangeBlockOffset(blocks []*domain.Block, s
 // Returns:
 //   - *domain.File: The newly created shortcut entity.
 //   - error: Nil on success, or database error.
-func (s *FileService) CreateShortcutFromPublicLink(ctx context.Context, userID, targetID string, parentID *string) (*domain.File, error) {
-	if userID == "" || targetID == "" {
-		return nil, fmt.Errorf("user_id and target_id are required")
+func (s *FileService) CreateShortcutFromPublicLink(ctx context.Context, userID, targetID string, parentID *string, linkToken string) (*domain.File, error) {
+	if userID == "" || targetID == "" || linkToken == "" {
+		return nil, fmt.Errorf("user_id, target_id, and public link token are required")
+	}
+	parentID = normalizeParentID(parentID)
+	user, err := s.users.GetByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve user: %w", err)
+	}
+	if err := s.validateWritableParent(ctx, userID, user.Email, parentID); err != nil {
+		return nil, fmt.Errorf("validate shortcut destination: %w", err)
 	}
 
 	// 1. Get target file metadata
 	target, err := s.files.GetByID(ctx, targetID)
 	if err != nil {
 		return nil, fmt.Errorf("get target file: %w", err)
+	}
+	if target.Status != "" && target.Status != "ACTIVE" {
+		return nil, fmt.Errorf("cannot create shortcut to unavailable file")
 	}
 
 	// 2. If target is already a shortcut, use the target's target_id instead
@@ -1334,10 +1751,35 @@ func (s *FileService) CreateShortcutFromPublicLink(ctx context.Context, userID, 
 		Status:           target.Status,
 	}
 
-	// 4. Save to db
-	if err := s.files.Create(ctx, shortcut); err != nil {
+	entries := buildJournalEntries([]string{userID}, shortcut.ID, domain.ActionFileCreated, shortcut)
+	if err := s.runMutationTx(ctx, func(tx postgresrepo.DBTX) error {
+		if tx == nil {
+			return fmt.Errorf("public shortcut creation requires a transaction")
+		}
+		link, err := postgresrepo.NewShareableLinkRepository(tx).GetByTokenForUpdate(ctx, linkToken)
+		if err != nil || link.FileID != targetID || (link.ExpiresAt != nil && !link.ExpiresAt.After(time.Now())) {
+			return fmt.Errorf("public link is unavailable")
+		}
+		txFiles := s.filesForTx(tx)
+		currentTarget, err := txFiles.GetByID(ctx, targetID)
+		if err != nil {
+			return err
+		}
+		if currentTarget.DeletedAt != nil || (currentTarget.Status != "" && currentTarget.Status != "ACTIVE") {
+			return fmt.Errorf("cannot create shortcut to unavailable file")
+		}
+		if err := validateWritableParentStore(ctx, txFiles, userID, user.Email, parentID); err != nil {
+			return fmt.Errorf("validate shortcut destination: %w", err)
+		}
+		if err := txFiles.Create(ctx, shortcut); err != nil {
+			return fmt.Errorf("create shortcut: %w", err)
+		}
+		entries = buildJournalEntries([]string{userID}, shortcut.ID, domain.ActionFileCreated, shortcut)
+		return s.recordJournalInTx(ctx, tx, entries)
+	}); err != nil {
 		return nil, fmt.Errorf("create shortcut: %w", err)
 	}
+	s.notifyJournalEntries(entries)
 
 	return shortcut, nil
 }

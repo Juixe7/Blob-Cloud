@@ -2,7 +2,7 @@
 
 Blob-Cloud is a browser-based file storage application with a Go API, PostgreSQL metadata, and local or S3-compatible object storage. The repository includes a React/TypeScript frontend, background file processing, sharing, and synchronization features.
 
-> **Project status:** actively being audited and improved. ACL consistency work is not complete; PostgreSQL-backed role and race tests must run against a live database before those guarantees are considered verified. Review the limitations below before relying on security or production-readiness claims.
+> **Project status:** core upload, sharing/ACL, sync, processing, and local-storage garbage-collection paths have been implemented and exercised with PostgreSQL-backed tests. This is a portfolio project, not a claim of production security certification. See the limitations below for the areas that remain unverified or incomplete.
 
 ## Features
 
@@ -29,6 +29,8 @@ flowchart LR
 ```
 
 The Go backend is organized into HTTP handlers, services, domain interfaces, PostgreSQL repositories, storage providers, and background workers. Upload completion validates staged bytes before associating blocks with file metadata. Plaintext files remain unavailable until a successful scan; encrypted ciphertext cannot be inspected by the server and is an explicit antivirus limitation.
+
+The garbage collector uses storage object age as a grace period and PostgreSQL coordination to recheck block references while holding a per-hash lock through deletion. Upload-session creation uses the same lock, and inactive sessions are aborted after 24 hours without upload progress. The grace period supplements that coordination; it is not the sole data-safety mechanism.
 
 ## Technology
 
@@ -75,7 +77,7 @@ go vet ./...
 go build ./...
 ```
 
-PostgreSQL integration tests use `DB_DSN`; provide a disposable migrated test database to execute them. Some integration tests skip when PostgreSQL is unreachable, so a green command alone does not prove those tests ran. Current Phase 4 authorization matrix and race regressions require live PostgreSQL verification.
+PostgreSQL integration tests use `DB_DSN`; provide a disposable migrated database with the required `vector` extension. Some integration tests skip when PostgreSQL is unreachable, so confirm the integration packages actually ran. The ACL matrix and GC/upload coordination tests have been exercised against disposable PostgreSQL. The complete Go race suite, `go vet`, and `go build` have passed in that setup.
 
 From `frontend/`:
 
@@ -88,11 +90,12 @@ There is currently no frontend test script. S3 integration tests require explici
 
 ## Current limitations
 
-- **ACL audit is ongoing.** Effective-role precedence, shortcut authorization, link revocation, transaction-time authorization, and several disclosure paths have been addressed, but the full nested-resource role matrix and revocation/read/write race suite still need live PostgreSQL execution.
+- **ACL coverage is strong but not a security certification.** Role precedence, nested resources, shortcut authorization, link revocation, collaborator-roster disclosure, and selected mutation races have PostgreSQL-backed regressions. This is not a penetration test or proof that every route has an individually enumerated adversarial test.
 - **Journal retention is not implemented.** Journal rows are not pruned, so the table grows over time; cursors do not currently expire.
 - **Encryption needs a documented threat model and independent review.** The current browser implementation derives deterministic salt/IV material in some upload paths. This can reveal equality patterns; do not describe the design as zero-knowledge or as providing randomized unique IVs.
 - **Encrypted uploads are not virus-scanned server-side.** The server sees ciphertext, not plaintext.
-- **Garbage-collection safety and S3 behavior require their own production-like integration evidence.** Do not treat local tests as proof of AWS behavior.
+- **GC has PostgreSQL/local-filesystem evidence, not live S3 evidence.** Multipart-upload abort/cleanup and S3-specific behavior have not been verified. Do not treat local tests as proof of AWS or S3-compatible provider behavior.
+- **Inactive upload sessions expire after 24 hours without recorded block-upload progress.** GC marks them aborted and later removes eligible staging data; clients must start a new session after expiration.
 
 ## Repository layout
 

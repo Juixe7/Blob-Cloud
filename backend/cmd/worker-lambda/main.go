@@ -83,6 +83,7 @@ func getWorker(ctx context.Context) (*LambdaWorker, error) {
 
 		files := postgresrepo.NewFileRepository(db)
 		blocks := postgresrepo.NewBlockRepository(db)
+		perms := postgresrepo.NewPermissionRepository(db)
 
 		// 3. Notifier (Redis Pub/Sub for cross-service WebSocket alerts)
 		var notifier wsSync.Notifier = wsSync.NoopNotifier()
@@ -104,7 +105,8 @@ func getWorker(ctx context.Context) (*LambdaWorker, error) {
 			clamClient = antivirus.NewClamAVClient(clamAddr)
 		}
 
-		processor := queue.NewFileProcessor(files, blocks, storageProvider, notifier, aiClient, clamClient, log)
+		processor := queue.NewFileProcessor(files, blocks, storageProvider, notifier, aiClient, clamClient, log).
+			WithDatabase(db).WithJournal(postgresrepo.NewJournalRepository(db)).WithPermissions(perms)
 
 		instance = &LambdaWorker{
 			processor: processor,
@@ -134,7 +136,9 @@ func Handler(ctx context.Context, sqsEvent events.SQSEvent) (events.SQSEventResp
 // processSQSEvent handles each message in the batch and tracks individual item failures.
 func processSQSEvent(
 	ctx context.Context,
-	processor interface{ ProcessMessage(ctx context.Context, msg queue.ThumbnailMessage) error },
+	processor interface {
+		ProcessMessage(ctx context.Context, msg queue.ThumbnailMessage) error
+	},
 	log *slog.Logger,
 	sqsEvent events.SQSEvent,
 ) (events.SQSEventResponse, error) {

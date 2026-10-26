@@ -1,4 +1,4 @@
-﻿// Command gc is the orphaned-block garbage collector for Blob-Cloud.
+// Command gc is the orphaned-block garbage collector for Blob-Cloud.
 //
 // It compares every physical object under "blocks/" in the configured storage
 // backend against the Postgres blocks table, and deletes any key that has no
@@ -18,16 +18,18 @@
 //	                 Defaults to ".env" in the current directory.
 //
 // Environment variables:
-//   The binary reads the same env vars as the API server (DB_DSN, STORAGE_PROVIDER,
-//   AWS_*, LOCAL_STORAGE_DIR, etc.) so a single .env file covers both.
+//
+//	The binary reads the same env vars as the API server (DB_DSN, STORAGE_PROVIDER,
+//	AWS_*, LOCAL_STORAGE_DIR, etc.) so a single .env file covers both.
 //
 // LP alignment:
-//   Ownership    — we identified the storage-leak gap in our own README and
-//                  closed it rather than leaving a known issue open.
-//   Frugality    — every orphaned block left in S3/R2 costs money; this job
-//                  makes storage cost proportional to actual data stored.
-//   Dive Deep    — the GC distinguishes aborted uploads from legitimate blocks
-//                  using the DB as the authoritative source of truth.
+//
+//	Ownership    — we identified the storage-leak gap in our own README and
+//	               closed it rather than leaving a known issue open.
+//	Frugality    — every orphaned block left in S3/R2 costs money; this job
+//	               makes storage cost proportional to actual data stored.
+//	Dive Deep    — the GC distinguishes aborted uploads from legitimate blocks
+//	               using the DB as the authoritative source of truth.
 package main
 
 import (
@@ -42,6 +44,7 @@ import (
 
 	"go-drive-clone/internal/config"
 	"go-drive-clone/internal/database"
+	"go-drive-clone/internal/domain"
 	"go-drive-clone/internal/gc"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 	"go-drive-clone/internal/storage"
@@ -49,10 +52,15 @@ import (
 
 func main() {
 	// ── flags ───────────────────────────────────────────────────────────────
-	dryRun  := flag.Bool("dry-run", true, "log orphans without deleting (safe default)")
-	minAge  := flag.Duration("min-age", time.Hour, "minimum object age to be considered an orphan")
+	dryRun := flag.Bool("dry-run", true, "log orphans without deleting (safe default)")
+	minAge := flag.Duration("min-age", time.Hour, "minimum object age to be considered an orphan")
 	envFile := flag.String("env-file", ".env", "path to .env file (optional)")
 	flag.Parse()
+	if *minAge < domain.StagingUploadURLLifetime {
+		log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+		log.Error("--min-age must be at least the maximum staging upload URL lifetime", "minimum", domain.StagingUploadURLLifetime.String())
+		os.Exit(2)
+	}
 
 	// ── logger ──────────────────────────────────────────────────────────────
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -98,7 +106,7 @@ func main() {
 	// ── storage backend ─────────────────────────────────────────────────────
 	// The GC needs a BlockLister (to enumerate storage keys) and a Deleter
 	// (to remove orphans). Both are satisfied by the concrete storage drivers.
-	var lister  gc.BlockLister
+	var lister gc.BlockLister
 	var deleter gc.Deleter
 
 	switch cfg.StorageProvider {
@@ -108,7 +116,7 @@ func main() {
 			log.Error("failed to initialise S3 storage", "err", err)
 			os.Exit(1)
 		}
-		lister  = s3stor
+		lister = s3stor
 		deleter = s3stor
 
 	default: // "local" or empty
@@ -117,7 +125,7 @@ func main() {
 			log.Error("failed to initialise local storage", "err", err)
 			os.Exit(1)
 		}
-		lister  = localStor
+		lister = localStor
 		deleter = localStor
 	}
 
@@ -135,12 +143,16 @@ func main() {
 	}
 
 	log.Info("gc finished",
-		"mode",             mode,
-		"storage_scanned",  result.StorageKeysScanned,
-		"db_hashes",        result.DBHashesLoaded,
-		"orphans_found",    result.OrphansFound,
-		"orphans_deleted",  result.OrphansDeleted,
-		"errors",           result.Errors,
+		"mode", mode,
+		"storage_scanned", result.StorageKeysScanned,
+		"db_hashes", result.DBHashesLoaded,
+		"orphans_found", result.OrphansFound,
+		"orphans_deleted", result.OrphansDeleted,
+		"staging_found", result.StagingFound,
+		"staging_deleted", result.StagingDeleted,
+		"stale_sessions_found", result.StaleSessionsFound,
+		"stale_sessions_aborted", result.StaleSessionsAborted,
+		"errors", result.Errors,
 	)
 
 	// Exit non-zero if any deletions failed so cron can alert on partial runs.

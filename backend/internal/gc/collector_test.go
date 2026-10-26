@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"go-drive-clone/internal/domain"
 	"go-drive-clone/internal/gc"
 )
 
@@ -26,6 +27,24 @@ type fakeDBHashes struct{ hashes []string }
 
 func (f *fakeDBHashes) AllBlockHashes(_ context.Context) ([]string, error) {
 	return f.hashes, nil
+}
+func (f *fakeDBHashes) ExpireStaleUploadSessions(context.Context, bool) (int64, error) { return 0, nil }
+func (f *fakeDBHashes) WithBlockCandidate(_ context.Context, hash string, _ bool, deleteObject func() error) (bool, error) {
+	for _, known := range f.hashes {
+		if known == hash {
+			return false, nil
+		}
+	}
+	if err := deleteObject(); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+func (f *fakeDBHashes) WithStagingCandidate(_ context.Context, _ string, _ bool, deleteObject func() error) (bool, error) {
+	if err := deleteObject(); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 type fakeDeleter struct {
@@ -48,7 +67,7 @@ func silentLog() *slog.Logger {
 }
 
 func buildCollector(lister gc.BlockLister, db gc.DBBlockHashes, deleter gc.Deleter, dryRun bool) *gc.Collector {
-	cfg := gc.Config{DryRun: dryRun, MinBlockAge: time.Hour}
+	cfg := gc.Config{DryRun: dryRun}
 	return gc.New(lister, db, deleter, cfg, silentLog())
 }
 
@@ -57,8 +76,8 @@ func buildCollector(lister gc.BlockLister, db gc.DBBlockHashes, deleter gc.Delet
 // TestCollector_NoOrphans verifies that when every storage key has a matching
 // DB hash, Run reports 0 orphans and deletes nothing.
 func TestCollector_NoOrphans(t *testing.T) {
-	lister  := &fakeBlockLister{keys: []string{"blocks/aaa", "blocks/bbb"}}
-	db      := &fakeDBHashes{hashes: []string{"aaa", "bbb"}}
+	lister := &fakeBlockLister{keys: []string{"blocks/aaa", "blocks/bbb"}}
+	db := &fakeDBHashes{hashes: []string{"aaa", "bbb"}}
 	deleter := &fakeDeleter{}
 
 	res, err := buildCollector(lister, db, deleter, false).Run(context.Background())
@@ -82,8 +101,8 @@ func TestCollector_NoOrphans(t *testing.T) {
 // TestCollector_DryRun verifies that orphans are identified but NOT deleted
 // when DryRun=true.
 func TestCollector_DryRun(t *testing.T) {
-	lister  := &fakeBlockLister{keys: []string{"blocks/known", "blocks/orphan1", "blocks/orphan2"}}
-	db      := &fakeDBHashes{hashes: []string{"known"}}
+	lister := &fakeBlockLister{keys: []string{"blocks/known", "blocks/orphan1", "blocks/orphan2"}}
+	db := &fakeDBHashes{hashes: []string{"known"}}
 	deleter := &fakeDeleter{}
 
 	res, err := buildCollector(lister, db, deleter, true /* dry-run */).Run(context.Background())
@@ -104,8 +123,8 @@ func TestCollector_DryRun(t *testing.T) {
 // TestCollector_LiveDelete verifies that orphaned objects are deleted and the
 // result counters reflect the outcome.
 func TestCollector_LiveDelete(t *testing.T) {
-	lister  := &fakeBlockLister{keys: []string{"blocks/known", "blocks/orphan"}}
-	db      := &fakeDBHashes{hashes: []string{"known"}}
+	lister := &fakeBlockLister{keys: []string{"blocks/known", "blocks/orphan"}}
+	db := &fakeDBHashes{hashes: []string{"known"}}
 	deleter := &fakeDeleter{}
 
 	res, err := buildCollector(lister, db, deleter, false /* live */).Run(context.Background())
@@ -130,8 +149,8 @@ func TestCollector_LiveDelete(t *testing.T) {
 // error and does NOT abort the rest of the sweep (other orphans are still
 // processed).
 func TestCollector_DeleteError(t *testing.T) {
-	lister  := &fakeBlockLister{keys: []string{"blocks/orphan1", "blocks/orphan2"}}
-	db      := &fakeDBHashes{hashes: []string{}}
+	lister := &fakeBlockLister{keys: []string{"blocks/orphan1", "blocks/orphan2"}}
+	db := &fakeDBHashes{hashes: []string{}}
 	deleter := &fakeDeleter{failOn: "blocks/orphan1"}
 
 	res, err := buildCollector(lister, db, deleter, false).Run(context.Background())
@@ -153,8 +172,8 @@ func TestCollector_DeleteError(t *testing.T) {
 // TestCollector_EmptyStorage verifies a run against an empty storage bucket
 // produces a valid zero-orphan result without error.
 func TestCollector_EmptyStorage(t *testing.T) {
-	lister  := &fakeBlockLister{keys: []string{}}
-	db      := &fakeDBHashes{hashes: []string{"some_hash"}}
+	lister := &fakeBlockLister{keys: []string{}}
+	db := &fakeDBHashes{hashes: []string{"some_hash"}}
 	deleter := &fakeDeleter{}
 
 	res, err := buildCollector(lister, db, deleter, false).Run(context.Background())
@@ -190,7 +209,7 @@ func TestCollector_SweepsAbandonedStaging(t *testing.T) {
 	db := &fakeDBHashes{hashes: []string{"aaa"}}
 	deleter := &fakeDeleter{}
 
-	c := gc.New(lister, db, deleter, gc.Config{DryRun: false, MinBlockAge: time.Hour}, silentLog())
+	c := gc.New(lister, db, deleter, gc.Config{DryRun: false}, silentLog())
 	res, err := c.Run(context.Background())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -205,6 +224,82 @@ func TestCollector_SweepsAbandonedStaging(t *testing.T) {
 	if len(deleter.deleted) != 2 {
 		t.Errorf("total deleted: want 2, got %d", len(deleter.deleted))
 	}
+}
+
+type agedFakeLister struct {
+	blocks  []domain.StorageObject
+	staging []domain.StorageObject
+}
+
+func (f *agedFakeLister) ListBlockKeys(context.Context) ([]string, error)   { return nil, nil }
+func (f *agedFakeLister) ListStagingKeys(context.Context) ([]string, error) { return nil, nil }
+func (f *agedFakeLister) ListBlockObjects(context.Context) ([]domain.StorageObject, error) {
+	return f.blocks, nil
+}
+func (f *agedFakeLister) ListStagingObjects(context.Context) ([]domain.StorageObject, error) {
+	return f.staging, nil
+}
+
+func TestCollector_EnforcesMinAgeAndPreservesActiveSessionStaging(t *testing.T) {
+	now := time.Now()
+	lister := &agedFakeLister{
+		blocks: []domain.StorageObject{
+			{Key: "blocks/young-orphan", LastModified: now.Add(-time.Minute)},
+			{Key: "blocks/old-orphan", LastModified: now.Add(-2 * time.Hour)},
+		},
+		staging: []domain.StorageObject{
+			{Key: "staging/active-session/0", LastModified: now.Add(-2 * time.Hour)},
+			{Key: "staging/terminal-session/0", LastModified: now.Add(-2 * time.Hour)},
+		},
+	}
+	checker := &gcSafetyDB{fakeDBHashes: fakeDBHashes{}, activeSessions: map[string]bool{"active-session": true}}
+	deleter := &fakeDeleter{}
+	c := gc.New(lister, checker, deleter, gc.Config{MinBlockAge: time.Hour}, silentLog())
+	res, err := c.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OrphansFound != 1 || res.StagingFound != 1 {
+		t.Fatalf("found block/staging candidates = %d/%d, want 1/1", res.OrphansFound, res.StagingFound)
+	}
+	if res.OrphansDeleted != 1 || res.StagingDeleted != 1 {
+		t.Fatalf("deleted block/staging = %d/%d, want 1/1", res.OrphansDeleted, res.StagingDeleted)
+	}
+	for _, key := range deleter.deleted {
+		if key == "blocks/young-orphan" || key == "staging/active-session/0" {
+			t.Fatalf("GC deleted a young or active-session object: %v", deleter.deleted)
+		}
+	}
+	dryRunDeleter := &fakeDeleter{}
+	dryRun, err := gc.New(lister, checker, dryRunDeleter, gc.Config{DryRun: true, MinBlockAge: time.Hour}, silentLog()).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dryRun.OrphansFound != res.OrphansFound || dryRun.StagingFound != res.StagingFound {
+		t.Fatalf("dry-run/live candidate mismatch: dry=%+v live=%+v", dryRun, res)
+	}
+	if len(dryRunDeleter.deleted) != 0 {
+		t.Fatalf("dry-run deleted objects: %v", dryRunDeleter.deleted)
+	}
+}
+
+type gcSafetyDB struct {
+	fakeDBHashes
+	activeSessions map[string]bool
+}
+
+func (d *gcSafetyDB) WithBlockCandidate(ctx context.Context, hash string, dryRun bool, deleteObject func() error) (bool, error) {
+	return d.fakeDBHashes.WithBlockCandidate(ctx, hash, dryRun, deleteObject)
+}
+
+func (d *gcSafetyDB) WithStagingCandidate(_ context.Context, sessionID string, _ bool, deleteObject func() error) (bool, error) {
+	if d.activeSessions[sessionID] {
+		return false, nil
+	}
+	if err := deleteObject(); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 // concurrent3TableState models the 3-table reference check (file_blocks,
@@ -250,12 +345,41 @@ func (s *concurrent3TableState) AllBlockHashes(_ context.Context) ([]string, err
 	}
 	return out, nil
 }
+func (s *concurrent3TableState) ExpireStaleUploadSessions(context.Context, bool) (int64, error) {
+	return 0, nil
+}
+
+func (s *concurrent3TableState) WithBlockCandidate(_ context.Context, hash string, _ bool, deleteObject func() error) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fileBlocks[hash] || s.versionBlocks[hash] || s.sessionBlocks[hash] {
+		return false, nil
+	}
+	if err := deleteObject(); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
+func (s *concurrent3TableState) WithStagingCandidate(_ context.Context, _ string, _ bool, deleteObject func() error) (bool, error) {
+	return true, deleteObject()
+}
 
 func (s *concurrent3TableState) DeleteObject(_ context.Context, key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.storageObjects, key)
 	s.deletedKeys = append(s.deletedKeys, key)
+	return nil
+}
+
+// lockedConcurrentDeleter is used only inside WithBlockCandidate, which holds
+// the state mutex while modeling PostgreSQL's candidate lock transaction.
+type lockedConcurrentDeleter struct{ state *concurrent3TableState }
+
+func (d *lockedConcurrentDeleter) DeleteObject(_ context.Context, key string) error {
+	delete(d.state.storageObjects, key)
+	d.state.deletedKeys = append(d.state.deletedKeys, key)
 	return nil
 }
 
@@ -283,7 +407,7 @@ func TestCollector_ConcurrentGCVsInFlightUploadSessionsSafety(t *testing.T) {
 		state.storageObjects["blocks/"+h] = true
 	}
 
-	collector := gc.New(state, state, state, gc.Config{DryRun: false, MinBlockAge: time.Hour}, silentLog())
+	collector := gc.New(state, state, &lockedConcurrentDeleter{state: state}, gc.Config{DryRun: false}, silentLog())
 
 	var wg sync.WaitGroup
 	startGate := make(chan struct{})
@@ -366,4 +490,3 @@ func TestCollector_ConcurrentGCVsInFlightUploadSessionsSafety(t *testing.T) {
 		t.Fatalf("expected exactly 10 true orphans deleted, got %d (%v)", len(state.deletedKeys), state.deletedKeys)
 	}
 }
-

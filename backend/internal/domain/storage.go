@@ -16,16 +16,18 @@ type ObjectMetadata struct {
 	ETag          string
 }
 
+// StorageObject carries a backend key and storage-reported modification time
+// for age-aware lifecycle operations.
+type StorageObject struct {
+	Key          string
+	LastModified time.Time
+}
+
 // StorageProvider abstracts a content-addressable block store. Phase 1 ships a
 // local disk implementation that mirrors how AWS S3 behaves; Phase 4 will add an
 // S3 implementation that satisfies the same interface. Callers (HTTP handlers,
 // background workers) depend on this interface and never on a concrete driver.
 type StorageProvider interface {
-	// GenerateUploadURL returns a URL that a client can use to upload a block
-	// via a direct HTTP PUT. For the local driver this points back at our own
-	// server; for the S3 driver this will be a presigned S3 PUT URL.
-	GenerateUploadURL(ctx context.Context, blockHash string, expires time.Duration) (string, error)
-
 	// PutObject uploads a stream (used for small assets or internal/server-side
 	// writes). The concrete driver is responsible for persisting the bytes.
 	PutObject(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error
@@ -57,6 +59,14 @@ type StorageProvider interface {
 	PromoteObject(ctx context.Context, srcKey, destKey string) error
 }
 
+// StagingUploadURLValidator verifies the short-lived bearer capability issued
+// by storage providers whose upload URLs terminate at this API (for example,
+// the local filesystem provider). Remote providers such as S3 validate their
+// own presigned URLs and do not need to implement this interface.
+type StagingUploadURLValidator interface {
+	ValidateStagingUploadURL(stagingKey string, expiresAt int64, signature string) bool
+}
+
 // ── Multipart upload (Tier 3G) ────────────────────────────────────────────────
 
 // MPUBlockThreshold is the maximum block size supported by a single presigned
@@ -78,7 +88,7 @@ const MPUPartSize = int64(100) * 1024 * 1024 // 100 MiB
 //	if mpu, ok := storage.(domain.MultipartUploadProvider); ok { ... }
 type MultipartUploadProvider interface {
 	// CreateMultipartUpload initiates an MPU and returns the upload ID.
-	// The key must be the final destination key (e.g. "blocks/<sha256>").
+	// The key must be a session-scoped staging key (e.g. "staging/<session>/<sequence>").
 	CreateMultipartUpload(ctx context.Context, key string) (uploadID string, err error)
 
 	// PresignUploadPart returns a presigned PUT URL for one MPU part.
