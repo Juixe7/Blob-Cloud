@@ -1,6 +1,6 @@
 import { type FormEvent, useState } from 'react'
 import { apiClient } from '../lib/api'
-import { extractError } from '../context/AuthContext'
+import { extractError } from '../lib/errors'
 import { Modal } from './ui/Modal'
 import { Button } from './ui/Button'
 import { Input } from './ui/Input'

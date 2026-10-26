@@ -1,7 +1,7 @@
 import { type FormEvent, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { apiClient } from '../lib/api'
-import { extractError } from '../context/AuthContext'
+import { extractError } from '../lib/errors'
 import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'
 import { Alert } from '../components/ui/Alert'

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import axios from 'axios'
 import { apiClient } from '../lib/api'
 import { Modal } from './ui/Modal'
@@ -32,7 +32,10 @@ interface MoveModalProps {
  * Supports both single-item and bulk-item move operations.
  */
 export function MoveModal({ open, onClose, file, files, onMoved }: MoveModalProps) {
-  const itemsToMove: MoveItem[] = files && files.length > 0 ? files : file ? [file] : []
+  const itemsToMove = useMemo<MoveItem[]>(
+    () => (files && files.length > 0 ? files : file ? [file] : []),
+    [files, file],
+  )
   const firstItem = itemsToMove[0] ?? null
 
   // Navigation state local to the modal.

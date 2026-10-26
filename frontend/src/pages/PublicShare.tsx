@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { apiClient } from '../lib/api'
 import { getAccessToken } from '../lib/token'
@@ -37,7 +37,7 @@ export function PublicShare() {
   const [decryptModalOpen, setDecryptModalOpen] = useState(false)
   const [decrypting, setDecrypting] = useState(false)
 
-  const fetchShare = async (explicitToken?: string) => {
+  const fetchShare = useCallback(async (explicitToken?: string) => {
     setLoading(true)
     setError(null)
     setPasswordRequired(false)
@@ -56,7 +56,7 @@ export function PublicShare() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [token, verifiedToken])
 
   useEffect(() => {
     if (token) {
@@ -66,7 +66,7 @@ export function PublicShare() {
         apiClient.post(`/public/shares/${token}/view`).catch((e) => console.error('failed to record public view', e))
       }
     }
-  }, [token, isLoggedIn])
+  }, [token, isLoggedIn, fetchShare])
 
   const handleVerify = async (e: React.FormEvent) => {
     e.preventDefault()
