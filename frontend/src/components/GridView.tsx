@@ -54,6 +54,7 @@ const Card = React.memo(function Card({
 }: CardProps) {
   const isShortcut = item.mime_type === 'application/vnd.google-apps.shortcut'
   const isBrokenShortcut = isShortcut && item.shortcut_target_id === null
+  const isUnavailable = !item.is_directory && item.status !== 'ACTIVE'
   const [imgLoaded, setImgLoaded] = useState(false)
   const [imgError, setImgError] = useState(() => isThumbnailFailed(item.id))
 
@@ -68,7 +69,7 @@ const Card = React.memo(function Card({
   const isImage = item.mime_type?.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)$/i.test(item.name)
   const isVideo = item.mime_type?.startsWith('video/') || /\.(mp4|webm|mov|mkv)$/i.test(item.name)
   const isPdf = item.mime_type === 'application/pdf' || item.name.toLowerCase().endsWith('.pdf')
-  const canHaveThumbnail = !item.is_directory && (isImage || isVideo || isPdf || Boolean(item.thumbnail_url))
+  const canHaveThumbnail = !isUnavailable && !item.is_directory && (isImage || isVideo || isPdf || Boolean(item.thumbnail_url))
 
   return (
     <div
@@ -83,7 +84,7 @@ const Card = React.memo(function Card({
         }
       }}
       onDoubleClick={() => {
-        if (isBrokenShortcut || item.status === 'QUARANTINED') return
+        if (isBrokenShortcut || isUnavailable) return
         if (item.is_directory) {
           onOpenFolder(item)
         } else if (onOpenFile) {
@@ -92,7 +93,7 @@ const Card = React.memo(function Card({
       }}
       onKeyDown={(e) => {
         if (e.key === 'Enter') {
-          if (isBrokenShortcut || item.status === 'QUARANTINED') return
+          if (isBrokenShortcut || isUnavailable) return
           if (item.is_directory) onOpenFolder(item)
           else if (onOpenFile) onOpenFile(item)
         }
@@ -110,7 +111,7 @@ const Card = React.memo(function Card({
         isSelected ? 'bg-amber-500/10 border-amber-500/50' : 'hover:border-arch-border hover:bg-arch-850/60',
         item.status === 'QUARANTINED' && 'bg-[repeating-linear-gradient(45deg,transparent,transparent_10px,rgba(220,38,38,0.1)_10px,rgba(220,38,38,0.1)_20px)] border-red-500/50 hover:bg-[repeating-linear-gradient(45deg,transparent,transparent_10px,rgba(220,38,38,0.1)_10px,rgba(220,38,38,0.1)_20px)] hover:border-red-500/50'
       )}
-      title={item.status === 'QUARANTINED' ? 'Malware detected. This file is locked in quarantine.' : undefined}
+      title={item.status === 'QUARANTINED' ? 'Malware detected. This file is locked in quarantine.' : isUnavailable ? 'Security scan in progress. This file is temporarily unavailable.' : undefined}
     >
       <div className="absolute left-3 top-3 z-10" onClick={(e) => e.stopPropagation()}>
         <input
@@ -206,6 +207,9 @@ const Card = React.memo(function Card({
           >
             {item.name}
           </h3>
+          {item.status === 'PROCESSING' && !item.is_directory && (
+            <span className="mt-1 block text-[9px] font-mono uppercase tracking-wide text-amber-400">Security scan pending</span>
+          )}
           {item.shared_by_email && (
             <p className="text-[10px] text-zinc-500 truncate mt-0.5 font-mono">
               Shared by {item.shared_by_email}

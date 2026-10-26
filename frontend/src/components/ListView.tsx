@@ -53,6 +53,7 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
   const isSelected = selectedIds?.has(item.id) ?? false
   const isShortcut = item.mime_type === 'application/vnd.google-apps.shortcut'
   const isBrokenShortcut = isShortcut && item.shortcut_target_id === null
+  const isUnavailable = !item.is_directory && item.status !== 'ACTIVE'
   const [imgError, setImgError] = useState(() => isThumbnailFailed(item.id))
   
   useEffect(() => {
@@ -65,7 +66,7 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
   const isImage = item.mime_type?.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif)$/i.test(item.name)
   const isVideo = item.mime_type?.startsWith('video/') || /\.(mp4|webm|mov|mkv)$/i.test(item.name)
   const isPdf = item.mime_type === 'application/pdf' || item.name.toLowerCase().endsWith('.pdf')
-  const canHaveThumbnail = !item.is_directory && (isImage || isVideo || isPdf || Boolean(item.thumbnail_url))
+  const canHaveThumbnail = !isUnavailable && !item.is_directory && (isImage || isVideo || isPdf || Boolean(item.thumbnail_url))
   const showThumbnail = canHaveThumbnail && !imgError
   
   return (
@@ -74,7 +75,7 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
       onClick={(e) => {
         e.stopPropagation()
         if (e.detail === 2) {
-          if (isBrokenShortcut) return
+          if (isBrokenShortcut || isUnavailable) return
           if (item.is_directory) {
             onOpenFolder(item)
             return
@@ -92,7 +93,7 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
         }
       }}
       onDoubleClick={() => {
-        if (isBrokenShortcut) return
+        if (isBrokenShortcut || isUnavailable) return
         if (item.is_directory) {
           onOpenFolder(item)
         } else if (onOpenFile) {
@@ -101,7 +102,7 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
       }}
       onKeyDown={(e) => {
         if (e.key === 'Enter') {
-          if (isBrokenShortcut) return
+          if (isBrokenShortcut || isUnavailable) return
           if (item.is_directory) onOpenFolder(item)
           else if (onOpenFile) onOpenFile(item)
         }
@@ -118,7 +119,7 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
         isSelected ? 'bg-amber-500/10 border-l-2 border-l-amber-500 border-b-transparent' : 'hover:bg-arch-850/60',
         item.status === 'QUARANTINED' && 'bg-[repeating-linear-gradient(45deg,transparent,transparent_10px,rgba(220,38,38,0.1)_10px,rgba(220,38,38,0.1)_20px)]'
       )}
-      title={item.status === 'QUARANTINED' ? 'Malware detected. This file is locked in quarantine.' : undefined}
+      title={item.status === 'QUARANTINED' ? 'Malware detected. This file is locked in quarantine.' : isUnavailable ? 'Security scan in progress. This file is temporarily unavailable.' : undefined}
     >
       <div className="pl-4 pr-1 py-2 w-10 shrink-0 flex items-center" onClick={(e) => e.stopPropagation()}>
         <input
@@ -181,6 +182,9 @@ const Row = React.memo(({ index, style, items, selectedIds, isTrash, isShared, o
           >
             {item.name}
           </span>
+          {item.status === 'PROCESSING' && !item.is_directory && (
+            <span className="text-[9px] font-mono uppercase tracking-wide text-amber-400">Security scan pending</span>
+          )}
           <span className="sm:hidden truncate text-zinc-500 font-mono text-[9px] mt-0.5">
             {isTrash
               ? formatDate(item.deleted_at || '')

@@ -19,6 +19,10 @@ func NewShareableLinkRepository(db DBTX) *ShareableLinkRepository {
 	return &ShareableLinkRepository{db: db}
 }
 
+func (r *ShareableLinkRepository) WithTx(tx DBTX) *ShareableLinkRepository {
+	return &ShareableLinkRepository{db: tx}
+}
+
 // Create inserts a new shareable link.
 func (r *ShareableLinkRepository) Create(ctx context.Context, link *domain.ShareableLink) error {
 	const q = `
@@ -36,13 +40,27 @@ func (r *ShareableLinkRepository) Create(ctx context.Context, link *domain.Share
 
 // GetByToken returns a shareable link by its unique token.
 func (r *ShareableLinkRepository) GetByToken(ctx context.Context, token string) (*domain.ShareableLink, error) {
+	return r.getByToken(ctx, token, false)
+}
+
+// GetByTokenForUpdate locks the link until the surrounding transaction ends,
+// serializing shortcut creation with link revocation.
+func (r *ShareableLinkRepository) GetByTokenForUpdate(ctx context.Context, token string) (*domain.ShareableLink, error) {
+	return r.getByToken(ctx, token, true)
+}
+
+func (r *ShareableLinkRepository) getByToken(ctx context.Context, token string, forUpdate bool) (*domain.ShareableLink, error) {
+	lockClause := ""
+	if forUpdate {
+		lockClause = " FOR UPDATE"
+	}
 	const q = `
 		SELECT id, file_id, link_token, access_tier, password_hash, expires_at, created_at
 		FROM shareable_links
 		WHERE link_token = $1
 	`
 	var link domain.ShareableLink
-	err := r.db.QueryRowContext(ctx, q, token).Scan(
+	err := r.db.QueryRowContext(ctx, q+lockClause, token).Scan(
 		&link.ID, &link.FileID, &link.LinkToken, &link.AccessTier,
 		&link.PasswordHash, &link.ExpiresAt, &link.CreatedAt,
 	)
@@ -53,4 +71,21 @@ func (r *ShareableLinkRepository) GetByToken(ctx context.Context, token string) 
 		return nil, fmt.Errorf("query shareable link by token: %w", err)
 	}
 	return &link, nil
+}
+
+// DeleteByFileAndToken revokes one link without allowing a token from another
+// file to be used to mutate the link set.
+func (r *ShareableLinkRepository) DeleteByFileAndToken(ctx context.Context, fileID, token string) error {
+	res, err := r.db.ExecContext(ctx, `DELETE FROM shareable_links WHERE file_id=$1 AND link_token=$2`, fileID, token)
+	if err != nil {
+		return fmt.Errorf("revoke shareable link: %w", err)
+	}
+	rows, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("revoke shareable link rows affected: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }

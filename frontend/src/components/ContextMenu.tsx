@@ -139,7 +139,7 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
   }
 
   const isOwnerOrEditor = role === 'OWNER' || role === 'EDITOR'
-  const isQuarantined = item.status === 'QUARANTINED'
+  const isUnavailable = item.status !== 'ACTIVE'
 
   return (
     <div
@@ -163,7 +163,7 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
           onClick={run(actions.onOpenFolder)}
         />
       )}
-      {!isDirectory && actions.onPreview && !isQuarantined && (
+      {!isDirectory && actions.onPreview && !isUnavailable && (
         <MenuItem
           icon={
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
@@ -175,10 +175,10 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
           onClick={run(actions.onPreview)}
         />
       )}
-      {isOwnerOrEditor && !isQuarantined && (
+      {isOwnerOrEditor && !isUnavailable && (
         <MenuItem icon={<ShareIcon size={14} />} label="Share" onClick={run(actions.onShare)} />
       )}
-      {isOwnerOrEditor && actions.onSharePublic && !isQuarantined && (
+      {isOwnerOrEditor && actions.onSharePublic && !isUnavailable && (
         <MenuItem
           icon={
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
@@ -190,7 +190,7 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
           onClick={run(actions.onSharePublic)}
         />
       )}
-      {actions.onGetInfo && !isQuarantined && (
+      {actions.onGetInfo && !isUnavailable && (
         <MenuItem
           icon={
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
@@ -203,13 +203,13 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
           onClick={run(actions.onGetInfo)}
         />
       )}
-      {isOwnerOrEditor && !isQuarantined && (
+      {isOwnerOrEditor && !isUnavailable && (
         <MenuItem icon={<PencilIcon size={14} />} label="Rename" onClick={run(actions.onRename)} />
       )}
-      {isOwnerOrEditor && !isQuarantined && (
+      {isOwnerOrEditor && !isUnavailable && (
         <MenuItem icon={<FolderInputIcon size={14} />} label="Move To" onClick={run(actions.onMove)} />
       )}
-      {!isDirectory && actions.onUploadVersion && isOwnerOrEditor && !isQuarantined && (
+      {!isDirectory && actions.onUploadVersion && isOwnerOrEditor && !isUnavailable && (
         <MenuItem
           icon={
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
@@ -222,7 +222,7 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
           onClick={run(actions.onUploadVersion)}
         />
       )}
-      {!isDirectory && actions.onVersionHistory && !isQuarantined && (
+      {!isDirectory && actions.onVersionHistory && !isUnavailable && (
         <MenuItem
           icon={
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
@@ -233,8 +233,8 @@ export function ContextMenu({ item, position, onClose, actions, isTrash = false,
           onClick={run(actions.onVersionHistory)}
         />
       )}
-      {!isQuarantined && <MenuItem icon={<DownloadIcon size={14} />} label="Download" onClick={run(actions.onDownload)} />}
-      {actions.onCreateShortcut && !isQuarantined && (
+      {!isUnavailable && <MenuItem icon={<DownloadIcon size={14} />} label="Download" onClick={run(actions.onDownload)} />}
+      {actions.onCreateShortcut && !isUnavailable && (
         <MenuItem
           icon={
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">

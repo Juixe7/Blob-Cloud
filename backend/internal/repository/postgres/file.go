@@ -111,6 +111,28 @@ func (r *FileRepository) GetByID(ctx context.Context, id string) (*domain.File, 
 	return &f, nil
 }
 
+// GetByIDForUpdate returns a file row while holding a row lock until the
+// caller's transaction ends. Use it when a mutation must serialize with file
+// deletion or status changes, such as accepting a share invitation.
+func (r *FileRepository) GetByIDForUpdate(ctx context.Context, id string) (*domain.File, error) {
+	q := fmt.Sprintf(`
+		SELECT %s
+		FROM files f
+		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+		WHERE f.id = $1
+		FOR UPDATE OF f
+	`, fileSelectColumnsWithTarget)
+	var f domain.File
+	err := scanFileRow(r.db.QueryRowContext(ctx, q, id), &f)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return nil, fmt.Errorf("file by id %q: %w", id, sql.ErrNoRows)
+	case err != nil:
+		return nil, fmt.Errorf("query file by id for update: %w", err)
+	}
+	return &f, nil
+}
+
 // GetFolderByNameAndParent checks if an active (non-deleted) folder with exact name and parentID exists for userID.
 func (r *FileRepository) GetFolderByNameAndParent(ctx context.Context, userID, name string, parentID *string) (*domain.File, error) {
 	var (
@@ -359,6 +381,7 @@ func (r *FileRepository) GetSubtreeForItems(ctx context.Context, ids []string, u
 				END::VARCHAR(1024) AS relative_path
 			FROM files f
 			WHERE f.id = ANY($1::uuid[]) AND f.deleted_at IS NULL
+			  AND (f.is_directory OR f.status = 'ACTIVE')
 			
 			UNION ALL
 			
@@ -368,6 +391,7 @@ func (r *FileRepository) GetSubtreeForItems(ctx context.Context, ids []string, u
 			FROM files f
 			INNER JOIN selected_hierarchy sh ON f.parent_id = sh.id
 			WHERE f.deleted_at IS NULL
+			  AND (f.is_directory OR f.status = 'ACTIVE')
 		)
 		-- 3. Return both directories (for empty folder headers) and files
 		SELECT id, parent_id, name, mime_type, relative_path, target_id
@@ -864,8 +888,7 @@ func (r *FileRepository) findOrphanedHashes(ctx context.Context, hashes []string
 			SELECT 1 FROM session_blocks sb 
 			JOIN upload_sessions us ON sb.session_id = us.id 
 			WHERE sb.block_hash = b.sha256 
-			  AND us.status = 'INITIATED' 
-			  AND us.created_at > NOW() - INTERVAL '6 hours'
+			  AND us.status = 'INITIATED'
 		)`)
 
 	rows, err := r.db.QueryContext(ctx, sb.String(), args...)
@@ -882,8 +905,8 @@ func (r *FileRepository) findOrphanedHashes(ctx context.Context, hashes []string
 		}
 		orphans = append(orphans, h)
 	}
-		return orphans, rows.Err()
-	}
+	return orphans, rows.Err()
+}
 
 // GetResolvedPermission checks permissions recursively up the folder tree.
 func (r *FileRepository) GetResolvedPermission(ctx context.Context, fileID string, userEmail string) (string, error) {
@@ -893,16 +916,17 @@ func (r *FileRepository) GetResolvedPermission(ctx context.Context, fileID strin
 	const q = `
 		WITH RECURSIVE file_hierarchy AS (
 			-- 1. Base Case: Start with the target file/folder being checked
-			SELECT id, parent_id, 1 AS depth
+			SELECT id, parent_id, 1 AS depth, ARRAY[id] AS path
 			FROM files
 			WHERE id = $1
 			
 			UNION ALL
 			
 			-- 2. Recursive Step: Walk up the tree to the parent folder
-			SELECT f.id, f.parent_id, fh.depth + 1
+			SELECT f.id, f.parent_id, fh.depth + 1, fh.path || f.id
 			FROM files f
 			INNER JOIN file_hierarchy fh ON f.id = fh.parent_id
+			WHERE NOT f.id = ANY(fh.path)
 		)
 		-- 3. Join the resolved hierarchy with the permissions table
 		SELECT p.role
@@ -912,7 +936,8 @@ func (r *FileRepository) GetResolvedPermission(ctx context.Context, fileID strin
 		  AND p.status = 'ACCEPTED'
 		  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
 		ORDER BY fh.depth ASC
-		LIMIT 1;
+		LIMIT 1
+		FOR SHARE OF p;
 	`
 	var role string
 	err := r.db.QueryRowContext(ctx, q, fileID, userEmail).Scan(&role)
@@ -934,14 +959,15 @@ func (r *FileRepository) HasPublicLinkOrShortcutAccess(ctx context.Context, user
 	}
 	const q = `
 		WITH RECURSIVE file_hierarchy AS (
-			SELECT id, parent_id
+			SELECT id, parent_id, ARRAY[id] AS path
 			FROM files
 			WHERE id = $1 AND deleted_at IS NULL
 			UNION ALL
-			SELECT f.id, f.parent_id
+			SELECT f.id, f.parent_id, fh.path || f.id
 			FROM files f
 			INNER JOIN file_hierarchy fh ON f.id = fh.parent_id
 			WHERE f.deleted_at IS NULL
+			  AND NOT f.id = ANY(fh.path)
 		)
 		SELECT EXISTS (
 			SELECT 1
@@ -1024,17 +1050,32 @@ func (r *FileRepository) BulkMove(ctx context.Context, ids []string, parentID *s
 	if len(ids) == 0 {
 		return nil
 	}
-	db, ok := r.db.(*sql.DB)
-	if !ok {
-		return fmt.Errorf("BulkMove must be called outside of a transaction")
-	}
+	apply := func(txRepo *FileRepository) error {
 
-	return RunInTx(ctx, db, func(tx DBTX) error {
-		txRepo := r.WithTx(tx)
-		
 		var userEmail string
 		if err := txRepo.db.QueryRowContext(ctx, "SELECT email FROM users WHERE id = $1", userID).Scan(&userEmail); err != nil {
 			return fmt.Errorf("resolve user email for golden rule: %w", err)
+		}
+		if parentID != nil && *parentID != "" && *parentID != "root" {
+			destination, err := txRepo.GetByID(ctx, *parentID)
+			if err != nil {
+				return fmt.Errorf("get destination folder: %w", err)
+			}
+			if !destination.IsDirectory {
+				return fmt.Errorf("destination parent is not a directory")
+			}
+			if destination.DeletedAt != nil {
+				return fmt.Errorf("destination folder is deleted")
+			}
+			if destination.UserID != userID {
+				role, err := txRepo.GetResolvedPermission(ctx, destination.ID, userEmail)
+				if err != nil {
+					return fmt.Errorf("destination permission check: %w", err)
+				}
+				if role != domain.RoleOwner && role != domain.RoleEditor {
+					return fmt.Errorf("access denied: editor permission required on destination folder")
+				}
+			}
 		}
 
 		for _, id := range ids {
@@ -1042,7 +1083,7 @@ func (r *FileRepository) BulkMove(ctx context.Context, ids []string, parentID *s
 			if err != nil {
 				return fmt.Errorf("get file %s for move: %w", id, err)
 			}
-			
+
 			// 1. Cycle guard
 			if parentID != nil && file.IsDirectory {
 				if *parentID == file.ID {
@@ -1078,21 +1119,21 @@ func (r *FileRepository) BulkMove(ctx context.Context, ids []string, parentID *s
 			isMove := (file.ParentID == nil && targetParent != nil) ||
 				(file.ParentID != nil && targetParent == nil) ||
 				(file.ParentID != nil && targetParent != nil && *file.ParentID != *targetParent)
-			
+
 			if isMove && (role == domain.RoleViewer || (role == domain.RoleEditor && file.IsDirectory)) {
 				realTargetID := file.ID
 				if file.TargetID != nil && *file.TargetID != "" {
 					realTargetID = *file.TargetID
 				}
-				
+
 				shortcut := &domain.File{
-					UserID: userID,
-					Name: file.Name,
-					ParentID: targetParent,
-					IsDirectory: file.IsDirectory,
-					SizeBytes: file.SizeBytes,
-					TargetID: &realTargetID,
-					MimeType: "application/vnd.google-apps.shortcut",
+					UserID:           userID,
+					Name:             file.Name,
+					ParentID:         targetParent,
+					IsDirectory:      file.IsDirectory,
+					SizeBytes:        file.SizeBytes,
+					TargetID:         &realTargetID,
+					MimeType:         "application/vnd.google-apps.shortcut",
 					ShortcutTargetID: &realTargetID,
 				}
 				if err := txRepo.Create(ctx, shortcut); err != nil {
@@ -1109,7 +1150,11 @@ func (r *FileRepository) BulkMove(ctx context.Context, ids []string, parentID *s
 			}
 		}
 		return nil
-	})
+	}
+	if db, ok := r.db.(*sql.DB); ok {
+		return RunInTx(ctx, db, func(tx DBTX) error { return apply(r.WithTx(tx)) })
+	}
+	return apply(r)
 }
 
 // BulkHardDelete recursively hard-deletes multiple file/folder roots and compiles orphaned block hashes in a single transaction.
@@ -1355,11 +1400,27 @@ func (r *FileRepository) SemanticSearch(ctx context.Context, userID string, quer
 // Compile-time assertion that FileRepository satisfies the interface.
 var _ domain.FileRepository = (*FileRepository)(nil)
 
-
 func (r *FileRepository) UpdateStatus(ctx context.Context, id string, status string) error {
 	q := `UPDATE files SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
 	_, err := r.db.ExecContext(ctx, q, status, id)
 	return err
+}
+
+// UpdateProcessingStatus prevents a delayed scan result from changing a file
+// that was replaced or otherwise modified while the scanner was running.
+func (r *FileRepository) UpdateProcessingStatus(ctx context.Context, id string, expectedUpdatedAt time.Time, status string) (bool, error) {
+	var rows int
+	err := r.db.QueryRowContext(ctx, `
+		WITH changed AS (
+			UPDATE files SET status = $1, updated_at = CURRENT_TIMESTAMP
+			WHERE id = $2 AND status = 'PROCESSING' AND updated_at = $3
+			RETURNING id
+		), removed AS (
+			DELETE FROM file_processing_outbox WHERE file_id IN (SELECT id FROM changed)
+			RETURNING file_id
+		)
+		SELECT COUNT(*) FROM changed`, status, id, expectedUpdatedAt).Scan(&rows)
+	return rows == 1, err
 }
 
 // RecordView upserts a view record for the user and file, updating the viewed_at timestamp.
@@ -1701,4 +1762,3 @@ func (r *FileRepository) TryCopyAIMetadataFromCAS(ctx context.Context, fileID st
 
 	return donorID, tags, summary, true, nil
 }
-

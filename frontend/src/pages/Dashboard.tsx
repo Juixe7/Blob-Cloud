@@ -1261,7 +1261,7 @@ export function Dashboard() {
         setIsDetailsOpen(true)
       },
     }),
-    [handleDownload, handleRestore, navigateToFolder],
+    [handleDownload, handleOpenFile, handleRestore, navigateToFolder],
   )
 
   /** Patch an item's name in local state after a successful rename. */
@@ -1621,7 +1621,7 @@ export function Dashboard() {
     const handler = () => void applyDeltaSync()
     window.addEventListener(UPLOAD_COMPLETE_EVENT, handler)
     return () => window.removeEventListener(UPLOAD_COMPLETE_EVENT, handler)
-  }, [UPLOAD_COMPLETE_EVENT, applyDeltaSync])
+  }, [applyDeltaSync])
 
   // Prompt conflict modal when a server-side 409 conflict is encountered
   useEffect(() => {

@@ -64,10 +64,6 @@ func (s *faultStorageProvider) hasKey(key string) bool {
 	return ok
 }
 
-func (s *faultStorageProvider) GenerateUploadURL(_ context.Context, blockHash string, _ time.Duration) (string, error) {
-	return "https://r2.example.com/blocks/" + blockHash, nil
-}
-
 func (s *faultStorageProvider) GenerateStagingUploadURL(_ context.Context, stagingKey string, _ time.Duration) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -272,6 +268,35 @@ func (n *spyNotifier) NotifyUser(userID string, event wsSync.NotificationEvent) 
 func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func TestUploadInitiate_RejectsMalformedMetadataBeforeSessionCreation(t *testing.T) {
+	svc, _, _, sessions, _, _ := newTestUploadHarness()
+	validHash := sha256Hex([]byte("valid"))
+	tests := []struct {
+		name string
+		edit func(*InitiateRequest)
+	}{
+		{name: "path-like filename", edit: func(r *InitiateRequest) { r.Filename = "../secret.txt" }},
+		{name: "negative total size", edit: func(r *InitiateRequest) { r.TotalSize = -1 }},
+		{name: "malformed sha256", edit: func(r *InitiateRequest) { r.Chunks[0].SHA256 = "not-a-digest" }},
+		{name: "negative chunk size", edit: func(r *InitiateRequest) { r.Chunks[0].SizeBytes = -1 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := InitiateRequest{
+				UserID: "user-alice", Filename: "valid.txt", TotalSize: 5,
+				Chunks: []InitiateChunk{{SHA256: validHash, SizeBytes: 5}},
+			}
+			tt.edit(&req)
+			if _, err := svc.Initiate(context.Background(), req); err == nil {
+				t.Fatal("expected malformed upload metadata to be rejected")
+			}
+			if len(sessions.sessions) != 0 {
+				t.Fatal("invalid metadata created an upload session")
+			}
+		})
+	}
 }
 
 func newTestUploadHarness() (*UploadService, *faultStorageProvider, *memUploadBlockStore, *memUploadSessionStore, *spyPublisher, *spyNotifier) {
@@ -574,6 +599,63 @@ func TestUpload_CrossUserSessionIDORBlocked(t *testing.T) {
 	}
 }
 
+func TestStoreStagingBlock_ValidatesSessionSequenceSizeAndHash(t *testing.T) {
+	svc, storage, _, sessions, _, _ := newTestUploadHarness()
+	ctx := context.Background()
+	payload := []byte("verified staged payload")
+	hash := sha256Hex(payload)
+	session := &domain.UploadSession{UserID: "user-alice", Status: domain.SessionStatusInitiated}
+	if err := sessions.CreateSession(ctx, session, []domain.SessionBlock{{
+		BlockHash: hash, SequenceNumber: 0, SizeBytes: int32(len(payload)),
+	}}); err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+
+	if err := svc.StoreStagingBlock(ctx, session.ID, 0, bytes.NewReader(payload), "application/octet-stream"); err != nil {
+		t.Fatalf("StoreStagingBlock valid payload: %v", err)
+	}
+	if !storage.hasKey("staging/" + session.ID + "/0") {
+		t.Fatal("valid payload was not staged")
+	}
+	if err := svc.StoreStagingBlock(ctx, session.ID, 1, bytes.NewReader(payload), "application/octet-stream"); err == nil {
+		t.Fatal("expected unrecognized sequence to be rejected")
+	}
+
+	badSession := &domain.UploadSession{UserID: "user-alice", Status: domain.SessionStatusInitiated}
+	if err := sessions.CreateSession(ctx, badSession, []domain.SessionBlock{{
+		BlockHash: hash, SequenceNumber: 0, SizeBytes: int32(len(payload) + 1),
+	}}); err != nil {
+		t.Fatalf("CreateSession bad-size: %v", err)
+	}
+	if err := svc.StoreStagingBlock(ctx, badSession.ID, 0, bytes.NewReader(payload), "application/octet-stream"); err == nil {
+		t.Fatal("expected wrong-sized payload to be rejected")
+	}
+	if storage.hasKey("staging/" + badSession.ID + "/0") {
+		t.Fatal("wrong-sized payload remained in staging")
+	}
+
+	poisonedSession := &domain.UploadSession{UserID: "user-alice", Status: domain.SessionStatusInitiated}
+	if err := sessions.CreateSession(ctx, poisonedSession, []domain.SessionBlock{{
+		BlockHash: hash, SequenceNumber: 0, SizeBytes: int32(len(payload)),
+	}}); err != nil {
+		t.Fatalf("CreateSession poisoned: %v", err)
+	}
+	poison := bytes.Repeat([]byte("x"), len(payload))
+	if err := svc.StoreStagingBlock(ctx, poisonedSession.ID, 0, bytes.NewReader(poison), "application/octet-stream"); err == nil {
+		t.Fatal("expected same-sized payload with wrong hash to be rejected")
+	}
+	if storage.hasKey("staging/" + poisonedSession.ID + "/0") {
+		t.Fatal("hash-mismatched payload remained in staging")
+	}
+
+	if err := sessions.UpdateSessionStatus(ctx, session.ID, domain.SessionStatusCompleted); err != nil {
+		t.Fatalf("UpdateSessionStatus: %v", err)
+	}
+	if err := svc.StoreStagingBlock(ctx, session.ID, 0, bytes.NewReader(payload), "application/octet-stream"); err == nil {
+		t.Fatal("expected completed session to reject staging writes")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 5. Security & Tree Integrity: Materialized Path Cycle Guard & RBAC Move Rules
 // ---------------------------------------------------------------------------
@@ -627,8 +709,8 @@ func (m *memFileServiceStore) Update(_ context.Context, f *domain.File) error {
 	m.files[f.ID] = &cp
 	return nil
 }
-func (m *memFileServiceStore) SoftDelete(context.Context, string, string) error  { return nil }
-func (m *memFileServiceStore) Restore(context.Context, string, string) error     { return nil }
+func (m *memFileServiceStore) SoftDelete(context.Context, string, string) error { return nil }
+func (m *memFileServiceStore) Restore(context.Context, string, string) error    { return nil }
 func (m *memFileServiceStore) ListTrash(context.Context, string) ([]*domain.File, error) {
 	return nil, nil
 }
@@ -677,6 +759,48 @@ func (m *memPermLookup) FindCollaboratorUserIDs(context.Context, string) ([]stri
 	return nil, nil
 }
 func (m *memPermLookup) WithTx(_ postgresrepo.DBTX) *postgresrepo.PermissionRepository { return nil }
+
+func TestFileService_RequiresWritableDirectoryDestination(t *testing.T) {
+	ctx := context.Background()
+	files := &memFileServiceStore{
+		files: map[string]*domain.File{
+			"source":         {ID: "source", UserID: "alice", Name: "source.txt"},
+			"foreign-folder": {ID: "foreign-folder", UserID: "bob", Name: "shared", IsDirectory: true},
+			"foreign-file":   {ID: "foreign-file", UserID: "bob", Name: "readme.txt"},
+		},
+		roles: map[string]map[string]string{
+			"foreign-folder": {"alice@example.com": domain.RoleViewer},
+		},
+	}
+	users := &memUserLookup{users: map[string]*domain.User{
+		"alice": {ID: "alice", Email: "alice@example.com"},
+		"bob":   {ID: "bob", Email: "bob@example.com"},
+	}}
+	perms := &memPermLookup{allowed: map[string]bool{}}
+	svc := NewFileService(nil, users, files, nil, perms, newFaultStorage(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	foreignFolder := "foreign-folder"
+	if _, err := svc.RenameMove(ctx, "alice", "source", RenameMoveRequest{ParentID: &foreignFolder, hasParent: true}); err == nil || !strings.Contains(err.Error(), "access denied") {
+		t.Fatalf("expected viewer-only destination to reject move, got %v", err)
+	}
+	if files.files["source"].ParentID != nil {
+		t.Fatal("denied move modified the source file")
+	}
+
+	if _, _, err := svc.CreateFolder(ctx, "alice", "new-folder", &foreignFolder); err == nil || !strings.Contains(err.Error(), "access denied") {
+		t.Fatalf("expected viewer-only destination to reject folder creation, got %v", err)
+	}
+
+	foreignFile := "foreign-file"
+	if _, err := svc.RenameMove(ctx, "alice", "source", RenameMoveRequest{ParentID: &foreignFile, hasParent: true}); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("expected non-directory destination to be rejected, got %v", err)
+	}
+
+	files.roles[foreignFolder]["alice@example.com"] = domain.RoleEditor
+	if _, err := svc.RenameMove(ctx, "alice", "source", RenameMoveRequest{ParentID: &foreignFolder, hasParent: true}); err != nil {
+		t.Fatalf("editor should be allowed to move into shared folder: %v", err)
+	}
+}
 
 func TestFileService_CycleGuardAndRBACMoveRules(t *testing.T) {
 	ctx := context.Background()
@@ -1032,6 +1156,3 @@ func BenchmarkStreamingSHA256Verification_32KBBuffer(b *testing.B) {
 		_ = hex.EncodeToString(hasher.Sum(nil))
 	}
 }
-
-
-

@@ -5,8 +5,10 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -121,32 +123,6 @@ func TestPutObject_OverwritesExisting(t *testing.T) {
 	}
 }
 
-func TestGenerateUploadURL(t *testing.T) {
-	dir := t.TempDir()
-	store, err := NewLocalStore(dir, "http://localhost:8080", slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatalf("NewLocalStore: %v", err)
-	}
-
-	got, err := store.GenerateUploadURL(context.Background(), "deadbeef", 5*time.Minute)
-	if err != nil {
-		t.Fatalf("GenerateUploadURL: %v", err)
-	}
-	want := "http://localhost:8080/local-storage/blocks/deadbeef"
-	if got != want {
-		t.Fatalf("got %q, want %q", got, want)
-	}
-}
-
-func TestGenerateUploadURL_RejectsEmptyHash(t *testing.T) {
-	store, cleanup := newTestStore(t)
-	defer cleanup()
-
-	if _, err := store.GenerateUploadURL(context.Background(), "", time.Minute); err == nil {
-		t.Fatal("expected error for empty blockHash, got nil")
-	}
-}
-
 // TestPutObject_NoPathTraversal ensures a crafted key cannot escape baseDir.
 func TestPutObject_NoPathTraversal(t *testing.T) {
 	store, cleanup := newTestStore(t)
@@ -172,13 +148,29 @@ func TestGenerateStagingUploadURL(t *testing.T) {
 	store, cleanup := newTestStore(t)
 	defer cleanup()
 
-	url, err := store.GenerateStagingUploadURL(context.Background(), "staging/sess123/0", 5*time.Minute)
+	uploadURL, err := store.GenerateStagingUploadURL(context.Background(), "staging/sess123/0", 5*time.Minute)
 	if err != nil {
 		t.Fatalf("GenerateStagingUploadURL: %v", err)
 	}
-	want := "http://localhost:8080/local-storage/staging/sess123/0"
-	if url != want {
-		t.Fatalf("got %q, want %q", url, want)
+	parsed, err := url.Parse(uploadURL)
+	if err != nil {
+		t.Fatalf("Parse generated staging URL: %v", err)
+	}
+	if parsed.Scheme != "http" || parsed.Host != "localhost:8080" || parsed.Path != "/local-storage/staging/sess123/0" {
+		t.Fatalf("unexpected staging URL path: %q", uploadURL)
+	}
+	expiresAt, err := strconv.ParseInt(parsed.Query().Get("expires"), 10, 64)
+	if err != nil {
+		t.Fatalf("missing valid expiry: %v", err)
+	}
+	if !store.ValidateStagingUploadURL("staging/sess123/0", expiresAt, parsed.Query().Get("signature")) {
+		t.Fatal("generated URL signature should validate")
+	}
+	if store.ValidateStagingUploadURL("staging/sess123/1", expiresAt, parsed.Query().Get("signature")) {
+		t.Fatal("signature must be bound to the staging key")
+	}
+	if store.ValidateStagingUploadURL("staging/sess123/0", time.Now().Add(-time.Minute).Unix(), parsed.Query().Get("signature")) {
+		t.Fatal("expired URL signature should not validate")
 	}
 
 	if _, err := store.GenerateStagingUploadURL(context.Background(), "", time.Minute); err == nil {
@@ -192,7 +184,7 @@ func TestPromoteObject(t *testing.T) {
 
 	ctx := context.Background()
 	srcKey := "staging/sess-xyz/0"
-	destKey := "blocks/promoted-hash"
+	destKey := "blocks/" + strings.Repeat("a", 64)
 	data := []byte("promoted content verified")
 
 	// Put in staging

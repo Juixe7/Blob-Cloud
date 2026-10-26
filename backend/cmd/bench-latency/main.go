@@ -48,9 +48,6 @@ import (
 
 type noopStorage struct{}
 
-func (n *noopStorage) GenerateUploadURL(_ context.Context, _ string, _ time.Duration) (string, error) {
-	return "", nil
-}
 func (n *noopStorage) PutObject(_ context.Context, _ string, _ io.Reader, _ int64, _ string) error {
 	return nil
 }
@@ -163,9 +160,9 @@ func (s *benchFileStore) Create(_ context.Context, f *domain.File) error {
 	s.Seed(f)
 	return nil
 }
-func (s *benchFileStore) Update(_ context.Context, _ *domain.File) error        { return nil }
-func (s *benchFileStore) SoftDelete(_ context.Context, _, _ string) error       { return nil }
-func (s *benchFileStore) Restore(_ context.Context, _, _ string) error          { return nil }
+func (s *benchFileStore) Update(_ context.Context, _ *domain.File) error  { return nil }
+func (s *benchFileStore) SoftDelete(_ context.Context, _, _ string) error { return nil }
+func (s *benchFileStore) Restore(_ context.Context, _, _ string) error    { return nil }
 func (s *benchFileStore) ListTrash(_ context.Context, _ string) ([]*domain.File, error) {
 	return nil, nil
 }

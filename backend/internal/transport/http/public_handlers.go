@@ -2,9 +2,9 @@ package httpx
 
 import (
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"database/sql"
 	"errors"
 	"net/http"
 	"strings"
@@ -15,6 +15,7 @@ import (
 
 	"go-drive-clone/internal/auth"
 	"go-drive-clone/internal/domain"
+	postgresrepo "go-drive-clone/internal/repository/postgres"
 )
 
 // generateSecureToken generates a random 64-character hex string.
@@ -35,9 +36,11 @@ type CreateLinkResponse struct {
 	ShareURL  string `json:"share_url"`
 }
 
+var errPublicLinkAccessDenied = errors.New("public link management access denied")
+
 func (s *Server) HandleCreatePublicLink(w http.ResponseWriter, r *http.Request) {
-	if s.shares == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "DB unavailable"})
+	if s.shares == nil || s.perms == nil || s.users == nil || s.files == nil || s.fileOps == nil || s.db == nil || s.journalWriter == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "sharing service unavailable"})
 		return
 	}
 
@@ -51,6 +54,15 @@ func (s *Server) HandleCreatePublicLink(w http.ResponseWriter, r *http.Request) 
 	user, err := s.users.GetByID(r.Context(), userID)
 	if err != nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
+		return
+	}
+	file, err := s.files.GetByID(r.Context(), fileID)
+	if err != nil || file.Status != "ACTIVE" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "file is unavailable until processing is complete"})
+		return
+	}
+	if isShortcutFile(file) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "create the link from the canonical file, not its shortcut"})
 		return
 	}
 
@@ -71,8 +83,12 @@ func (s *Server) HandleCreatePublicLink(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if req.AccessTier != "VIEWER" && req.AccessTier != "EDITOR" {
-		req.AccessTier = "VIEWER"
+	if req.AccessTier == "" {
+		req.AccessTier = domain.RoleViewer
+	}
+	if req.AccessTier != domain.RoleViewer {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "public links are read-only; access_tier must be VIEWER"})
+		return
 	}
 
 	link := &domain.ShareableLink{
@@ -92,7 +108,25 @@ func (s *Server) HandleCreatePublicLink(w http.ResponseWriter, r *http.Request) 
 		link.PasswordHash = &hashStr
 	}
 
-	if err := s.shares.Create(r.Context(), link); err != nil {
+	entries, err := s.journalEntriesForFile(r.Context(), file, domain.ActionPublicLinkCreated, userID)
+	if err != nil {
+		s.log.Error("failed to resolve public link event recipients", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create share link"})
+		return
+	}
+	if err := s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+		currentFile, err := s.requireSharePermissionInTx(r.Context(), tx, fileID, userID, user.Email)
+		if err != nil {
+			return err
+		}
+		if currentFile.DeletedAt != nil || currentFile.Status != "ACTIVE" {
+			return errors.New("file is unavailable for public sharing")
+		}
+		if isShortcutFile(currentFile) {
+			return errors.New("cannot create a public link for a shortcut")
+		}
+		return postgresrepo.NewShareableLinkRepository(tx).Create(r.Context(), link)
+	}, entries); err != nil {
 		s.log.Error("failed to create share link", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create share link"})
 		return
@@ -105,6 +139,75 @@ func (s *Server) HandleCreatePublicLink(w http.ResponseWriter, r *http.Request) 
 		LinkToken: link.LinkToken,
 		ShareURL:  shareURL,
 	})
+}
+
+// HandleRevokePublicLink implements DELETE /api/files/{id}/links/{token}.
+func (s *Server) HandleRevokePublicLink(w http.ResponseWriter, r *http.Request) {
+	if s.shares == nil || s.perms == nil || s.users == nil || s.files == nil || s.db == nil || s.journalWriter == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "sharing service unavailable"})
+		return
+	}
+	userID, status, msg := s.userFromBearer(r)
+	if status != 0 {
+		writeJSON(w, status, map[string]string{"error": msg})
+		return
+	}
+	fileID := chi.URLParam(r, "id")
+	token := chi.URLParam(r, "token")
+	if fileID == "" || token == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "file id and link token are required"})
+		return
+	}
+	link, err := s.shares.GetByToken(r.Context(), token)
+	if err != nil || link.FileID != fileID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "link not found"})
+		return
+	}
+	user, err := s.users.GetByID(r.Context(), userID)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
+		return
+	}
+	file, err := s.files.GetByID(r.Context(), fileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		return
+	}
+	entries, err := s.journalEntriesForFile(r.Context(), file, domain.ActionPublicLinkRevoked, userID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to revoke link"})
+		return
+	}
+	err = s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+		currentFile, err := s.files.WithTx(tx).GetByID(r.Context(), fileID)
+		if err != nil {
+			return err
+		}
+		if currentFile.UserID != userID {
+			allowed, err := s.perms.WithTx(tx).CheckUserPermission(r.Context(), fileID, user.Email, []string{domain.RoleOwner, domain.RoleEditor})
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return errPublicLinkAccessDenied
+			}
+		}
+		return s.shares.WithTx(tx).DeleteByFileAndToken(r.Context(), fileID, token)
+	}, entries)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "link not found"})
+		return
+	}
+	if err != nil {
+		if errors.Is(err, errPublicLinkAccessDenied) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only owners or editors can revoke public links"})
+			return
+		}
+		s.log.Error("failed to revoke public link", "file_id", fileID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to revoke link"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "public link revoked"})
 }
 
 // Fetch Public Share Metadata
@@ -126,8 +229,8 @@ func extractPublicShareToken(r *http.Request, token string) string {
 }
 
 func (s *Server) HandleGetPublicShare(w http.ResponseWriter, r *http.Request) {
-	if s.shares == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "DB unavailable"})
+	if s.shares == nil || s.fileOps == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "public sharing service unavailable"})
 		return
 	}
 
@@ -166,8 +269,12 @@ func (s *Server) HandleGetPublicShare(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 		return
 	}
-	if file.DeletedAt != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file has been deleted"})
+	if isShortcutFile(file) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "link not found"})
+		return
+	}
+	if file.DeletedAt != nil || file.Status != "ACTIVE" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file is unavailable"})
 		return
 	}
 
@@ -179,10 +286,16 @@ func (s *Server) HandleGetPublicShare(w http.ResponseWriter, r *http.Request) {
 	if file.IsDirectory && s.files != nil {
 		children, err = s.files.ListDirectory(r.Context(), "", &file.ID)
 		if err == nil {
+			visible := children[:0]
 			for _, child := range children {
+				if child.DeletedAt != nil || child.Status != "ACTIVE" {
+					continue
+				}
 				child.Role = link.AccessTier
 				child.UserID = ""
+				visible = append(visible, child)
 			}
+			children = visible
 		}
 	}
 
@@ -197,6 +310,10 @@ type VerifyPublicShareRequest struct {
 }
 
 func (s *Server) HandleVerifyPublicShare(w http.ResponseWriter, r *http.Request) {
+	if s.shares == nil || s.jwtSecret == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "public sharing service unavailable"})
+		return
+	}
 	token := chi.URLParam(r, "token")
 	link, err := s.shares.GetByToken(r.Context(), token)
 	if err != nil {
@@ -245,6 +362,10 @@ func (s *Server) HandleVerifyPublicShare(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) HandlePublicDownload(w http.ResponseWriter, r *http.Request) {
+	if s.shares == nil || s.fileOps == nil || s.zipOps == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "public download service unavailable"})
+		return
+	}
 	token := chi.URLParam(r, "token")
 	link, err := s.shares.GetByToken(r.Context(), token)
 	if err != nil {
@@ -279,12 +400,16 @@ func (s *Server) HandlePublicDownload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 		return
 	}
+	if isShortcutFile(file) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "link not found"})
+		return
+	}
 	if file.DeletedAt != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file has been deleted"})
 		return
 	}
-	if file.Status == "QUARANTINED" {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "file blocked: malware detected by server antivirus security policy"})
+	if file.Status != "ACTIVE" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "file is unavailable until processing is complete"})
 		return
 	}
 
@@ -301,6 +426,10 @@ func (s *Server) HandlePublicDownload(w http.ResponseWriter, r *http.Request) {
 
 // HandlePublicRecordView records a view for a public share if the user is authenticated.
 func (s *Server) HandlePublicRecordView(w http.ResponseWriter, r *http.Request) {
+	if s.shares == nil || s.files == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "public sharing service unavailable"})
+		return
+	}
 	token := chi.URLParam(r, "token")
 	link, err := s.shares.GetByToken(r.Context(), token)
 	if err != nil {
@@ -327,6 +456,10 @@ func (s *Server) HandlePublicRecordView(w http.ResponseWriter, r *http.Request) 
 
 // HandlePublicSaveShortcut creates a shortcut in the authenticated user's drive pointing to the shared file.
 func (s *Server) HandlePublicSaveShortcut(w http.ResponseWriter, r *http.Request) {
+	if s.shares == nil || s.fileOps == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "public sharing service unavailable"})
+		return
+	}
 	token := chi.URLParam(r, "token")
 	link, err := s.shares.GetByToken(r.Context(), token)
 	if err != nil {
@@ -336,6 +469,11 @@ func (s *Server) HandlePublicSaveShortcut(w http.ResponseWriter, r *http.Request
 
 	if link.ExpiresAt != nil && time.Now().After(*link.ExpiresAt) {
 		writeJSON(w, http.StatusGone, map[string]string{"error": "link expired"})
+		return
+	}
+	linkedFile, err := s.fileOps.GetFile(r.Context(), link.FileID)
+	if err != nil || isShortcutFile(linkedFile) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "link not found"})
 		return
 	}
 
@@ -361,7 +499,7 @@ func (s *Server) HandlePublicSaveShortcut(w http.ResponseWriter, r *http.Request
 	}
 
 	// Create shortcut in root directory (parentID = nil)
-	shortcut, err := s.fileOps.CreateShortcutFromPublicLink(r.Context(), userID, link.FileID, nil)
+	shortcut, err := s.fileOps.CreateShortcutFromPublicLink(r.Context(), userID, link.FileID, nil, token)
 	if err != nil {
 		s.log.Error("failed to save public shortcut", "err", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save to drive"})

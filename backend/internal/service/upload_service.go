@@ -207,20 +207,45 @@ type InitiateRespChunk struct {
 //   - *InitiateResponse: Session ID and chunk-by-chunk upload coordination URLs.
 //   - error: Nil on success, or validation/database error.
 func (s *UploadService) Initiate(ctx context.Context, req InitiateRequest) (*InitiateResponse, error) {
-	if req.UserID == "" || req.Filename == "" {
+	if req.UserID == "" || strings.TrimSpace(req.Filename) == "" {
 		return nil, errors.New("user_id and filename are required")
+	}
+	if req.ParentID != nil {
+		parent := strings.TrimSpace(*req.ParentID)
+		if parent == "" || parent == "root" {
+			req.ParentID = nil
+		} else {
+			req.ParentID = &parent
+		}
+	}
+	if len(req.Filename) > 255 || strings.ContainsAny(req.Filename, `/\\`) || strings.ContainsRune(req.Filename, 0) {
+		return nil, errors.New("filename is invalid")
+	}
+	if req.TotalSize < 0 {
+		return nil, errors.New("total_size must not be negative")
 	}
 	if len(req.Chunks) == 0 {
 		return nil, errors.New("at least one chunk is required")
+	}
+	if err := validateUploadParent(ctx, s.files, s.users, req.UserID, req.ParentID); err != nil {
+		return nil, err
 	}
 
 	// 1. Collect chunk hashes and ask the global blocks table which already
 	//    exist. This is the deduplication check: hits skip both upload and
 	//    storage of the physical block.
 	hashes := make([]string, 0, len(req.Chunks))
-	for _, c := range req.Chunks {
-		if c.SHA256 == "" {
-			return nil, errors.New("chunk sha256 must not be empty")
+	for i := range req.Chunks {
+		c := &req.Chunks[i]
+		if len(c.SHA256) != sha256.Size*2 {
+			return nil, errors.New("chunk sha256 must be a 64-character hex digest")
+		}
+		if _, err := hex.DecodeString(c.SHA256); err != nil {
+			return nil, errors.New("chunk sha256 must be a 64-character hex digest")
+		}
+		c.SHA256 = strings.ToLower(c.SHA256)
+		if c.SizeBytes < 0 {
+			return nil, errors.New("chunk size_bytes must not be negative")
 		}
 		hashes = append(hashes, c.SHA256)
 	}
@@ -296,7 +321,7 @@ func (s *UploadService) Initiate(ctx context.Context, req InitiateRequest) (*Ini
 				partCount := int32((blockSize + domain.MPUPartSize - 1) / domain.MPUPartSize)
 				partURLs := make([]string, 0, partCount)
 				for p := int32(1); p <= partCount; p++ {
-					pURL, err := mpu.PresignUploadPart(ctx, stagingKey, uploadID, p, 30*time.Minute)
+					pURL, err := mpu.PresignUploadPart(ctx, stagingKey, uploadID, p, domain.StagingUploadURLLifetime)
 					if err != nil {
 						_ = mpu.AbortMultipartUpload(ctx, stagingKey, uploadID)
 						return nil, fmt.Errorf("presign part %d for %s: %w", p, c.SHA256, err)
@@ -307,7 +332,7 @@ func (s *UploadService) Initiate(ctx context.Context, req InitiateRequest) (*Ini
 				rc.PartURLs = partURLs
 			} else {
 				// Standard path (≤ 5 GiB): presigned PUT URL targeting staging.
-				url, err := s.storage.GenerateStagingUploadURL(ctx, stagingKey, 30*time.Minute)
+				url, err := s.storage.GenerateStagingUploadURL(ctx, stagingKey, domain.StagingUploadURLLifetime)
 				if err != nil {
 					return nil, fmt.Errorf("generate staging upload url for %s: %w", c.SHA256, err)
 				}
@@ -388,7 +413,7 @@ func (s *UploadService) GetSession(ctx context.Context, id string, userID string
 				rc.AlreadyExists = true
 			} else {
 				// Chunk is genuinely missing — issue a fresh presigned PUT URL.
-				url, err := s.storage.GenerateStagingUploadURL(ctx, stagingKey, 30*time.Minute)
+				url, err := s.storage.GenerateStagingUploadURL(ctx, stagingKey, domain.StagingUploadURLLifetime)
 				if err != nil {
 					return nil, fmt.Errorf("regenerate staging upload url: %w", err)
 				}
@@ -398,6 +423,108 @@ func (s *UploadService) GetSession(ctx context.Context, id string, userID string
 		resp.Chunks = append(resp.Chunks, rc)
 	}
 	return resp, nil
+}
+
+// StoreStagingBlock accepts a local-driver upload only when its session is
+// active and the sequence, byte length, and SHA-256 match the session record.
+// The URL capability is checked by the HTTP transport before this method.
+func (s *UploadService) StoreStagingBlock(ctx context.Context, sessionID string, sequenceNumber int, body io.Reader, contentType string) error {
+	if sessionID == "" || sequenceNumber < 0 || body == nil {
+		return errors.New("invalid staging upload parameters")
+	}
+	session, blocks, err := s.sessions.GetSessionByID(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("get upload session: %w", err)
+	}
+	if session.Status != domain.SessionStatusInitiated {
+		return fmt.Errorf("session is not active")
+	}
+	var expected *domain.SessionBlock
+	for i := range blocks {
+		if blocks[i].SequenceNumber == sequenceNumber {
+			expected = &blocks[i]
+			break
+		}
+	}
+	if expected == nil {
+		return errors.New("staging sequence is not part of upload session")
+	}
+	if expected.IsUploaded {
+		return errors.New("staging sequence does not require an upload")
+	}
+	if expected.SizeBytes < 0 || len(expected.BlockHash) != sha256.Size*2 {
+		return errors.New("session contains invalid block metadata")
+	}
+	if _, err := hex.DecodeString(expected.BlockHash); err != nil {
+		return errors.New("session contains invalid block metadata")
+	}
+
+	key := fmt.Sprintf("staging/%s/%d", sessionID, sequenceNumber)
+	hasher := sha256.New()
+	counted := &countingReader{reader: io.LimitReader(body, int64(expected.SizeBytes)+1)}
+	if err := s.storage.PutObject(ctx, key, io.TeeReader(counted, hasher), int64(expected.SizeBytes), contentType); err != nil {
+		return fmt.Errorf("%w: %v", ErrStagingStorage, err)
+	}
+	actualHash := hex.EncodeToString(hasher.Sum(nil))
+	if counted.count != int64(expected.SizeBytes) || !strings.EqualFold(actualHash, expected.BlockHash) {
+		_ = s.storage.DeleteObject(ctx, key)
+		return fmt.Errorf("staging payload does not match declared size and sha256")
+	}
+	return nil
+}
+
+type countingReader struct {
+	reader io.Reader
+	count  int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	r.count += int64(n)
+	return n, err
+}
+
+func validateUploadParent(
+	ctx context.Context,
+	files *postgresrepo.FileRepository,
+	users *postgresrepo.UserRepository,
+	userID string,
+	parentID *string,
+) error {
+	if parentID == nil || strings.TrimSpace(*parentID) == "" || strings.TrimSpace(*parentID) == "root" {
+		return nil
+	}
+	if files == nil || users == nil {
+		return errors.New("destination validation unavailable")
+	}
+	parent, err := files.GetByID(ctx, *parentID)
+	if err != nil {
+		return fmt.Errorf("destination folder not found: %w", err)
+	}
+	if !parent.IsDirectory {
+		return errors.New("destination parent is not a directory")
+	}
+	if parent.DeletedAt != nil {
+		return errors.New("destination folder is deleted")
+	}
+	if parent.UserID == userID {
+		return nil
+	}
+	user, err := users.GetByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("resolve uploader: %w", err)
+	}
+	role, err := files.GetResolvedPermission(ctx, parent.ID, user.Email)
+	if err != nil {
+		if errors.Is(err, domain.ErrPermissionNotFound) {
+			return errors.New("access denied: editor permission required on destination folder")
+		}
+		return fmt.Errorf("destination permission check: %w", err)
+	}
+	if role != domain.RoleOwner && role != domain.RoleEditor {
+		return errors.New("access denied: editor permission required on destination folder")
+	}
+	return nil
 }
 
 // CompleteRequest defines the payload for finalizing a completed upload session.
@@ -416,6 +543,9 @@ type CompleteRequest struct {
 // ErrFileConflict is returned when an upload complete request has ResolutionMode "fail"
 // and an active file with the same name already exists in the target destination.
 var ErrFileConflict = errors.New("file conflict: an active file with this name already exists in this destination")
+
+// ErrStagingStorage reports a failure persisting a validated local staging PUT.
+var ErrStagingStorage = errors.New("staging storage failure")
 
 // CompleteResponse confirms a finished upload and returns the finalized file metadata ID.
 type CompleteResponse struct {
@@ -470,6 +600,9 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 	}
 	if session.Status != domain.SessionStatusInitiated {
 		return nil, fmt.Errorf("session %s is %s, cannot complete", req.SessionID, session.Status)
+	}
+	if err := validateUploadParent(ctx, s.files, s.users, session.UserID, session.ParentID); err != nil {
+		return nil, fmt.Errorf("validate upload destination: %w", err)
 	}
 	uploaderID = session.UserID
 
@@ -578,79 +711,167 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 			perms := s.perms.WithTx(tx)
 			users := s.users.WithTx(tx)
 
-		// Re-verify session state under transaction lock
-		currentSession, _, err := sessions.GetSessionByID(ctx, req.SessionID)
-		if err != nil {
-			return err
-		}
-		if currentSession.Status != domain.SessionStatusInitiated {
-			return fmt.Errorf("session %s is %s, cannot complete", req.SessionID, currentSession.Status)
-		}
-
-		// 3. Upsert blocks into the global table, resolving each to a stable id.
-		seqs := make([]domain.BlockSequence, 0, len(sessionBlocks))
-		for _, b := range sessionBlocks {
-			blk := &domain.Block{SHA256: b.BlockHash, SizeBytes: b.SizeBytes}
-			if err := blocks.GetOrCreate(ctx, blk); err != nil {
+			// Re-verify session state under transaction lock
+			currentSession, _, err := sessions.GetSessionByID(ctx, req.SessionID)
+			if err != nil {
 				return err
 			}
-			seqs = append(seqs, domain.BlockSequence{
-				BlockID:        blk.ID,
-				SequenceNumber: b.SequenceNumber,
-			})
-		}
-
-		// 4. Handle File Versioning / Collision with Transaction Advisory Locking
-		// Serializes concurrent uploads of the same filename to the same parent folder,
-		// preventing duplicate key collisions and version number races.
-		parentLockStr := "root"
-		if session.ParentID != nil {
-			parentLockStr = *session.ParentID
-		}
-		uploadLockKey := fmt.Sprintf("upload_file_%s_%s_%s", session.UserID, parentLockStr, session.Filename)
-		if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", uploadLockKey); err != nil {
-			return fmt.Errorf("acquire upload completion lock: %w", err)
-		}
-
-		existingFile, err := files.GetFileByNameAndParent(ctx, session.UserID, session.Filename, session.ParentID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("check existing file: %w", err)
-		}
-
-		if existingFile != nil && existingFile.IsDirectory {
-			return fmt.Errorf("a folder named %q already exists in this destination", session.Filename)
-		}
-
-		isVersionUpdate := false
-		if existingFile != nil && !existingFile.IsDirectory {
-			if req.ResolutionMode == "fail" {
-				return ErrFileConflict
+			if currentSession.Status != domain.SessionStatusInitiated {
+				return fmt.Errorf("session %s is %s, cannot complete", req.SessionID, currentSession.Status)
+			}
+			if err := validateUploadParent(ctx, files, users, currentSession.UserID, currentSession.ParentID); err != nil {
+				return fmt.Errorf("validate upload destination: %w", err)
 			}
 
-			if req.ResolutionMode == "copy" {
-				// Keep Both: Auto-generate an available clash-free filename
-				ext := filepath.Ext(session.Filename)
-				base := strings.TrimSuffix(session.Filename, ext)
-				targetName := ""
-				for i := 1; i <= 1000; i++ {
-					candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
-					f, err := files.GetFileByNameAndParent(ctx, session.UserID, candidate, session.ParentID)
-					if errors.Is(err, sql.ErrNoRows) || f == nil {
-						targetName = candidate
-						break
-					}
+			// 3. Upsert blocks into the global table, resolving each to a stable id.
+			seqs := make([]domain.BlockSequence, 0, len(sessionBlocks))
+			for _, b := range sessionBlocks {
+				blk := &domain.Block{SHA256: b.BlockHash, SizeBytes: b.SizeBytes}
+				if err := blocks.GetOrCreate(ctx, blk); err != nil {
+					return err
 				}
-				if targetName == "" {
-					targetName = fmt.Sprintf("%s (%d)%s", base, time.Now().Unix(), ext)
+				seqs = append(seqs, domain.BlockSequence{
+					BlockID:        blk.ID,
+					SequenceNumber: b.SequenceNumber,
+				})
+			}
+
+			// 4. Handle File Versioning / Collision with Transaction Advisory Locking
+			// Serializes concurrent uploads of the same filename to the same parent folder,
+			// preventing duplicate key collisions and version number races.
+			parentLockStr := "root"
+			if session.ParentID != nil {
+				parentLockStr = *session.ParentID
+			}
+			uploadLockKey := fmt.Sprintf("upload_file_%s_%s_%s", session.UserID, parentLockStr, session.Filename)
+			if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", uploadLockKey); err != nil {
+				return fmt.Errorf("acquire upload completion lock: %w", err)
+			}
+
+			existingFile, err := files.GetFileByNameAndParent(ctx, session.UserID, session.Filename, session.ParentID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("check existing file: %w", err)
+			}
+
+			if existingFile != nil && existingFile.IsDirectory {
+				return fmt.Errorf("a folder named %q already exists in this destination", session.Filename)
+			}
+
+			isVersionUpdate := false
+			if existingFile != nil && !existingFile.IsDirectory {
+				if req.ResolutionMode == "fail" {
+					return ErrFileConflict
 				}
 
+				if req.ResolutionMode == "copy" {
+					// Keep Both: Auto-generate an available clash-free filename
+					ext := filepath.Ext(session.Filename)
+					base := strings.TrimSuffix(session.Filename, ext)
+					targetName := ""
+					for i := 1; i <= 1000; i++ {
+						candidate := fmt.Sprintf("%s (%d)%s", base, i, ext)
+						f, err := files.GetFileByNameAndParent(ctx, session.UserID, candidate, session.ParentID)
+						if errors.Is(err, sql.ErrNoRows) || f == nil {
+							targetName = candidate
+							break
+						}
+					}
+					if targetName == "" {
+						targetName = fmt.Sprintf("%s (%d)%s", base, time.Now().Unix(), ext)
+					}
+
+					file := &domain.File{
+						UserID:      session.UserID,
+						Name:        targetName,
+						ParentID:    session.ParentID,
+						SizeBytes:   session.TotalSize,
+						MimeType:    detectMimeType(targetName),
+						Status:      "PROCESSING",
+						IsEncrypted: req.IsEncrypted,
+					}
+					if req.EncryptionSalt != "" {
+						file.EncryptionSalt = &req.EncryptionSalt
+					}
+					if err := files.Create(ctx, file); err != nil {
+						return err
+					}
+					result.FileID = file.ID
+
+					if err := blocks.LinkBlocksToFile(ctx, file.ID, seqs); err != nil {
+						return err
+					}
+
+					uploader, err := users.GetByID(ctx, session.UserID)
+					if err != nil {
+						return fmt.Errorf("resolve uploader for owner perm: %w", err)
+					}
+					if err := perms.GrantPermission(ctx, &domain.Permission{
+						FileID:       file.ID,
+						GranteeEmail: uploader.Email,
+						Role:         domain.RoleOwner,
+					}); err != nil {
+						return err
+					}
+				} else {
+					// Collision exists: backup old state to file_versions (version mode)
+					isVersionUpdate = true
+					oldBlocks, err := blocks.ListFileBlockHashes(ctx, existingFile.ID)
+					if err != nil {
+						return fmt.Errorf("list old blocks: %w", err)
+					}
+
+					// Atomically resolve next version number from DB to eliminate gaps and race conditions
+					var maxVersion int
+					err = tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version_number), 0) FROM file_versions WHERE file_id = $1", existingFile.ID).Scan(&maxVersion)
+					if err != nil {
+						return fmt.Errorf("resolve next version number: %w", err)
+					}
+					nextVersion := maxVersion + 1
+
+					fileVersion := &domain.FileVersion{
+						FileID:        existingFile.ID,
+						VersionNumber: nextVersion,
+						SizeBytes:     existingFile.SizeBytes,
+						ChunkHashes:   oldBlocks,
+					}
+					if err := files.CreateFileVersion(ctx, fileVersion); err != nil {
+						return fmt.Errorf("create file version: %w", err)
+					}
+
+					// Update the active file record
+					existingFile.SizeBytes = session.TotalSize
+					existingFile.MimeType = detectMimeType(session.Filename)
+					existingFile.Status = "PROCESSING"
+					existingFile.IsEncrypted = req.IsEncrypted
+					if req.EncryptionSalt != "" {
+						existingFile.EncryptionSalt = &req.EncryptionSalt
+					} else {
+						existingFile.EncryptionSalt = nil
+					}
+					if err := files.Update(ctx, existingFile); err != nil {
+						return fmt.Errorf("update existing file metadata: %w", err)
+					}
+
+					result.FileID = existingFile.ID
+
+					// Replace blocks
+					if err := blocks.ReplaceBlocksForFile(ctx, existingFile.ID, seqs); err != nil {
+						return err
+					}
+
+					if err := files.UpdateAIMetadata(ctx, existingFile.ID, nil, nil, nil); err != nil {
+						return fmt.Errorf("clear stale AI metadata before scan: %w", err)
+					}
+				}
+			} else {
+				// No collision, create new file
 				file := &domain.File{
 					UserID:      session.UserID,
-					Name:        targetName,
+					Name:        session.Filename,
 					ParentID:    session.ParentID,
 					SizeBytes:   session.TotalSize,
-					MimeType:    detectMimeType(targetName),
-					Status:      "ACTIVE",
+					MimeType:    detectMimeType(session.Filename),
+					Status:      "PROCESSING",
 					IsEncrypted: req.IsEncrypted,
 				}
 				if req.EncryptionSalt != "" {
@@ -661,13 +882,12 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 				}
 				result.FileID = file.ID
 
+				// 5. Link blocks to the file in order.
 				if err := blocks.LinkBlocksToFile(ctx, file.ID, seqs); err != nil {
 					return err
 				}
-				if !req.IsEncrypted {
-					_, _, _, _, _ = files.TryCopyAIMetadataFromCAS(ctx, file.ID)
-				}
 
+				// 6. Grant the uploader OWNER. Resolve their email from the user row.
 				uploader, err := users.GetByID(ctx, session.UserID)
 				if err != nil {
 					return fmt.Errorf("resolve uploader for owner perm: %w", err)
@@ -679,167 +899,74 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 				}); err != nil {
 					return err
 				}
-			} else {
-				// Collision exists: backup old state to file_versions (version mode)
-				isVersionUpdate = true
-				oldBlocks, err := blocks.ListFileBlockHashes(ctx, existingFile.ID)
-				if err != nil {
-					return fmt.Errorf("list old blocks: %w", err)
-				}
-				
-				// Atomically resolve next version number from DB to eliminate gaps and race conditions
-				var maxVersion int
-				err = tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version_number), 0) FROM file_versions WHERE file_id = $1", existingFile.ID).Scan(&maxVersion)
-				if err != nil {
-					return fmt.Errorf("resolve next version number: %w", err)
-				}
-				nextVersion := maxVersion + 1
-				
-				fileVersion := &domain.FileVersion{
-					FileID:        existingFile.ID,
-					VersionNumber: nextVersion,
-					SizeBytes:     existingFile.SizeBytes,
-					ChunkHashes:   oldBlocks,
-				}
-				if err := files.CreateFileVersion(ctx, fileVersion); err != nil {
-					return fmt.Errorf("create file version: %w", err)
-				}
-				
-				// Update the active file record
-				existingFile.SizeBytes = session.TotalSize
-				existingFile.MimeType = detectMimeType(session.Filename)
-				existingFile.Status = "ACTIVE"
-				existingFile.IsEncrypted = req.IsEncrypted
-				if req.EncryptionSalt != "" {
-					existingFile.EncryptionSalt = &req.EncryptionSalt
-				} else {
-					existingFile.EncryptionSalt = nil
-				}
-				if err := files.Update(ctx, existingFile); err != nil {
-					return fmt.Errorf("update existing file metadata: %w", err)
-				}
-				
-				result.FileID = existingFile.ID
-				
-				// Replace blocks
-				if err := blocks.ReplaceBlocksForFile(ctx, existingFile.ID, seqs); err != nil {
-					return err
-				}
+			}
 
-				// Check if block sequence changed compared to previous version
-				sameBlocks := len(oldBlocks) == len(sessionBlocks)
-				if sameBlocks {
-					for i, sb := range sessionBlocks {
-						if oldBlocks[i] != sb.BlockHash {
-							sameBlocks = false
-							break
+			// Persist processing intent in the same transaction as file metadata so
+			// queue outages cannot make new content readable or lose the scan job.
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO file_processing_outbox(file_id, user_id)
+				VALUES ($1, $2)
+				ON CONFLICT (file_id) DO UPDATE SET user_id = EXCLUDED.user_id,
+					attempts = 0, next_attempt_at = NOW(), created_at = NOW()`, result.FileID, session.UserID); err != nil {
+				return fmt.Errorf("enqueue file processing: %w", err)
+			}
+
+			// 7. Mark the session COMPLETED.
+			if err := sessions.UpdateSessionStatus(ctx, req.SessionID, domain.SessionStatusCompleted); err != nil {
+				return err
+			}
+
+			// 8. Record in Journal for Delta Synchronization (Fan-out to all collaborators)
+			if s.journal != nil {
+				action := domain.ActionFileCreated
+				if isVersionUpdate {
+					action = domain.ActionFileUpdated
+				}
+				recordedAction = action
+
+				recipientSet := map[string]struct{}{
+					session.UserID: {},
+				}
+				if s.perms != nil {
+					if collabs, err := perms.FindCollaboratorUserIDs(ctx, result.FileID); err == nil {
+						for _, c := range collabs {
+							if c != "" {
+								recipientSet[c] = struct{}{}
+							}
 						}
 					}
 				}
-				if !sameBlocks {
-					_ = files.UpdateAIMetadata(ctx, existingFile.ID, nil, nil, nil)
-					if !req.IsEncrypted {
-						_, _, _, _, _ = files.TryCopyAIMetadataFromCAS(ctx, existingFile.ID)
-					}
+
+				entries := make([]*domain.JournalEntry, 0, len(recipientSet))
+				for rUID := range recipientSet {
+					entries = append(entries, &domain.JournalEntry{
+						UserID:      rUID,
+						FileID:      result.FileID,
+						Action:      action,
+						ParentID:    session.ParentID,
+						Name:        session.Filename,
+						IsDirectory: false,
+						SizeBytes:   session.TotalSize,
+						Status:      "PROCESSING",
+					})
 				}
-			}
-		} else {
-			// No collision, create new file
-			file := &domain.File{
-				UserID:         session.UserID,
-				Name:           session.Filename,
-				ParentID:       session.ParentID,
-				SizeBytes:      session.TotalSize,
-				MimeType:       detectMimeType(session.Filename),
-				Status:         "ACTIVE",
-				IsEncrypted:    req.IsEncrypted,
-			}
-			if req.EncryptionSalt != "" {
-				file.EncryptionSalt = &req.EncryptionSalt
-			}
-			if err := files.Create(ctx, file); err != nil {
-				return err
-			}
-			result.FileID = file.ID
-	
-			// 5. Link blocks to the file in order.
-			if err := blocks.LinkBlocksToFile(ctx, file.ID, seqs); err != nil {
-				return err
-			}
-			if !req.IsEncrypted {
-				_, _, _, _, _ = files.TryCopyAIMetadataFromCAS(ctx, file.ID)
-			}
-	
-			// 6. Grant the uploader OWNER. Resolve their email from the user row.
-			uploader, err := users.GetByID(ctx, session.UserID)
-			if err != nil {
-				return fmt.Errorf("resolve uploader for owner perm: %w", err)
-			}
-			if err := perms.GrantPermission(ctx, &domain.Permission{
-				FileID:       file.ID,
-				GranteeEmail: uploader.Email,
-				Role:         domain.RoleOwner,
-			}); err != nil {
-				return err
-			}
-		}
 
-		// 7. Mark the session COMPLETED.
-		if err := sessions.UpdateSessionStatus(ctx, req.SessionID, domain.SessionStatusCompleted); err != nil {
-			return err
-		}
-
-		// 8. Record in Journal for Delta Synchronization (Fan-out to all collaborators)
-		if s.journal != nil {
-			action := domain.ActionFileCreated
-			if isVersionUpdate {
-				action = domain.ActionFileUpdated
-			}
-			recordedAction = action
-
-			recipientSet := map[string]struct{}{
-				session.UserID: {},
-			}
-			if s.perms != nil {
-				if collabs, err := perms.FindCollaboratorUserIDs(ctx, result.FileID); err == nil {
-					for _, c := range collabs {
-						if c != "" {
-							recipientSet[c] = struct{}{}
-						}
+				cursors, err := s.journal.WithTx(tx).BatchRecord(ctx, entries)
+				if err != nil {
+					return fmt.Errorf("record journal entries: %w", err)
+				}
+				recordedCursors = make(map[string]int64)
+				for i, e := range entries {
+					if i < len(cursors) {
+						recordedCursors[e.UserID] = cursors[i]
 					}
 				}
 			}
 
-			entries := make([]*domain.JournalEntry, 0, len(recipientSet))
-			for rUID := range recipientSet {
-				entries = append(entries, &domain.JournalEntry{
-					UserID:      rUID,
-					FileID:      result.FileID,
-					Action:      action,
-					ParentID:    session.ParentID,
-					Name:        session.Filename,
-					IsDirectory: false,
-					SizeBytes:   session.TotalSize,
-					Status:      "ACTIVE",
-				})
-			}
-
-			cursors, err := s.journal.WithTx(tx).BatchRecord(ctx, entries)
-			if err != nil {
-				return fmt.Errorf("record journal entries: %w", err)
-			}
-			recordedCursors = make(map[string]int64)
-			for i, e := range entries {
-				if i < len(cursors) {
-					recordedCursors[e.UserID] = cursors[i]
-				}
-			}
-		}
-
-		result.SessionID = req.SessionID
-		result.Status = domain.SessionStatusCompleted
-		return nil
-	})
+			result.SessionID = req.SessionID
+			result.Status = domain.SessionStatusCompleted
+			return nil
+		})
 	}
 	if txErr != nil {
 		s.log.Error("complete upload failed", "session_id", req.SessionID, "err", txErr)
@@ -849,14 +976,18 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 	s.log.Info("upload completed", "session_id", req.SessionID, "file_id", result.FileID)
 	metrics.UploadsCompleted.Inc()
 
-	// Publish a thumbnail job to the event queue. Failure to publish is
-	// non-fatal — the upload succeeded, the thumbnail will just be missed.
+	// Publish the processing job after commit. A failed publish leaves the file
+	// unavailable; the durable retry/reconciliation path is tracked separately.
 	if s.publisher != nil {
 		if err := s.publisher.PublishThumbnailJob(ctx, queue.ThumbnailMessage{
 			FileID: result.FileID,
 			UserID: uploaderID,
 		}); err != nil {
-			s.log.Error("failed to publish thumbnail job", "file_id", result.FileID, "err", err)
+			s.log.Error("failed to publish processing job; file remains unavailable", "file_id", result.FileID, "err", err)
+		} else if s.db != nil {
+			// The outbox remains until a worker completes scanning. Delay its
+			// fallback delivery after this immediate publish succeeds.
+			_, _ = s.db.ExecContext(ctx, `UPDATE file_processing_outbox SET next_attempt_at = NOW() + INTERVAL '10 minutes' WHERE file_id = $1`, result.FileID)
 		}
 	}
 
@@ -864,7 +995,7 @@ func (s *UploadService) Complete(ctx context.Context, req CompleteRequest, userI
 	s.notifier.NotifyUser(uploaderID, wsSync.NotificationEvent{
 		Type: wsSync.EventUploadComplete,
 		Payload: map[string]string{
-			"file_id":   result.FileID,
+			"file_id":    result.FileID,
 			"session_id": result.SessionID,
 		},
 	})

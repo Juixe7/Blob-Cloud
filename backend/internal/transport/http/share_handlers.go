@@ -2,7 +2,9 @@ package httpx
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -12,6 +14,7 @@ import (
 
 	"go-drive-clone/internal/audit"
 	"go-drive-clone/internal/domain"
+	postgresrepo "go-drive-clone/internal/repository/postgres"
 	wsSync "go-drive-clone/internal/sync"
 )
 
@@ -37,7 +40,7 @@ var validRoles = map[string]struct{}{
 // Senders blocked by the recipient are rejected with 403 Forbidden.
 // Requires OWNER or EDITOR permission on the file.
 func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
-	if s.perms == nil {
+	if s.perms == nil || s.users == nil || s.files == nil || s.db == nil || s.journalWriter == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "permissions unavailable (database not configured)",
 		})
@@ -59,6 +62,19 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 	fileID := chi.URLParam(r, "id")
 	if fileID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing file id"})
+		return
+	}
+	file, err := s.files.GetByID(r.Context(), fileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		return
+	}
+	if isShortcutFile(file) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "share the canonical file instead of its shortcut"})
+		return
+	}
+	if file.Status != "ACTIVE" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "cannot share a file until processing is complete"})
 		return
 	}
 
@@ -84,6 +100,13 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 	if _, ok := validRoles[req.Role]; !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role must be VIEWER, EDITOR, or OWNER"})
 		return
+	}
+	if req.Role == domain.RoleOwner {
+		fileOwner, ownerErr := s.files.GetByID(r.Context(), fileID)
+		if ownerErr != nil || fileOwner.UserID != userID {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only the file owner can grant OWNER access"})
+			return
+		}
 	}
 	if strings.EqualFold(req.GranteeEmail, sender.Email) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot share a file with yourself"})
@@ -114,7 +137,30 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:    &expiresAt,
 		InvitedBy:    &userID,
 	}
-	if err := s.perms.GrantPermission(r.Context(), perm); err != nil {
+	var granteeID string
+	if grantee, err := s.users.GetByEmail(r.Context(), req.GranteeEmail); err == nil && grantee != nil {
+		granteeID = grantee.ID
+	}
+	entries := shareJournalEntries(file, domain.ActionShareInvitation, userID)
+	if granteeID != "" {
+		entries = append(entries, shareJournalEntries(file, domain.ActionShareInvitation, granteeID)...)
+	}
+	if err := s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+		currentFile, err := s.requireSharePermissionInTx(r.Context(), tx, fileID, userID, sender.Email)
+		if err != nil {
+			return err
+		}
+		if currentFile.DeletedAt != nil || currentFile.Status != "ACTIVE" {
+			return errors.New("cannot share a file until it is active")
+		}
+		if isShortcutFile(currentFile) {
+			return errors.New("cannot share a shortcut; share the canonical file")
+		}
+		if req.Role == domain.RoleOwner && currentFile.UserID != userID {
+			return errors.New("only the file owner can grant OWNER access")
+		}
+		return s.perms.WithTx(tx).GrantPermission(r.Context(), perm)
+	}, entries); err != nil {
 		// Unique violation (duplicate grant) -> 409 Conflict.
 		if isUniqueViolation(err) {
 			writeJSON(w, http.StatusConflict, map[string]string{
@@ -129,27 +175,25 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 	// Resolve the actual filename for notifications
 	filename := fileID
 	if s.fileOps != nil {
-		if file, _, fErr := s.fileOps.GetDownloadInfo(r.Context(), fileID); fErr == nil && file != nil {
+		if file, fErr := s.fileOps.GetFile(r.Context(), fileID); fErr == nil && file != nil {
 			filename = file.Name
 		}
 	}
 
 	// Notify the grantee in real-time about the pending invitation so their UI refreshes without polling
-	if s.users != nil {
-		if grantee, err := s.users.GetByEmail(r.Context(), req.GranteeEmail); err == nil && grantee != nil {
-			s.notifyUser(grantee.ID, wsSync.NotificationEvent{
-				Type: wsSync.EventShareInvitation,
-				Payload: map[string]string{
-					"invitation_id": perm.ID,
-					"file_id":       fileID,
-					"filename":      filename,
-					"role":          req.Role,
-					"shared_by":     sender.Email,
-					"message":       req.Message,
-					"expires_at":    expiresAt.Format(time.RFC3339),
-				},
-			})
-		}
+	if granteeID != "" {
+		s.notifyUser(granteeID, wsSync.NotificationEvent{
+			Type: wsSync.EventShareInvitation,
+			Payload: map[string]string{
+				"invitation_id": perm.ID,
+				"file_id":       fileID,
+				"filename":      filename,
+				"role":          req.Role,
+				"shared_by":     sender.Email,
+				"message":       req.Message,
+				"expires_at":    expiresAt.Format(time.RFC3339),
+			},
+		})
 	}
 
 	// Dispatch asynchronous background email notification
@@ -174,12 +218,23 @@ func (s *Server) HandleShare(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, perm)
 }
 
+func shareJournalEntries(file *domain.File, action, userID string) []*domain.JournalEntry {
+	if file == nil || userID == "" {
+		return nil
+	}
+	return []*domain.JournalEntry{{
+		UserID: userID, FileID: file.ID, Action: action, ParentID: file.ParentID,
+		Name: file.Name, IsDirectory: file.IsDirectory, SizeBytes: file.SizeBytes,
+		MimeType: file.MimeType, Status: file.Status,
+	}}
+}
+
 // HandleListPermissions implements GET /api/files/{id}/permissions.
 //
 // Lists the direct grants on a file (does not walk the folder hierarchy).
 // Requires authentication.
 func (s *Server) HandleListPermissions(w http.ResponseWriter, r *http.Request) {
-	if s.perms == nil {
+	if s.perms == nil || s.files == nil || s.users == nil || s.db == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "permissions unavailable (database not configured)",
 		})
@@ -198,30 +253,65 @@ func (s *Server) HandleListPermissions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.fileOps != nil {
-		if err := s.fileOps.AuthoriseRead(r.Context(), userID, fileID); err != nil {
-			writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
-			return
+	// A VIEWER may read file content, but the direct ACL contains other users'
+	// email addresses, invitation state, and messages. Check the manager role
+	// and read the roster in one transaction so revocation cannot race between
+	// the authorization check and the sensitive query.
+	var grants []*domain.Permission
+	err := postgresrepo.RunInTx(r.Context(), s.db, func(tx postgresrepo.DBTX) error {
+		// Read first without a row lock so collaborators can lock their effective
+		// grant before locking the file. Share mutations use that same
+		// grant-then-file order; reversing it here can deadlock with a revoke or
+		// role update that already holds the grant row.
+		file, err := s.files.WithTx(tx).GetByID(r.Context(), fileID)
+		if err != nil {
+			return err
 		}
-	}
-
-	perms, err := s.perms.GetPermissionsByFile(r.Context(), fileID)
+		if file.DeletedAt != nil || file.Status == "TRASHED" || file.Status == "QUARANTINED" || (file.Status != "" && file.Status != "ACTIVE") {
+			return errors.New("file is unavailable")
+		}
+		if file.UserID != userID {
+			user, err := s.users.WithTx(tx).GetByID(r.Context(), userID)
+			if err != nil {
+				return fmt.Errorf("resolve user: %w", err)
+			}
+			allowed, err := s.perms.WithTx(tx).CheckUserPermission(r.Context(), fileID, user.Email, []string{domain.RoleEditor, domain.RoleOwner})
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				return errors.New("access denied")
+			}
+		}
+		// Do not lock the file row for this read. The grant lock above protects
+		// the authorization decision through the roster query; taking a file
+		// lock here could deadlock with a role update that holds another actor's
+		// grant and then locks this file before changing the roster.
+		grants, err = s.perms.WithTx(tx).GetPermissionsByFile(r.Context(), fileID)
+		return err
+	})
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		} else if strings.Contains(err.Error(), "access denied") || strings.Contains(err.Error(), "unavailable") {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied"})
+		} else {
+			s.log.Error("failed to list permission roster", "file_id", fileID, "err", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to list permissions"})
+		}
 		return
 	}
-	// Always return a list, never null, so the JSON is client-friendly.
-	if perms == nil {
-		perms = []*domain.Permission{}
+	if grants == nil {
+		grants = []*domain.Permission{}
 	}
-	writeJSON(w, http.StatusOK, perms)
+	writeJSON(w, http.StatusOK, grants)
 }
 
 // HandleUpdateShare implements PATCH /api/files/{id}/share/{email}.
 // Updates the role of an existing permission.
 // Requires OWNER or EDITOR permission on the file.
 func (s *Server) HandleUpdateShare(w http.ResponseWriter, r *http.Request) {
-	if s.perms == nil {
+	if s.perms == nil || s.users == nil || s.files == nil || s.db == nil || s.journalWriter == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "permissions unavailable (database not configured)",
 		})
@@ -266,8 +356,59 @@ func (s *Server) HandleUpdateShare(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "role must be VIEWER, EDITOR, or OWNER"})
 		return
 	}
+	actor, err := s.users.GetByID(r.Context(), userID)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
+		return
+	}
 
-	if err := s.perms.UpdatePermission(r.Context(), fileID, granteeEmail, req.Role); err != nil {
+	file, err := s.files.GetByID(r.Context(), fileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		return
+	}
+	grants, err := s.perms.GetPermissionsByFile(r.Context(), fileID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load permission"})
+		return
+	}
+	var targetGrant *domain.Permission
+	for _, grant := range grants {
+		if strings.EqualFold(strings.TrimSpace(grant.GranteeEmail), strings.TrimSpace(granteeEmail)) {
+			targetGrant = grant
+			break
+		}
+	}
+	if targetGrant == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "permission not found"})
+		return
+	}
+	if file.UserID != userID && (targetGrant.Role == domain.RoleOwner || req.Role == domain.RoleOwner) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "only the file owner can modify OWNER access"})
+		return
+	}
+	var recipientID string
+	if grantee, err := s.users.GetByEmail(r.Context(), granteeEmail); err == nil && grantee != nil {
+		recipientID = grantee.ID
+	}
+	entries := shareJournalEntries(file, domain.ActionShareUpdated, userID)
+	if recipientID != "" {
+		entries = append(entries, shareJournalEntries(file, domain.ActionShareUpdated, recipientID)...)
+	}
+	if err := s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+		currentFile, err := s.requireSharePermissionInTx(r.Context(), tx, fileID, userID, actor.Email)
+		if err != nil {
+			return err
+		}
+		currentGrant, err := s.perms.WithTx(tx).GetPermissionByFileAndGranteeForUpdate(r.Context(), fileID, granteeEmail)
+		if err != nil {
+			return err
+		}
+		if currentFile.UserID != userID && (currentGrant.Role == domain.RoleOwner || req.Role == domain.RoleOwner) {
+			return errors.New("only the file owner can modify OWNER access")
+		}
+		return s.perms.WithTx(tx).UpdatePermission(r.Context(), fileID, granteeEmail, req.Role)
+	}, entries); err != nil {
 		if errors.Is(err, domain.ErrPermissionNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "permission not found"})
 			return
@@ -283,7 +424,7 @@ func (s *Server) HandleUpdateShare(w http.ResponseWriter, r *http.Request) {
 // Revokes access to the file.
 // Requires OWNER or EDITOR permission on the file.
 func (s *Server) HandleRevokeShare(w http.ResponseWriter, r *http.Request) {
-	if s.perms == nil {
+	if s.perms == nil || s.users == nil || s.files == nil || s.db == nil || s.journalWriter == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "permissions unavailable (database not configured)",
 		})
@@ -317,8 +458,50 @@ func (s *Server) HandleRevokeShare(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing grantee email"})
 		return
 	}
+	actor, err := s.users.GetByID(r.Context(), userID)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
+		return
+	}
 
-	if err := s.perms.RevokePermission(r.Context(), fileID, granteeEmail); err != nil {
+	file, err := s.files.GetByID(r.Context(), fileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		return
+	}
+	grants, err := s.perms.GetPermissionsByFile(r.Context(), fileID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load permission"})
+		return
+	}
+	for _, grant := range grants {
+		if strings.EqualFold(strings.TrimSpace(grant.GranteeEmail), strings.TrimSpace(granteeEmail)) && grant.Role == domain.RoleOwner && file.UserID != userID {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only the file owner can revoke OWNER access"})
+			return
+		}
+	}
+	var recipientID string
+	if grantee, err := s.users.GetByEmail(r.Context(), granteeEmail); err == nil && grantee != nil {
+		recipientID = grantee.ID
+	}
+	entries := shareJournalEntries(file, domain.ActionShareRevoked, userID)
+	if recipientID != "" {
+		entries = append(entries, shareJournalEntries(file, domain.ActionShareRevoked, recipientID)...)
+	}
+	if err := s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+		currentFile, err := s.requireSharePermissionInTx(r.Context(), tx, fileID, userID, actor.Email)
+		if err != nil {
+			return err
+		}
+		currentGrant, err := s.perms.WithTx(tx).GetPermissionByFileAndGranteeForUpdate(r.Context(), fileID, granteeEmail)
+		if err != nil {
+			return err
+		}
+		if currentFile.UserID != userID && currentGrant.Role == domain.RoleOwner {
+			return errors.New("only the file owner can revoke OWNER access")
+		}
+		return s.perms.WithTx(tx).RevokePermission(r.Context(), fileID, granteeEmail)
+	}, entries); err != nil {
 		if errors.Is(err, domain.ErrPermissionNotFound) {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "permission not found"})
 			return
@@ -401,7 +584,7 @@ func (s *Server) HandleListInvitations(w http.ResponseWriter, r *http.Request) {
 // HandleAcceptInvitation implements POST /api/shares/invitations/{id}/accept.
 // Accepts an unexpired PENDING invitation, transitioning it to ACCEPTED.
 func (s *Server) HandleAcceptInvitation(w http.ResponseWriter, r *http.Request) {
-	if s.perms == nil || s.users == nil {
+	if s.perms == nil || s.users == nil || s.files == nil || s.db == nil || s.journalWriter == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "permissions service unavailable",
 		})
@@ -426,8 +609,39 @@ func (s *Server) HandleAcceptInvitation(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	perm, err := s.perms.RespondToInvitation(r.Context(), invID, user.Email, domain.PermissionStatusAccepted)
+	invitation, err := s.perms.GetInvitationByIDForUser(r.Context(), invID, user.Email)
 	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invitation not found"})
+		return
+	}
+	file, err := s.files.GetByID(r.Context(), invitation.FileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "shared file no longer exists"})
+		return
+	}
+	if isShortcutFile(file) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invitation targets a shortcut; ask the sender to share the canonical file"})
+		return
+	}
+	entries := shareJournalEntries(file, domain.ActionShareAccepted, userID)
+	if invitation.InvitedBy != nil {
+		entries = append(entries, shareJournalEntries(file, domain.ActionShareAccepted, *invitation.InvitedBy)...)
+	}
+	var perm *domain.Permission
+	if err := s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+		currentFile, err := s.files.WithTx(tx).GetByIDForUpdate(r.Context(), invitation.FileID)
+		if err != nil {
+			return err
+		}
+		if currentFile.DeletedAt != nil || currentFile.Status != "ACTIVE" {
+			return errors.New("shared file is unavailable")
+		}
+		if isShortcutFile(currentFile) {
+			return errors.New("invitation targets a shortcut; share the canonical file")
+		}
+		perm, err = s.perms.WithTx(tx).RespondToInvitation(r.Context(), invID, user.Email, domain.PermissionStatusAccepted)
+		return err
+	}, entries); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -444,15 +658,6 @@ func (s *Server) HandleAcceptInvitation(w http.ResponseWriter, r *http.Request) 
 		})
 	}
 
-	// Trigger real-time sync update on recipient's connection so the shared file view refreshes immediately
-	s.notifyUser(userID, wsSync.NotificationEvent{
-		Type: wsSync.EventSyncDelta,
-		Payload: map[string]string{
-			"action":  "INVITATION_ACCEPTED",
-			"file_id": perm.FileID,
-		},
-	})
-
 	s.auditLog.Log(r.Context(), audit.Entry{
 		UserID:       userID,
 		Action:       "INVITATION_ACCEPTED",
@@ -468,7 +673,7 @@ func (s *Server) HandleAcceptInvitation(w http.ResponseWriter, r *http.Request) 
 // HandleDeclineInvitation implements POST /api/shares/invitations/{id}/decline.
 // Declines an unexpired PENDING invitation, moving it to DECLINED.
 func (s *Server) HandleDeclineInvitation(w http.ResponseWriter, r *http.Request) {
-	if s.perms == nil || s.users == nil {
+	if s.perms == nil || s.users == nil || s.files == nil || s.db == nil || s.journalWriter == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "permissions service unavailable",
 		})
@@ -493,8 +698,26 @@ func (s *Server) HandleDeclineInvitation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	perm, err := s.perms.RespondToInvitation(r.Context(), invID, user.Email, domain.PermissionStatusDeclined)
+	invitation, err := s.perms.GetInvitationByIDForUser(r.Context(), invID, user.Email)
 	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invitation not found"})
+		return
+	}
+	file, err := s.files.GetByID(r.Context(), invitation.FileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "shared file no longer exists"})
+		return
+	}
+	entries := shareJournalEntries(file, domain.ActionShareDeclined, userID)
+	if invitation.InvitedBy != nil {
+		entries = append(entries, shareJournalEntries(file, domain.ActionShareDeclined, *invitation.InvitedBy)...)
+	}
+	var perm *domain.Permission
+	if err := s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+		var err error
+		perm, err = s.perms.WithTx(tx).RespondToInvitation(r.Context(), invID, user.Email, domain.PermissionStatusDeclined)
+		return err
+	}, entries); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -514,7 +737,7 @@ func (s *Server) HandleDeclineInvitation(w http.ResponseWriter, r *http.Request)
 // HandleBlockSender implements POST /api/shares/invitations/{id}/block.
 // Blocks future invitations from the sender and declines this invitation.
 func (s *Server) HandleBlockSender(w http.ResponseWriter, r *http.Request) {
-	if s.perms == nil || s.users == nil {
+	if s.perms == nil || s.users == nil || s.files == nil || s.db == nil || s.journalWriter == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "permissions service unavailable",
 		})
@@ -539,25 +762,43 @@ func (s *Server) HandleBlockSender(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inv, err := s.perms.GetInvitationByID(r.Context(), invID)
+	inv, err := s.perms.GetInvitationByIDForUser(r.Context(), invID, user.Email)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "invitation not found"})
 		return
 	}
-	if !strings.EqualFold(inv.GranteeEmail, user.Email) {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": "not authorised to manage this invitation"})
+	file, err := s.files.GetByID(r.Context(), inv.FileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "shared file no longer exists"})
 		return
 	}
-
-	// Block the sender if sender user ID is present
+	var senderEmail string
 	if inv.InvitedBy != nil && *inv.InvitedBy != "" {
-		if senderUser, sErr := s.users.GetByID(r.Context(), *inv.InvitedBy); sErr == nil && senderUser != nil {
-			_ = s.perms.BlockUser(r.Context(), userID, senderUser.Email)
+		senderUser, senderErr := s.users.GetByID(r.Context(), *inv.InvitedBy)
+		if senderErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load invitation sender"})
+			return
 		}
+		senderEmail = senderUser.Email
 	}
-
-	// Automatically decline the pending invitation
-	_, _ = s.perms.RespondToInvitation(r.Context(), invID, user.Email, domain.PermissionStatusDeclined)
+	entries := shareJournalEntries(file, domain.ActionShareDeclined, userID)
+	if inv.InvitedBy != nil && *inv.InvitedBy != "" {
+		entries = append(entries, shareJournalEntries(file, domain.ActionShareDeclined, *inv.InvitedBy)...)
+	}
+	if err := s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+		perms := s.perms.WithTx(tx)
+		if senderEmail != "" {
+			if err := perms.BlockUser(r.Context(), userID, senderEmail); err != nil {
+				return err
+			}
+		}
+		_, err := perms.RespondToInvitation(r.Context(), invID, user.Email, domain.PermissionStatusDeclined)
+		return err
+	}, entries); err != nil {
+		s.log.Error("failed to block sender and decline invitation", "invitation_id", invID, "err", err)
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "invitation is no longer pending or could not be processed"})
+		return
+	}
 
 	s.auditLog.Log(r.Context(), audit.Entry{
 		UserID:       userID,
@@ -574,7 +815,7 @@ func (s *Server) HandleBlockSender(w http.ResponseWriter, r *http.Request) {
 // HandlePreviewInvitation implements GET /api/shares/invitations/{id}/preview.
 // Streams an isolated read-only preview of a file in PENDING invitation state.
 func (s *Server) HandlePreviewInvitation(w http.ResponseWriter, r *http.Request) {
-	if s.perms == nil || s.users == nil || s.files == nil || s.fileOps == nil {
+	if s.perms == nil || s.users == nil || s.files == nil || s.fileOps == nil || s.blocks == nil || s.storage == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "preview service unavailable",
 		})
@@ -624,8 +865,16 @@ func (s *Server) HandlePreviewInvitation(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
 		return
 	}
+	if isShortcutFile(file) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "invitation not found"})
+		return
+	}
 	if file.IsDirectory {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot preview a directory directly"})
+		return
+	}
+	if file.Status != "ACTIVE" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "file is unavailable until processing is complete"})
 		return
 	}
 
@@ -645,7 +894,7 @@ func (s *Server) HandlePreviewInvitation(w http.ResponseWriter, r *http.Request)
 // It allows a collaborator (recipient) to remove a shared file from their own "Shared with me" view.
 // It deletes or revokes the caller's permission record for the file without modifying the file or affecting other collaborators.
 func (s *Server) HandleRemoveSharedWithMe(w http.ResponseWriter, r *http.Request) {
-	if s.perms == nil || s.users == nil {
+	if s.perms == nil || s.users == nil || s.files == nil || s.db == nil || s.journalWriter == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"error": "permissions service unavailable",
 		})
@@ -669,14 +918,43 @@ func (s *Server) HandleRemoveSharedWithMe(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "user not found"})
 		return
 	}
+	file, err := s.files.GetByID(r.Context(), fileID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "file not found"})
+		return
+	}
+	grants, err := s.perms.GetPermissionsByFile(r.Context(), fileID)
+	if err != nil {
+		s.log.Error("failed to load shared permission", "file_id", fileID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to remove shared file"})
+		return
+	}
+	grantExists := false
+	for _, grant := range grants {
+		if strings.EqualFold(strings.TrimSpace(grant.GranteeEmail), strings.TrimSpace(user.Email)) {
+			grantExists = true
+			break
+		}
+	}
+	if !grantExists {
+		writeJSON(w, http.StatusOK, map[string]string{"message": "removed from shared with me"})
+		return
+	}
 
-	// Revoke/remove the grantee's permission for this file
-	if err := s.perms.RevokePermission(r.Context(), fileID, user.Email); err != nil {
-		if !errors.Is(err, domain.ErrPermissionNotFound) {
-			s.log.Error("failed to remove shared file for user", "file_id", fileID, "email", user.Email, "err", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to remove shared file"})
+	entries := shareJournalEntries(file, domain.ActionShareRevoked, userID)
+	if file.UserID != "" && file.UserID != userID {
+		entries = append(entries, shareJournalEntries(file, domain.ActionShareRevoked, file.UserID)...)
+	}
+	if err := s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+		return s.perms.WithTx(tx).RevokePermission(r.Context(), fileID, user.Email)
+	}, entries); err != nil {
+		if errors.Is(err, domain.ErrPermissionNotFound) {
+			writeJSON(w, http.StatusOK, map[string]string{"message": "removed from shared with me"})
 			return
 		}
+		s.log.Error("failed to remove shared file for user", "file_id", fileID, "email", user.Email, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to remove shared file"})
+		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "removed from shared with me"})

@@ -3,45 +3,55 @@ package queue
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"image"
 	"image/png"
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	_ "golang.org/x/image/webp"
 	_ "image/gif"
 	_ "image/jpeg"
-	_ "golang.org/x/image/webp"
 
 	"golang.org/x/image/draw"
 
-	"go-drive-clone/internal/ai"
-	"go-drive-clone/internal/antivirus"
-	"go-drive-clone/internal/domain"
-	wsSync "go-drive-clone/internal/sync"
 	"github.com/ledongthuc/pdf"
+	"go-drive-clone/internal/ai"
+	"go-drive-clone/internal/domain"
+	postgresrepo "go-drive-clone/internal/repository/postgres"
+	wsSync "go-drive-clone/internal/sync"
 )
 
 type fileGetter interface {
 	GetByID(ctx context.Context, id string) (*domain.File, error)
 	UpdateAIMetadata(ctx context.Context, id string, tags, summary *string, embedding []float32) error
 	UpdateStatus(ctx context.Context, id string, status string) error
+	UpdateProcessingStatus(ctx context.Context, id string, expectedUpdatedAt time.Time, status string) (bool, error)
 	InsertFileChunks(ctx context.Context, chunks []*domain.FileChunk) error
+}
+
+type transactionalFileGetter interface {
+	WithTx(tx postgresrepo.DBTX) *postgresrepo.FileRepository
 }
 
 type blockHashLister interface {
 	ListFileBlockHashes(ctx context.Context, fileID string) ([]string, error)
 }
 
+type virusScanner interface {
+	ScanStream(ctx context.Context, reader io.Reader) (bool, string, error)
+}
+
 const ThumbnailMaxSize = 200
 
-// MaxAssemblySize defines the maximum file size (50MB) assembled into memory
-// for antivirus scanning, thumbnail extraction, or document parsing.
-// Files exceeding this size are marked ACTIVE immediately without buffering into RAM.
+// MaxAssemblySize caps in-memory thumbnail and AI enrichment; antivirus
+// scanning streams blocks independently of this limit.
 const MaxAssemblySize = 50 * 1024 * 1024
 
 var supportedImageExts = map[string]bool{
@@ -54,13 +64,177 @@ func isSupportedDocument(filename string) bool {
 }
 
 type FileProcessor struct {
+	db       *sql.DB
 	files    fileGetter
 	blocks   blockHashLister
 	storage  domain.StorageProvider
 	notifier wsSync.Notifier
 	aiClient ai.AIClient
-	clamAV   *antivirus.ClamAVClient
+	clamAV   virusScanner
+	journal  *postgresrepo.JournalRepository
+	perms    *postgresrepo.PermissionRepository
 	log      *slog.Logger
+}
+
+func (p *FileProcessor) WithDatabase(db *sql.DB) *FileProcessor {
+	p.db = db
+	return p
+}
+
+func (p *FileProcessor) WithJournal(journal *postgresrepo.JournalRepository) *FileProcessor {
+	p.journal = journal
+	return p
+}
+
+func (p *FileProcessor) WithPermissions(perms *postgresrepo.PermissionRepository) *FileProcessor {
+	p.perms = perms
+	return p
+}
+
+func (p *FileProcessor) journalRecipients(ctx context.Context, file *domain.File) ([]string, error) {
+	ids := map[string]struct{}{}
+	if file.UserID != "" {
+		ids[file.UserID] = struct{}{}
+	}
+	if p.perms != nil {
+		collaborators, err := p.perms.FindCollaboratorUserIDs(ctx, file.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list processing-event recipients: %w", err)
+		}
+		for _, id := range collaborators {
+			if id != "" {
+				ids[id] = struct{}{}
+			}
+		}
+	}
+	recipients := make([]string, 0, len(ids))
+	for id := range ids {
+		recipients = append(recipients, id)
+	}
+	sort.Strings(recipients)
+	return recipients, nil
+}
+
+func (p *FileProcessor) journalEntries(recipients []string, file, updated *domain.File) []*domain.JournalEntry {
+	entries := make([]*domain.JournalEntry, 0)
+	for _, userID := range recipients {
+		entries = append(entries, &domain.JournalEntry{
+			UserID: userID, FileID: file.ID, Action: domain.ActionFileUpdated,
+			ParentID: updated.ParentID, Name: updated.Name, IsDirectory: updated.IsDirectory,
+			SizeBytes: updated.SizeBytes, MimeType: updated.MimeType, Status: updated.Status,
+		})
+	}
+	return entries
+}
+
+func (p *FileProcessor) notifyJournalEntries(entries []*domain.JournalEntry) {
+	if p.notifier == nil {
+		return
+	}
+	for _, entry := range entries {
+		p.notifier.NotifyUser(entry.UserID, wsSync.NotificationEvent{
+			Type:    wsSync.EventSyncDelta,
+			Payload: map[string]any{"cursor": entry.Cursor, "file_id": entry.FileID, "action": entry.Action},
+		})
+	}
+}
+
+func (p *FileProcessor) updateProcessingStatus(ctx context.Context, file *domain.File, status string) (bool, error) {
+	if p.db == nil || p.journal == nil {
+		changed, err := p.files.UpdateProcessingStatus(ctx, file.ID, file.UpdatedAt, status)
+		if changed && err == nil {
+			p.notifyProcessingDelta(file.UserID, file.ID, 0)
+		}
+		return changed, err
+	}
+	files, ok := p.files.(transactionalFileGetter)
+	if !ok {
+		return false, fmt.Errorf("file store does not support transactional processing updates")
+	}
+	recipients, err := p.journalRecipients(ctx, file)
+	if err != nil {
+		return false, err
+	}
+	var changed bool
+	var entries []*domain.JournalEntry
+	err = postgresrepo.RunInTx(ctx, p.db, func(tx postgresrepo.DBTX) error {
+		txFiles := files.WithTx(tx)
+		var err error
+		changed, err = txFiles.UpdateProcessingStatus(ctx, file.ID, file.UpdatedAt, status)
+		if err != nil || !changed {
+			return err
+		}
+		updated, err := txFiles.GetByID(ctx, file.ID)
+		if err != nil {
+			return fmt.Errorf("read updated processing status: %w", err)
+		}
+		entries = p.journalEntries(recipients, file, updated)
+		cursors, err := p.journal.WithTx(tx).BatchRecord(ctx, entries)
+		if err != nil {
+			return err
+		}
+		for i, entry := range entries {
+			if i < len(cursors) {
+				entry.Cursor = cursors[i]
+			}
+		}
+		return nil
+	})
+	if err != nil || !changed {
+		return changed, err
+	}
+	p.notifyJournalEntries(entries)
+	return true, nil
+}
+
+func (p *FileProcessor) updateAIMetadata(ctx context.Context, file *domain.File, tags, summary *string) error {
+	if p.db == nil || p.journal == nil {
+		return p.files.UpdateAIMetadata(ctx, file.ID, tags, summary, nil)
+	}
+	files, ok := p.files.(transactionalFileGetter)
+	if !ok {
+		return fmt.Errorf("file store does not support transactional metadata updates")
+	}
+	recipients, err := p.journalRecipients(ctx, file)
+	if err != nil {
+		return err
+	}
+	var entries []*domain.JournalEntry
+	err = postgresrepo.RunInTx(ctx, p.db, func(tx postgresrepo.DBTX) error {
+		txFiles := files.WithTx(tx)
+		if err := txFiles.UpdateAIMetadata(ctx, file.ID, tags, summary, nil); err != nil {
+			return err
+		}
+		updated, err := txFiles.GetByID(ctx, file.ID)
+		if err != nil {
+			return fmt.Errorf("read updated AI metadata: %w", err)
+		}
+		entries = p.journalEntries(recipients, file, updated)
+		cursors, err := p.journal.WithTx(tx).BatchRecord(ctx, entries)
+		if err != nil {
+			return err
+		}
+		for i, entry := range entries {
+			if i < len(cursors) {
+				entry.Cursor = cursors[i]
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		p.notifyJournalEntries(entries)
+	}
+	return err
+}
+
+func (p *FileProcessor) notifyProcessingDelta(userID, fileID string, cursor int64) {
+	if p.notifier == nil {
+		return
+	}
+	p.notifier.NotifyUser(userID, wsSync.NotificationEvent{
+		Type:    wsSync.EventSyncDelta,
+		Payload: map[string]any{"cursor": cursor, "file_id": fileID, "action": domain.ActionFileUpdated},
+	})
 }
 
 func NewFileProcessor(
@@ -69,7 +243,7 @@ func NewFileProcessor(
 	storage domain.StorageProvider,
 	notifier wsSync.Notifier,
 	aiClient ai.AIClient,
-	clamAV *antivirus.ClamAVClient,
+	clamAV virusScanner,
 	log *slog.Logger,
 ) *FileProcessor {
 	if notifier == nil {
@@ -83,6 +257,9 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 	if err != nil {
 		return fmt.Errorf("fetch file %s: %w", msg.FileID, err)
 	}
+	if file.Status == "QUARANTINED" || file.Status == "ACTIVE" {
+		return nil
+	}
 
 	p.log.Info("processing file in background", "file_id", msg.FileID, "name", file.Name, "size_bytes", file.SizeBytes)
 
@@ -91,31 +268,42 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 	if file.IsEncrypted {
 		p.log.Info("file is client-side encrypted (zero-trust); bypassing server-side processing",
 			"file_id", msg.FileID, "name", file.Name)
-		if err := p.files.UpdateStatus(ctx, msg.FileID, "ACTIVE"); err != nil {
-			p.log.Error("failed to set status to ACTIVE for encrypted file", "err", err)
+		if _, err := p.updateProcessingStatus(ctx, file, "ACTIVE"); err != nil {
+			return fmt.Errorf("activate encrypted file: %w", err)
 		}
 		return nil
 	}
-
-	// Memory safety guard: skip in-memory assembly for large files (> 50MB) to prevent worker OOM kills.
+	if p.clamAV == nil {
+		return fmt.Errorf("antivirus scanner unavailable; file %s remains unavailable", msg.FileID)
+	}
+	clean, virusName, err := p.scanFile(ctx, msg.FileID)
+	if err != nil {
+		return fmt.Errorf("scan file: %w", err)
+	}
+	if !clean {
+		quarantined, err := p.updateProcessingStatus(ctx, file, "QUARANTINED")
+		if err != nil {
+			return fmt.Errorf("quarantine infected file: %w", err)
+		}
+		if quarantined && p.notifier != nil {
+			p.notifier.NotifyUser(file.UserID, wsSync.NotificationEvent{
+				Type:    "VIRUS_DETECTED",
+				Payload: map[string]any{"file_id": msg.FileID, "filename": file.Name, "virus_name": virusName},
+			})
+		}
+		return nil
+	}
+	activated, err := p.updateProcessingStatus(ctx, file, "ACTIVE")
+	if err != nil {
+		return fmt.Errorf("activate clean file: %w", err)
+	}
+	if !activated {
+		p.log.Info("discarding stale processing result", "file_id", msg.FileID)
+		return nil
+	}
 	if file.SizeBytes > MaxAssemblySize {
-		p.log.Info("file exceeds maximum in-memory processing threshold; skipping buffer assembly",
+		p.log.Info("clean file exceeds in-memory enrichment limit; skipping thumbnail and AI processing",
 			"file_id", msg.FileID, "size_bytes", file.SizeBytes, "max_assembly_bytes", MaxAssemblySize)
-		if err := p.files.UpdateStatus(ctx, msg.FileID, "ACTIVE"); err != nil {
-			p.log.Error("failed to set status to ACTIVE", "err", err)
-		}
-		return nil
-	}
-
-	// Early activation: if file requires no post-processing (not an image, not an AI document, and no ClamAV scanner),
-	// activate immediately without downloading or assembling blocks into RAM.
-	needsAssembly := (p.clamAV != nil) || isSupportedImage(file.Name) || isSupportedDocument(file.Name)
-	if !needsAssembly {
-		p.log.Info("file type requires no post-processing; activating immediately",
-			"file_id", msg.FileID, "name", file.Name)
-		if err := p.files.UpdateStatus(ctx, msg.FileID, "ACTIVE"); err != nil {
-			p.log.Error("failed to set status to ACTIVE", "err", err)
-		}
 		return nil
 	}
 
@@ -128,36 +316,6 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 	fileBytes, err := p.assembleFile(ctx, msg.FileID)
 	if err != nil {
 		return fmt.Errorf("assemble file: %w", err)
-	}
-
-	// 1. Antivirus Scan
-	if p.clamAV != nil {
-		isClean, virusName, errScan := p.clamAV.ScanStream(ctx, bytes.NewReader(fileBytes))
-		if errScan != nil {
-			p.log.Error("failed to scan file with clamav", "err", errScan)
-			// Proceed or block on error? Let's assume it failed and we might want to block or allow. The prompt says "If the Scan is CLEAN... If the Scan is INFECTED...". If it fails, we shouldn't quarantine. But we should log.
-		} else if !isClean {
-			p.log.Warn("malware detected in file", "file_id", msg.FileID, "virus", virusName)
-			if err := p.files.UpdateStatus(ctx, msg.FileID, "QUARANTINED"); err != nil {
-				p.log.Error("failed to quarantine file", "err", err)
-			}
-			if p.notifier != nil {
-				p.notifier.NotifyUser(file.UserID, wsSync.NotificationEvent{
-					Type: "VIRUS_DETECTED", // we will define this as string
-					Payload: map[string]interface{}{
-						"file_id":    msg.FileID,
-						"filename":   file.Name,
-						"virus_name": virusName,
-					},
-				})
-			}
-			return nil // Abort further processing
-		}
-	}
-
-	// If clean, mark as ACTIVE
-	if err := p.files.UpdateStatus(ctx, msg.FileID, "ACTIVE"); err != nil {
-		p.log.Error("failed to set status to ACTIVE", "err", err)
 	}
 
 	// CAS Content-Addressable AI Deduplication Check:
@@ -234,7 +392,7 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 				p.log.Error("failed to generate image tags", "err", errAI)
 			} else if len(tags) > 0 {
 				ts := strings.Join(tags, ", ")
-				if errUp := p.files.UpdateAIMetadata(ctx, msg.FileID, &ts, nil, nil); errUp != nil {
+				if errUp := p.updateAIMetadata(ctx, file, &ts, nil); errUp != nil {
 					p.log.Error("failed to update image AI tags", "err", errUp)
 				}
 				if p.notifier != nil {
@@ -326,7 +484,7 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 
 		if tagsStr != nil || summaryStr != nil {
 			p.log.Info("persisting AI metadata immediately", "file_id", msg.FileID)
-			if err := p.files.UpdateAIMetadata(ctx, msg.FileID, tagsStr, summaryStr, nil); err != nil {
+			if err := p.updateAIMetadata(ctx, file, tagsStr, summaryStr); err != nil {
 				p.log.Error("failed to update AI metadata", "err", err)
 			}
 			if p.notifier != nil {
@@ -420,6 +578,46 @@ func (p *FileProcessor) ProcessMessage(ctx context.Context, msg ThumbnailMessage
 
 	p.log.Info("process message complete")
 	return nil
+}
+
+// scanFile streams ordered CAS blocks into ClamAV without assembling the file
+// in memory, so the antivirus gate also covers files above the enrichment limit.
+func (p *FileProcessor) scanFile(ctx context.Context, fileID string) (bool, string, error) {
+	hashes, err := p.blocks.ListFileBlockHashes(ctx, fileID)
+	if err != nil {
+		return false, "", err
+	}
+	reader, writer := io.Pipe()
+	written := make(chan error, 1)
+	go func() {
+		for _, hash := range hashes {
+			rc, err := p.storage.GetObject(ctx, "blocks/"+hash)
+			if err != nil {
+				_ = writer.CloseWithError(err)
+				written <- err
+				return
+			}
+			_, copyErr := io.Copy(writer, rc)
+			_ = rc.Close()
+			if copyErr != nil {
+				_ = writer.CloseWithError(copyErr)
+				written <- copyErr
+				return
+			}
+		}
+		written <- writer.Close()
+	}()
+
+	clean, virus, scanErr := p.clamAV.ScanStream(ctx, reader)
+	_ = reader.Close()
+	writeErr := <-written
+	if scanErr != nil {
+		return false, "", scanErr
+	}
+	if writeErr != nil {
+		return false, "", writeErr
+	}
+	return clean, virus, nil
 }
 
 func (p *FileProcessor) assembleFile(ctx context.Context, fileID string) ([]byte, error) {

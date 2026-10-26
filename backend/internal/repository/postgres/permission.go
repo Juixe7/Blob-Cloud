@@ -76,63 +76,79 @@ func (r *PermissionRepository) GetPermissionsByFile(ctx context.Context, fileID 
 	return out, rows.Err()
 }
 
+// GetPermissionByFileAndGranteeForUpdate returns the direct grant row while
+// locking it until the caller's transaction ends. Use this when a rule depends
+// on the row's current role, such as protecting OWNER grants from editor
+// changes.
+func (r *PermissionRepository) GetPermissionByFileAndGranteeForUpdate(ctx context.Context, fileID, granteeEmail string) (*domain.Permission, error) {
+	const q = `
+		SELECT id, file_id, grantee_email, role, status, message, expires_at, responded_at, invited_by, created_at
+		FROM permissions
+		WHERE file_id = $1 AND LOWER(grantee_email) = LOWER($2)
+		FOR UPDATE
+	`
+	var p domain.Permission
+	err := r.db.QueryRowContext(ctx, q, fileID, granteeEmail).Scan(
+		&p.ID, &p.FileID, &p.GranteeEmail, &p.Role, &p.Status, &p.Message, &p.ExpiresAt, &p.RespondedAt, &p.InvitedBy, &p.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, domain.ErrPermissionNotFound
+		}
+		return nil, fmt.Errorf("lock permission by file and grantee: %w", err)
+	}
+	return &p, nil
+}
+
 // CheckUserPermission reports whether userEmail holds one of requiredRoles on
 // fileID, walking up the folder hierarchy.
 //
 // The query uses a recursive CTE to climb the parent_id chain from the target
 // file, collecting every file/folder id from the file itself up to the root.
-// Any direct permission on any node in that chain, whose role is in the
-// required set, satisfies the check — so granting VIEWER on a folder grants
-// VIEWER on everything inside it.
-//
-// Role rank is handled in Go (OWNER > EDITOR > VIEWER) rather than in SQL so
-// the caller controls exactly which roles satisfy a requirement: pass the full
-// set of acceptable roles (e.g. ["VIEWER","EDITOR","OWNER"] for a read check,
-// ["EDITOR","OWNER"] for a write check).
+// The nearest active grant wins, matching FileRepository.GetResolvedPermission.
+// This means a direct grant on a file can narrow or expand an inherited folder
+// grant. The required roles only determine which operations that effective
+// role may perform.
 func (r *PermissionRepository) CheckUserPermission(ctx context.Context, fileID string, userEmail string, requiredRoles []string) (bool, error) {
 	if len(requiredRoles) == 0 || strings.TrimSpace(userEmail) == "" {
 		return false, nil
 	}
 
-	// Build an IN-list of acceptable roles for the permissions join.
-	roleArgs := make([]any, 0, len(requiredRoles))
-	var rolePlaceholders strings.Builder
-	for i, role := range requiredRoles {
-		if i > 0 {
-			rolePlaceholders.WriteByte(',')
-		}
-		// fileID is $1, userEmail is $2; roles start at $3.
-		rolePlaceholders.WriteString(fmt.Sprintf("$%d", i+3))
-		roleArgs = append(roleArgs, role)
-	}
-
-	q := fmt.Sprintf(`
+	const q = `
 		WITH RECURSIVE chain AS (
 			-- Anchor: the target file itself.
-			SELECT id, parent_id FROM files WHERE id = $1
+			SELECT id, parent_id, ARRAY[id] AS path FROM files WHERE id = $1
 			UNION ALL
 			-- Recurse: walk up to each ancestor folder.
-			SELECT f.id, f.parent_id
+			SELECT f.id, f.parent_id, c.path || f.id
 			FROM files f
 			JOIN chain c ON f.id = c.parent_id
+			WHERE NOT f.id = ANY(c.path)
 		)
-		SELECT EXISTS (
-			SELECT 1
-			FROM permissions p
-			JOIN chain c ON c.id = p.file_id
-			WHERE LOWER(p.grantee_email) = LOWER($2)
-			  AND p.status = 'ACCEPTED'
-			  AND p.role IN (%s)
-			  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
-		) AS allowed
-	`, rolePlaceholders.String())
-
-	args := append([]any{fileID, userEmail}, roleArgs...)
-	var allowed bool
-	if err := r.db.QueryRowContext(ctx, q, args...).Scan(&allowed); err != nil {
+		SELECT p.role
+		FROM permissions p
+		JOIN chain c ON c.id = p.file_id
+		WHERE LOWER(p.grantee_email) = LOWER($2)
+		  AND p.status = 'ACCEPTED'
+		  AND (p.expires_at IS NULL OR p.expires_at > CURRENT_TIMESTAMP)
+		ORDER BY array_length(c.path, 1) ASC
+		LIMIT 1
+		FOR SHARE OF p
+	`
+	var effectiveRole string
+	err := r.db.QueryRowContext(ctx, q, fileID, userEmail).Scan(&effectiveRole)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
 		return false, fmt.Errorf("check user permission: %w", err)
 	}
-	return allowed, nil
+	for _, requiredRole := range requiredRoles {
+		if strings.EqualFold(effectiveRole, requiredRole) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Compile-time assertion that PermissionRepository satisfies the interface.
@@ -223,7 +239,7 @@ func (r *PermissionRepository) RespondToInvitation(ctx context.Context, invitati
 		UPDATE permissions
 		SET status = $1,
 		    responded_at = CURRENT_TIMESTAMP,
-		    expires_at = CASE WHEN $1 = 'ACCEPTED' THEN NULL ELSE expires_at END
+		    expires_at = CASE WHEN $4 THEN NULL ELSE expires_at END
 		WHERE id = $2
 		  AND LOWER(grantee_email) = LOWER($3)
 		  AND status = 'PENDING'
@@ -231,7 +247,7 @@ func (r *PermissionRepository) RespondToInvitation(ctx context.Context, invitati
 		RETURNING id, file_id, grantee_email, role, status, message, expires_at, responded_at, invited_by, created_at
 	`
 	var p domain.Permission
-	row := r.db.QueryRowContext(ctx, q, status, invitationID, userEmail)
+	row := r.db.QueryRowContext(ctx, q, status, invitationID, userEmail, status == domain.PermissionStatusAccepted)
 	if err := row.Scan(
 		&p.ID, &p.FileID, &p.GranteeEmail, &p.Role, &p.Status, &p.Message, &p.ExpiresAt, &p.RespondedAt, &p.InvitedBy, &p.CreatedAt,
 	); err != nil {
@@ -252,6 +268,24 @@ func (r *PermissionRepository) GetInvitationByID(ctx context.Context, invitation
 	`
 	var p domain.Permission
 	err := r.db.QueryRowContext(ctx, q, invitationID).Scan(
+		&p.ID, &p.FileID, &p.GranteeEmail, &p.Role, &p.Status, &p.Message, &p.ExpiresAt, &p.RespondedAt, &p.InvitedBy, &p.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// GetInvitationByIDForUser returns an invitation only when it is addressed to
+// userEmail, avoiding disclosure of another user's invitation metadata.
+func (r *PermissionRepository) GetInvitationByIDForUser(ctx context.Context, invitationID, userEmail string) (*domain.Permission, error) {
+	const q = `
+		SELECT id, file_id, grantee_email, role, status, message, expires_at, responded_at, invited_by, created_at
+		FROM permissions
+		WHERE id = $1 AND LOWER(grantee_email) = LOWER($2)
+	`
+	var p domain.Permission
+	err := r.db.QueryRowContext(ctx, q, invitationID, userEmail).Scan(
 		&p.ID, &p.FileID, &p.GranteeEmail, &p.Role, &p.Status, &p.Message, &p.ExpiresAt, &p.RespondedAt, &p.InvitedBy, &p.CreatedAt,
 	)
 	if err != nil {
@@ -315,14 +349,15 @@ func (r *PermissionRepository) FindCollaboratorUserIDs(ctx context.Context, file
 	const q = `
 		WITH RECURSIVE chain AS (
 			-- Anchor: target file itself
-			SELECT id, parent_id, user_id
+			SELECT id, parent_id, user_id, ARRAY[id] AS path
 			FROM files
 			WHERE id = $1
 			UNION ALL
 			-- Recurse: walk up to each ancestor folder
-			SELECT f.id, f.parent_id, f.user_id
+			SELECT f.id, f.parent_id, f.user_id, c.path || f.id
 			FROM files f
 			JOIN chain c ON f.id = c.parent_id
+			WHERE NOT f.id = ANY(c.path)
 		)
 		-- 1. All users holding direct or inherited ACCEPTED and unexpired permissions
 		SELECT DISTINCT u.id::text
@@ -358,4 +393,3 @@ func (r *PermissionRepository) FindCollaboratorUserIDs(ctx context.Context, file
 	}
 	return userIDs, rows.Err()
 }
-

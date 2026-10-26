@@ -60,20 +60,18 @@ func newS3OrFail(t *testing.T) *S3Storage {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	s, err := NewS3Storage(context.Background(), cfg, log)
 	if err != nil {
-		t.Skipf("S3 unavailable, skipping: %v", err)
+		t.Fatalf("S3 configured but unavailable: %v", err)
 	}
 	return s
 }
 
-// TestS3Storage_PresignPutUploadGetDelete exercises the full lifecycle against
-// the real bucket: presign a PUT URL, upload via the presigned URL, then
-// verify through GetObject and DeleteObject.
-func TestS3Storage_PresignPutUploadGetDelete(t *testing.T) {
+// TestS3Storage_PresignStagingPutUploadGetDelete exercises the full lifecycle
+// against the real bucket using a presigned URL restricted to staging.
+func TestS3Storage_PresignStagingPutUploadGetDelete(t *testing.T) {
 	s := newS3OrFail(t)
 	ctx := context.Background()
 
-	hash := "phase4-integration-test-block-" + strings.ReplaceAll(time.Now().Format("150405.000000"), ".", "")
-	key := s3BlockPrefix + "/" + hash
+	key := "staging/s3-integration-" + strings.ReplaceAll(time.Now().Format("20060102150405.000000000"), ".", "") + "/0"
 	payload := []byte("hello from phase 4 S3 integration test")
 
 	t.Cleanup(func() {
@@ -82,14 +80,14 @@ func TestS3Storage_PresignPutUploadGetDelete(t *testing.T) {
 		}
 	})
 
-	// 1. Generate a presigned PUT URL.
-	uploadURL, err := s.GenerateUploadURL(ctx, hash, 5*time.Minute)
+	// 1. Generate a presigned PUT URL scoped to staging.
+	uploadURL, err := s.GenerateStagingUploadURL(ctx, key, 5*time.Minute)
 	if err != nil {
-		t.Fatalf("GenerateUploadURL: %v", err)
+		t.Fatalf("GenerateStagingUploadURL: %v", err)
 	}
-	t.Logf("presigned URL: %s", uploadURL)
+	// Never log a presigned URL: its query string is a temporary bearer credential.
 	if !strings.Contains(uploadURL, "X-Amz-Signature") {
-		t.Fatalf("presigned URL missing signature query param: %s", uploadURL)
+		t.Fatal("presigned URL missing signature query param")
 	}
 
 	// 2. Upload via the presigned URL exactly as a browser would.

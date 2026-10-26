@@ -5,7 +5,7 @@
 // and an in-memory StorageProvider, verifying that:
 //
 //  1. Initiate correctly queries the global blocks table for dedup hits.
-//  2. The client''s missing blocks get presigned URLs while known blocks don''t.
+//  2. The client”s missing blocks get presigned URLs while known blocks don”t.
 //  3. Complete atomically creates the file, links blocks, grants OWNER perm,
 //     and marks the session COMPLETED.
 //  4. A second Initiate for the exact same file hash produces a 100% dedup hit
@@ -26,6 +26,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,10 +97,6 @@ type memStorage struct {
 
 func newMemStorage() *memStorage { return &memStorage{objects: map[string][]byte{}} }
 
-func (s *memStorage) GenerateUploadURL(_ context.Context, blockHash string, _ time.Duration) (string, error) {
-	// Return a fake local URL so the Initiate response is non-empty for new blocks.
-	return "http://test-storage/blocks/" + blockHash, nil
-}
 func (s *memStorage) PutObject(_ context.Context, key string, r io.Reader, _ int64, _ string) error {
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -159,9 +156,13 @@ func (s *memStorage) PromoteObject(_ context.Context, srcKey, destKey string) er
 // the SQS event was emitted without a real queue.
 type capturingPublisher struct {
 	Jobs []queue.ThumbnailMessage
+	Err  error
 }
 
 func (p *capturingPublisher) PublishThumbnailJob(_ context.Context, msg queue.ThumbnailMessage) error {
+	if p.Err != nil {
+		return p.Err
+	}
 	p.Jobs = append(p.Jobs, msg)
 	return nil
 }
@@ -298,6 +299,59 @@ func TestUploadPipeline_E2E(t *testing.T) {
 		if completeResp.FileID == "" {
 			t.Error("Complete returned empty FileID")
 		}
+		file, err := files.GetByID(ctx, completeResp.FileID)
+		if err != nil {
+			t.Fatalf("load completed file: %v", err)
+		}
+		if file.Status != "PROCESSING" {
+			t.Fatalf("new upload status = %q, want PROCESSING", file.Status)
+		}
+		var jobs int
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_processing_outbox WHERE file_id = $1`, file.ID).Scan(&jobs); err != nil {
+			t.Fatalf("count processing outbox jobs: %v", err)
+		}
+		if jobs != 1 {
+			t.Fatalf("processing outbox rows = %d, want 1", jobs)
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE file_processing_outbox SET next_attempt_at = NOW() WHERE file_id = $1`, file.ID); err != nil {
+			t.Fatalf("make outbox job due: %v", err)
+		}
+		failedPublisher := &capturingPublisher{Err: errors.New("queue unavailable")}
+		if err := queue.NewOutboxDispatcher(db, failedPublisher, log).DispatchOnce(ctx); err != nil {
+			t.Fatalf("dispatch retryable outbox job: %v", err)
+		}
+		var attempts int
+		if err := db.QueryRowContext(ctx, `SELECT attempts FROM file_processing_outbox WHERE file_id = $1`, file.ID).Scan(&attempts); err != nil {
+			t.Fatalf("read outbox attempts: %v", err)
+		}
+		if attempts != 1 {
+			t.Fatalf("outbox attempts = %d, want 1 after publish failure", attempts)
+		}
+		fileSvc := service.NewFileService(db, users, files, blocks, perms, stor, log)
+		if err := fileSvc.AuthoriseRead(ctx, user.ID, file.ID); err == nil {
+			t.Fatal("owner could read file before scan completed")
+		}
+		activated, err := files.UpdateProcessingStatus(ctx, file.ID, file.UpdatedAt, "ACTIVE")
+		if err != nil || !activated {
+			t.Fatalf("activate clean file fixture: activated=%v err=%v", activated, err)
+		}
+		if err := fileSvc.AuthoriseRead(ctx, user.ID, file.ID); err != nil {
+			t.Fatalf("owner could not read active file: %v", err)
+		}
+		if err := files.UpdateStatus(ctx, file.ID, "PROCESSING"); err != nil {
+			t.Fatalf("reset file fixture to processing: %v", err)
+		}
+		file, err = files.GetByID(ctx, file.ID)
+		if err != nil {
+			t.Fatalf("reload file fixture: %v", err)
+		}
+		quarantined, err := files.UpdateProcessingStatus(ctx, file.ID, file.UpdatedAt, "QUARANTINED")
+		if err != nil || !quarantined {
+			t.Fatalf("quarantine file fixture: quarantined=%v err=%v", quarantined, err)
+		}
+		if err := fileSvc.AuthoriseRead(ctx, user.ID, file.ID); err == nil {
+			t.Fatal("owner could read quarantined file")
+		}
 
 		// SQS thumbnail job must have been published.
 		if len(pub.Jobs) != 1 {
@@ -372,4 +426,78 @@ func TestUploadPipeline_E2E(t *testing.T) {
 			t.Errorf("thumbnail jobs for second upload: want 1, got %d", len(pub.Jobs))
 		}
 	})
+}
+
+func TestUploadDestinationAuthorization_RequiresEditorOnLiveFolder(t *testing.T) {
+	db := openE2EDB(t)
+	defer db.Close()
+	freshE2ESchema(t, db)
+	metrics.Init()
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	storage := newMemStorage()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	blocks := postgresrepo.NewBlockRepository(db)
+	sessions := postgresrepo.NewUploadSessionRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
+	svc := service.NewUploadService(db, users, files, blocks, sessions, perms, storage, queue.NoopPublisher{}, wsSync.NoopNotifier(), log)
+
+	owner := &domain.User{Email: fmt.Sprintf("folder-owner-%d@example.com", time.Now().UnixNano()), PasswordHash: "hash", IsVerified: true}
+	uploader := &domain.User{Email: fmt.Sprintf("folder-uploader-%d@example.com", time.Now().UnixNano()), PasswordHash: "hash", IsVerified: true}
+	for _, user := range []*domain.User{owner, uploader} {
+		if err := users.Create(ctx, user); err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+	}
+	folder := &domain.File{UserID: owner.ID, Name: "shared-destination", IsDirectory: true}
+	if err := files.Create(ctx, folder); err != nil {
+		t.Fatalf("create destination folder: %v", err)
+	}
+	payload := []byte("folder upload validation")
+	hash := sha256.Sum256(payload)
+	request := service.InitiateRequest{
+		UserID: uploader.ID, Filename: "payload.txt", ParentID: &folder.ID,
+		TotalSize: int64(len(payload)),
+		Chunks:    []service.InitiateChunk{{SHA256: hex.EncodeToString(hash[:]), SizeBytes: int32(len(payload))}},
+	}
+
+	if _, err := svc.Initiate(ctx, request); err == nil || !strings.Contains(err.Error(), "access denied") {
+		t.Fatalf("unshared destination should reject upload, got %v", err)
+	}
+	if err := perms.GrantPermission(ctx, &domain.Permission{FileID: folder.ID, GranteeEmail: uploader.Email, Role: domain.RoleViewer}); err != nil {
+		t.Fatalf("grant viewer permission: %v", err)
+	}
+	if _, err := svc.Initiate(ctx, request); err == nil || !strings.Contains(err.Error(), "access denied") {
+		t.Fatalf("viewer destination should reject upload, got %v", err)
+	}
+	if err := perms.UpdatePermission(ctx, folder.ID, uploader.Email, domain.RoleEditor); err != nil {
+		t.Fatalf("promote to editor: %v", err)
+	}
+	initResp, err := svc.Initiate(ctx, request)
+	if err != nil {
+		t.Fatalf("editor should initiate upload: %v", err)
+	}
+
+	// Revoke write access after initiation. Completion must recheck before it
+	// promotes any untrusted staged bytes into the canonical CAS namespace.
+	if err := perms.UpdatePermission(ctx, folder.ID, uploader.Email, domain.RoleViewer); err != nil {
+		t.Fatalf("demote to viewer: %v", err)
+	}
+	storage.objects[fmt.Sprintf("staging/%s/0", initResp.SessionID)] = payload
+	if _, err := svc.Complete(ctx, service.CompleteRequest{SessionID: initResp.SessionID}, uploader.ID); err == nil || !strings.Contains(err.Error(), "access denied") {
+		t.Fatalf("revoked destination write permission should reject completion, got %v", err)
+	}
+	if _, ok := storage.objects["blocks/"+hex.EncodeToString(hash[:])]; ok {
+		t.Fatal("completion promoted a block after destination permission was revoked")
+	}
+
+	regularFile := &domain.File{UserID: owner.ID, Name: "not-a-folder.txt"}
+	if err := files.Create(ctx, regularFile); err != nil {
+		t.Fatalf("create non-folder destination fixture: %v", err)
+	}
+	request.ParentID = &regularFile.ID
+	if _, err := svc.Initiate(ctx, request); err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("non-directory destination should reject upload, got %v", err)
+	}
 }

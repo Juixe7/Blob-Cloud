@@ -37,6 +37,14 @@ services:
       timeout: 3s
       retries: 5
 
+  # Antivirus scanning is a required gate before uploaded files become readable.
+  clamav:
+    image: clamav/clamav:1.4
+    container_name: blobcloud-clamav
+    restart: unless-stopped
+    ports:
+      - "3310:3310"
+
   # ----------------------------------------------------------------------------
   # API Gateway: Stateless HTTP REST, WebSockets & Auth (cmd/api)
   # ----------------------------------------------------------------------------
@@ -54,11 +62,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      clamav:
+        condition: service_started
     environment:
       ENV: production
       PORT: 8090
       DB_URL: postgres://postgres:password@postgres:5432/blobcloud?sslmode=disable
       REDIS_URL: redis://redis:6379
+      CLAMAV_ADDRESS: clamav:3310
       STORAGE_PROVIDER: s3
       AWS_REGION: us-east-1
       S3_BUCKET: blobcloud-storage
@@ -84,10 +95,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      clamav:
+        condition: service_started
     environment:
       ENV: production
       DB_URL: postgres://postgres:password@postgres:5432/blobcloud?sslmode=disable
       REDIS_URL: redis://redis:6379
+      CLAMAV_ADDRESS: clamav:3310
       STORAGE_PROVIDER: s3
       AWS_REGION: us-east-1
       S3_BUCKET: blobcloud-storage

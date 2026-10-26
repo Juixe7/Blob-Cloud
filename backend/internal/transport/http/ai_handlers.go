@@ -15,6 +15,7 @@ import (
 	"github.com/ledongthuc/pdf"
 
 	"go-drive-clone/internal/domain"
+	postgresrepo "go-drive-clone/internal/repository/postgres"
 	wsSync "go-drive-clone/internal/sync"
 )
 
@@ -107,7 +108,38 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 		}
 
 		// Fast Path 2: Check if another file in CAS has the exact same ordered block hashes and reuse its AI metadata.
-		if _, copiedTags, copiedSummary, copied, errCopy := s.files.TryCopyAIMetadataFromCAS(r.Context(), targetFileID); errCopy == nil && copied {
+		var copiedTags, copiedSummary *string
+		var copied bool
+		var copyErr error
+		var entries []*domain.JournalEntry
+		if s.db != nil && s.journalWriter != nil {
+			entries, copyErr = s.journalEntriesForFile(r.Context(), targetFile, domain.ActionFileUpdated, userID)
+			if copyErr == nil {
+				copyErr = postgresrepo.RunInTx(r.Context(), s.db, func(tx postgresrepo.DBTX) error {
+					var err error
+					_, copiedTags, copiedSummary, copied, err = s.files.WithTx(tx).TryCopyAIMetadataFromCAS(r.Context(), targetFileID)
+					if err != nil || !copied {
+						return err
+					}
+					cursors, err := s.journalWriter.WithTx(tx).BatchRecord(r.Context(), entries)
+					if err != nil {
+						return err
+					}
+					for i, cursor := range cursors {
+						entries[i].Cursor = cursor
+					}
+					return nil
+				})
+			}
+		} else {
+			_, copiedTags, copiedSummary, copied, copyErr = s.files.TryCopyAIMetadataFromCAS(r.Context(), targetFileID)
+		}
+		if copyErr == nil && copied {
+			for _, entry := range entries {
+				s.notifyUser(entry.UserID, wsSync.NotificationEvent{Type: wsSync.EventSyncDelta, Payload: map[string]any{
+					"cursor": entry.Cursor, "file_id": entry.FileID, "action": entry.Action,
+				}})
+			}
 			s.notifyAIMetadataUpdated(userID, fileID, targetFileID, copiedTags, copiedSummary)
 			writeJSON(w, http.StatusOK, map[string]any{
 				"file_id": fileID,
@@ -266,8 +298,22 @@ func (s *Server) HandleGenerateAIInsights(w http.ResponseWriter, r *http.Request
 		summaryStr = &summary
 	}
 
-	if err := s.files.UpdateAIMetadata(r.Context(), targetFileID, tagsStr, summaryStr, nil); err != nil {
-		s.log.Error("failed to update AI metadata", "err", err)
+	entries, err := s.journalEntriesForFile(r.Context(), targetFile, domain.ActionFileUpdated, userID)
+	if err != nil {
+		s.log.Error("failed to resolve AI metadata event recipients", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save AI metadata"})
+		return
+	}
+	var persistErr error
+	if s.db != nil && s.journalWriter != nil {
+		persistErr = s.recordMutationEvents(r.Context(), func(tx postgresrepo.DBTX) error {
+			return s.files.WithTx(tx).UpdateAIMetadata(r.Context(), targetFileID, tagsStr, summaryStr, nil)
+		}, entries)
+	} else {
+		persistErr = s.files.UpdateAIMetadata(r.Context(), targetFileID, tagsStr, summaryStr, nil)
+	}
+	if persistErr != nil {
+		s.log.Error("failed to update AI metadata", "err", persistErr)
 		call.status = http.StatusInternalServerError
 		call.err = errors.New("failed to save AI metadata")
 		writeJSON(w, call.status, map[string]string{"error": call.err.Error()})
@@ -295,13 +341,6 @@ func (s *Server) notifyAIMetadataUpdated(userID, requestedFileID, targetFileID s
 			"summary": summary,
 		},
 	})
-	s.notifyUser(userID, wsSync.NotificationEvent{
-		Type: wsSync.EventSyncDelta,
-		Payload: map[string]any{
-			"file_id": requestedFileID,
-			"action":  domain.ActionFileUpdated,
-		},
-	})
 	if targetFileID != requestedFileID {
 		s.notifyUser(userID, wsSync.NotificationEvent{
 			Type: wsSync.EventAIMetadataReady,
@@ -313,4 +352,3 @@ func (s *Server) notifyAIMetadataUpdated(userID, requestedFileID, targetFileID s
 		})
 	}
 }
-

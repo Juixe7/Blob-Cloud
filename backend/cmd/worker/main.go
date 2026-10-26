@@ -79,6 +79,7 @@ func main() {
 
 	files := postgresrepo.NewFileRepository(db)
 	blocks := postgresrepo.NewBlockRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
 
 	// 3. Notifier (Redis Backplane) ----------------------------------------
 	var notifier wsSync.Notifier = wsSync.NoopNotifier()
@@ -117,7 +118,8 @@ func main() {
 	}
 
 	// 5. File Processor ----------------------------------------------------
-	processor := queue.NewFileProcessor(files, blocks, storageProvider, notifier, aiClient, clamClient, log)
+	processor := queue.NewFileProcessor(files, blocks, storageProvider, notifier, aiClient, clamClient, log).
+		WithDatabase(db).WithJournal(postgresrepo.NewJournalRepository(db)).WithPermissions(perms)
 
 	// 6. Worker Pool -------------------------------------------------------
 	var workerWg sync.WaitGroup

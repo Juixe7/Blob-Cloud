@@ -257,7 +257,8 @@ func (s *Server) HandleRenameMove(w http.ResponseWriter, r *http.Request) {
 			code = http.StatusForbidden
 		} else if strings.Contains(err.Error(), "not found") || errors.Is(err, sql.ErrNoRows) {
 			code = http.StatusNotFound
-		} else if strings.Contains(err.Error(), "cannot move") || strings.Contains(err.Error(), "cycle") {
+		} else if strings.Contains(err.Error(), "cannot move") || strings.Contains(err.Error(), "cycle") ||
+			strings.Contains(err.Error(), "not a directory") || strings.Contains(err.Error(), "folder is deleted") {
 			code = http.StatusBadRequest
 		}
 		writeJSON(w, code, map[string]string{"error": err.Error()})
@@ -426,6 +427,10 @@ func (s *Server) HandleListTrash(w http.ResponseWriter, r *http.Request) {
 
 // HandleGetThumbnail implements GET /api/files/{id}/thumbnail.
 func (s *Server) HandleGetThumbnail(w http.ResponseWriter, r *http.Request) {
+	if s.fileOps == nil || s.storage == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "thumbnail service unavailable"})
+		return
+	}
 	userID, code, msg := s.userFromQueryToken(r)
 	if code != 0 {
 		writeJSON(w, code, map[string]string{"error": msg})
@@ -463,7 +468,9 @@ func (s *Server) HandleGetThumbnail(w http.ResponseWriter, r *http.Request) {
 	defer rc.Close()
 
 	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", "public, max-age=86400")
+	// Thumbnails can contain private file content. Prevent shared-proxy caching
+	// and stale browser reuse after a share is revoked.
+	w.Header().Set("Cache-Control", "private, no-store")
 	if _, err := io.Copy(w, rc); err != nil {
 		s.log.Error("failed to stream thumbnail", "file_id", fileID, "err", err)
 	}
@@ -882,13 +889,13 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 		if idx > startBlockIndex && (idx-startBlockIndex)%16 == 0 {
 			if s.files != nil {
 				f, checkErr := s.files.GetByID(r.Context(), file.ID)
-				if checkErr != nil || f == nil || f.DeletedAt != nil || f.Status == "TRASHED" || f.Status == "QUARANTINED" {
+				if checkErr != nil || f == nil || f.DeletedAt != nil || f.Status != "ACTIVE" {
 					logCtx.Warn("download aborted: file was deleted, trashed, or quarantined during streaming", "block_index", idx)
 					return
 				}
 			} else if s.fileOps != nil {
 				f, checkErr := s.fileOps.GetFileInfo(r.Context(), file.ID)
-				if checkErr != nil || f == nil || f.DeletedAt != nil || f.Status == "TRASHED" || f.Status == "QUARANTINED" {
+				if checkErr != nil || f == nil || f.DeletedAt != nil || f.Status != "ACTIVE" {
 					logCtx.Warn("download aborted: file was deleted, trashed, or quarantined during streaming", "block_index", idx)
 					return
 				}
@@ -940,7 +947,7 @@ func (s *Server) streamSingleFile(w http.ResponseWriter, r *http.Request, file *
 
 // HandleSearchFiles performs hybrid search (keywords, AI tags, summary, and semantic vectors) over accessible files.
 func (s *Server) HandleSearchFiles(w http.ResponseWriter, r *http.Request) {
-	if s.files == nil {
+	if s.files == nil || s.fileOps == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "file search is not configured"})
 		return
 	}
@@ -989,6 +996,7 @@ func (s *Server) HandleSearchFiles(w http.ResponseWriter, r *http.Request) {
 	if results == nil {
 		results = []*domain.File{}
 	}
+	results = filterReadableFiles(r.Context(), userID, results, s.fileOps.AuthoriseRead)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"files": results,
@@ -997,7 +1005,7 @@ func (s *Server) HandleSearchFiles(w http.ResponseWriter, r *http.Request) {
 
 // HandleGetRecentFiles returns the user's recently viewed files.
 func (s *Server) HandleGetRecentFiles(w http.ResponseWriter, r *http.Request) {
-	if s.fileOps == nil {
+	if s.fileOps == nil || s.files == nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "file operations unavailable"})
 		return
 	}
@@ -1018,10 +1026,27 @@ func (s *Server) HandleGetRecentFiles(w http.ResponseWriter, r *http.Request) {
 	if files == nil {
 		files = []*domain.File{}
 	}
+	files = filterReadableFiles(r.Context(), userID, files, s.fileOps.AuthoriseRead)
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"files": files,
 	})
+}
+
+// filterReadableFiles rechecks current effective permissions before returning
+// rows from directory, search, and recent queries, whose SQL predicates may be
+// broader or stale compared with the canonical ACL resolver.
+func filterReadableFiles(ctx context.Context, userID string, files []*domain.File, authorize func(context.Context, string, string) error) []*domain.File {
+	readable := make([]*domain.File, 0, len(files))
+	for _, file := range files {
+		if file == nil || file.ID == "" {
+			continue
+		}
+		if authorize(ctx, userID, file.ID) == nil {
+			readable = append(readable, file)
+		}
+	}
+	return readable
 }
 
 // HandleRecordView records a view for a specific file.

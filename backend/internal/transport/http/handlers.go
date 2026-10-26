@@ -5,13 +5,14 @@ package httpx
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -40,6 +41,7 @@ type JournalStore interface {
 // Server bundles handler dependencies. It is passed to route registration so
 // every handler shares the same injected storage provider and logger.
 type Server struct {
+	db      *sql.DB
 	storage domain.StorageProvider
 	log     *slog.Logger
 	// Phase 3: orchestration + sharing. These are nil when the DB is
@@ -69,7 +71,8 @@ type Server struct {
 	// the DB is absent so handlers always have a non-nil logger to call.
 	auditLog auditLogger
 	// Phase 2: Delta Sync Engine journal store
-	journal JournalStore
+	journal       JournalStore
+	journalWriter *postgresrepo.JournalRepository
 }
 
 // NewServer constructs a Server with its dependencies injected.
@@ -180,7 +183,100 @@ func (s *Server) WithAudit(l audit.Logger) *Server {
 // WithJournal wires the delta sync journal repository.
 func (s *Server) WithJournal(journal JournalStore) *Server {
 	s.journal = journal
+	if writer, ok := journal.(*postgresrepo.JournalRepository); ok {
+		s.journalWriter = writer
+	}
 	return s
+}
+
+func (s *Server) WithDatabase(db *sql.DB) *Server {
+	s.db = db
+	return s
+}
+
+func (s *Server) recordMutationEvents(ctx context.Context, mutate func(postgresrepo.DBTX) error, entries []*domain.JournalEntry) error {
+	if s.db == nil || s.journalWriter == nil {
+		return errors.New("transactional journal is unavailable")
+	}
+	err := postgresrepo.RunInTx(ctx, s.db, func(tx postgresrepo.DBTX) error {
+		if err := mutate(tx); err != nil {
+			return err
+		}
+		if len(entries) == 0 {
+			return nil
+		}
+		cursors, err := s.journalWriter.WithTx(tx).BatchRecord(ctx, entries)
+		if err != nil {
+			return fmt.Errorf("record mutation journal: %w", err)
+		}
+		for i, cursor := range cursors {
+			entries[i].Cursor = cursor
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		s.notifyUser(entry.UserID, sync.NotificationEvent{Type: sync.EventSyncDelta, Payload: map[string]any{
+			"cursor": entry.Cursor, "file_id": entry.FileID, "action": entry.Action,
+		}})
+	}
+	return nil
+}
+
+func (s *Server) requireSharePermissionInTx(ctx context.Context, tx postgresrepo.DBTX, fileID, userID, userEmail string) (*domain.File, error) {
+	file, err := s.files.WithTx(tx).GetByID(ctx, fileID)
+	if err != nil {
+		return nil, err
+	}
+	if file.UserID != userID {
+		allowed, err := s.perms.WithTx(tx).CheckUserPermission(ctx, fileID, userEmail, []string{domain.RoleOwner, domain.RoleEditor})
+		if err != nil {
+			return nil, err
+		}
+		if !allowed {
+			return nil, errors.New("share permission revoked")
+		}
+	}
+	// The effective grant is locked above for collaborators; lock the file row
+	// afterward so lifecycle changes cannot race the authorized mutation. Keep
+	// this grant-then-file order consistent across ACL mutation handlers.
+	return s.files.WithTx(tx).GetByIDForUpdate(ctx, fileID)
+}
+
+func isShortcutFile(file *domain.File) bool {
+	if file == nil {
+		return false
+	}
+	return (file.TargetID != nil && *file.TargetID != "") ||
+		(file.ShortcutTargetID != nil && *file.ShortcutTargetID != "")
+}
+
+func (s *Server) journalEntriesForFile(ctx context.Context, file *domain.File, action string, actorID string) ([]*domain.JournalEntry, error) {
+	ids := map[string]struct{}{}
+	if file != nil && file.UserID != "" {
+		ids[file.UserID] = struct{}{}
+	}
+	if actorID != "" {
+		ids[actorID] = struct{}{}
+	}
+	if s.perms != nil && file != nil {
+		collaborators, err := s.perms.FindCollaboratorUserIDs(ctx, file.ID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve journal recipients: %w", err)
+		}
+		for _, id := range collaborators {
+			if id != "" {
+				ids[id] = struct{}{}
+			}
+		}
+	}
+	entries := make([]*domain.JournalEntry, 0, len(ids))
+	for id := range ids {
+		entries = append(entries, shareJournalEntries(file, action, id)...)
+	}
+	return entries, nil
 }
 
 // HandleHealth serves a 200 OK text response. Standard endpoint for ECS ALBss check.
@@ -188,56 +284,46 @@ func (s *Server) HandleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// HandlePutBlock simulates an S3 direct PUT upload. The client streams the raw
-// block bytes in the request body; we persist them via the storage provider
-// under the "blocks/<hash>" key derived from the route parameter.
-func (s *Server) HandlePutBlock(w http.ResponseWriter, r *http.Request) {
-	hash := chi.URLParam(r, "hash")
-	if hash == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing block hash"})
-		return
-	}
-
-	key := "blocks/" + hash
-	// r.Body content type/length are honoured by the local driver; for S3 we
-	// would pass them through as object metadata.
-	contentType := r.Header.Get("Content-Type")
-	if err := s.storage.PutObject(r.Context(), key, r.Body, r.ContentLength, contentType); err != nil {
-		// A missing/invalid path (e.g. traversal) surfaces as a path error.
-		if errors.Is(err, fs.ErrInvalid) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid block hash"})
-			return
-		}
-		s.log.Error("put block failed", "hash", hash, "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed"})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"hash":   hash,
-		"status": "stored",
-	})
-}
-
 // HandlePutStagingBlock handles PUT /local-storage/staging/{session_id}/{index}.
 // Stores unverified upload chunks in the staging area until cryptographic verification.
 func (s *Server) HandlePutStagingBlock(w http.ResponseWriter, r *http.Request) {
 	sessionID := chi.URLParam(r, "session_id")
-	index := chi.URLParam(r, "index")
-	if sessionID == "" || index == "" {
+	indexText := chi.URLParam(r, "index")
+	if sessionID == "" || indexText == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing staging parameters"})
 		return
 	}
+	index, err := strconv.Atoi(indexText)
+	if err != nil || index < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid staging index"})
+		return
+	}
 
-	key := fmt.Sprintf("staging/%s/%s", sessionID, index)
-	contentType := r.Header.Get("Content-Type")
-	if err := s.storage.PutObject(r.Context(), key, r.Body, r.ContentLength, contentType); err != nil {
-		if errors.Is(err, fs.ErrInvalid) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid staging path"})
-			return
+	validator, ok := s.storage.(domain.StagingUploadURLValidator)
+	if !ok {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "local staging uploads are unavailable"})
+		return
+	}
+	expiresAt, err := strconv.ParseInt(r.URL.Query().Get("expires"), 10, 64)
+	key := fmt.Sprintf("staging/%s/%d", sessionID, index)
+	if err != nil || !validator.ValidateStagingUploadURL(key, expiresAt, r.URL.Query().Get("signature")) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "invalid or expired staging upload URL"})
+		return
+	}
+	if s.uploads == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "upload service unavailable"})
+		return
+	}
+	if err := s.uploads.StoreStagingBlock(r.Context(), sessionID, index, r.Body, r.Header.Get("Content-Type")); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, service.ErrStagingStorage) {
+			status = http.StatusInternalServerError
+		} else if errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "session is not active") {
+			status = http.StatusConflict
 		}
-		s.log.Error("put staging block failed", "key", key, "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload failed"})
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -269,4 +355,3 @@ func getAppBaseURL() string {
 	}
 	return "https://blobcloud.dev"
 }
-

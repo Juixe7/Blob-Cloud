@@ -33,6 +33,28 @@ func testDSN() string {
 	return "postgres://postgres:postgres@localhost:5432/godrive?sslmode=disable"
 }
 
+func TestFilterReadableFilesUsesCurrentAuthorization(t *testing.T) {
+	files := []*domain.File{
+		{ID: "owned"},
+		{ID: "revoked-share"},
+		{ID: "inherited-share"},
+		nil,
+		{ID: ""},
+	}
+	got := filterReadableFiles(context.Background(), "viewer", files, func(_ context.Context, userID, fileID string) error {
+		if userID != "viewer" {
+			t.Fatalf("authorization called for user %q", userID)
+		}
+		if fileID == "revoked-share" {
+			return errors.New("access denied")
+		}
+		return nil
+	})
+	if len(got) != 2 || got[0].ID != "owned" || got[1].ID != "inherited-share" {
+		t.Fatalf("filterReadableFiles() = %#v, want only currently authorized files", got)
+	}
+}
+
 func TestDownloadRangeRequest(t *testing.T) {
 	// Connect to database
 	db, err := sql.Open("pgx", testDSN())
@@ -267,9 +289,6 @@ type testMemStorage struct {
 	objects map[string][]byte
 }
 
-func (s *testMemStorage) GenerateUploadURL(ctx context.Context, blockHash string, expires time.Duration) (string, error) {
-	return "", nil
-}
 func (s *testMemStorage) PutObject(ctx context.Context, key string, reader io.Reader, size int64, contentType string) error {
 	return nil
 }
@@ -417,11 +436,11 @@ func (m *memFileStore) GetFileByNameAndParent(context.Context, string, string, *
 func (m *memFileStore) GetFolderByNameAndParent(context.Context, string, string, *string) (*domain.File, error) {
 	return nil, sql.ErrNoRows
 }
-func (m *memFileStore) Create(context.Context, *domain.File) error                 { return nil }
-func (m *memFileStore) Update(context.Context, *domain.File) error                 { return nil }
-func (m *memFileStore) SoftDelete(context.Context, string, string) error           { return nil }
-func (m *memFileStore) Restore(context.Context, string, string) error              { return nil }
-func (m *memFileStore) ListTrash(context.Context, string) ([]*domain.File, error)  { return nil, nil }
+func (m *memFileStore) Create(context.Context, *domain.File) error                { return nil }
+func (m *memFileStore) Update(context.Context, *domain.File) error                { return nil }
+func (m *memFileStore) SoftDelete(context.Context, string, string) error          { return nil }
+func (m *memFileStore) Restore(context.Context, string, string) error             { return nil }
+func (m *memFileStore) ListTrash(context.Context, string) ([]*domain.File, error) { return nil, nil }
 func (m *memFileStore) DeleteRecursive(context.Context, string, string) (int64, []string, error) {
 	return 0, nil, nil
 }
@@ -605,7 +624,8 @@ func TestDownload_IDORAndRBACBoundaries(t *testing.T) {
 
 	storage := &testMemStorage{
 		objects: map[string][]byte{
-			"blocks/hash-private": bytes.Repeat([]byte("SECRET_TAX_DATA_"), 32), // 512 bytes
+			"blocks/hash-private":               bytes.Repeat([]byte("SECRET_TAX_DATA_"), 32), // 512 bytes
+			"thumbnails/alice-private-file.png": []byte("private-thumbnail"),
 		},
 	}
 	blockStore := &memBlockStore{
@@ -652,6 +672,13 @@ func TestDownload_IDORAndRBACBoundaries(t *testing.T) {
 	srv.HandleDownload(wViewerDL, reqViewerDL)
 	if wViewerDL.Code != http.StatusOK || wViewerDL.Body.Len() != 512 {
 		t.Fatalf("Viewer download: expected 200 OK with 512 bytes, got status %d (%d bytes)", wViewerDL.Code, wViewerDL.Body.Len())
+	}
+	viewerThumb := httptest.NewRequest(http.MethodGet, "/api/files/alice-private-file/thumbnail?token="+viewerTok, nil)
+	viewerThumb = viewerThumb.WithContext(context.WithValue(viewerThumb.Context(), chi.RouteCtxKey, rctx))
+	wViewerThumb := httptest.NewRecorder()
+	srv.HandleGetThumbnail(wViewerThumb, viewerThumb)
+	if wViewerThumb.Code != http.StatusOK || wViewerThumb.Header().Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("Viewer thumbnail: status=%d cache-control=%q; want private, no-store", wViewerThumb.Code, wViewerThumb.Header().Get("Cache-Control"))
 	}
 
 	reqViewerWrite := httptest.NewRequest(http.MethodPut, "/api/files/alice-private-file/thumbnail", bytes.NewReader([]byte("fake-image")))
@@ -821,5 +848,3 @@ func FuzzSanitiseFilename(f *testing.F) {
 		}
 	})
 }
-
-

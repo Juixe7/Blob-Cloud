@@ -52,7 +52,13 @@ func (s *Server) HandleInitiateUpload(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.uploads.Initiate(r.Context(), req)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "access denied") {
+			status = http.StatusForbidden
+		} else if strings.Contains(err.Error(), "destination folder not found") || errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusCreated, resp)

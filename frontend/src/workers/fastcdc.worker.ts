@@ -353,5 +353,3 @@ self.onmessage = async (e: MessageEvent<FastCDCWorkerRequest>) => {
     ;(self as unknown as Worker).postMessage(msg)
   }
 }
-
-export {}

@@ -1,6 +1,8 @@
 package httpx
 
 import (
+	"database/sql"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -81,6 +83,7 @@ func (s *Server) HandleListFiles(w http.ResponseWriter, r *http.Request) {
 	if items == nil {
 		items = []*domain.File{}
 	}
+	items = filterReadableFiles(r.Context(), userID, items, s.fileOps.AuthoriseRead)
 
 	if filter != "shared" && len(items) > 0 && s.users != nil {
 		if u, err := s.users.GetByID(r.Context(), userID); err == nil && u != nil {
@@ -150,6 +153,18 @@ func (s *Server) HandleCreateFolder(w http.ResponseWriter, r *http.Request) {
 		// Detect a bad/missing parent_id foreign-key violation -> 400.
 		if strings.Contains(err.Error(), "23503") || strings.Contains(strings.ToLower(err.Error()), "foreign key") {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "parent folder not found"})
+			return
+		}
+		if strings.Contains(err.Error(), "access denied") {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "access denied to destination folder"})
+			return
+		}
+		if strings.Contains(err.Error(), "destination folder not found") || errors.Is(err, sql.ErrNoRows) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "parent folder not found"})
+			return
+		}
+		if strings.Contains(err.Error(), "not a directory") || strings.Contains(err.Error(), "folder is deleted") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid destination folder"})
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create folder"})
@@ -264,7 +279,16 @@ func (s *Server) HandleBulkMove(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := s.fileOps.BulkMove(r.Context(), userID, req); err != nil {
 		s.log.Error("bulk move failed", "user_id", userID, "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "bulk move failed"})
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "access denied") {
+			status = http.StatusForbidden
+		} else if strings.Contains(err.Error(), "not found") || errors.Is(err, sql.ErrNoRows) {
+			status = http.StatusNotFound
+		} else if strings.Contains(err.Error(), "not a directory") || strings.Contains(err.Error(), "folder is deleted") ||
+			strings.Contains(err.Error(), "cannot move") || strings.Contains(err.Error(), "cycle") {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "bulk move succeeded"})

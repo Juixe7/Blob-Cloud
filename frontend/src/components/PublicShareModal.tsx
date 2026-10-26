@@ -17,21 +17,21 @@ interface PublicShareModalProps {
 export function PublicShareModal({ open, onClose, file }: PublicShareModalProps) {
   const { push } = useToast()
   
-  const [accessTier, setAccessTier] = useState<'VIEWER' | 'EDITOR'>('VIEWER')
   const [password, setPassword] = useState('')
   const [expiresInDays, setExpiresInDays] = useState('0')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   
   const [generatedUrl, setGeneratedUrl] = useState<string | null>(null)
+  const [linkToken, setLinkToken] = useState<string | null>(null)
 
   useEffect(() => {
     if (open) {
-      setAccessTier('VIEWER')
       setPassword('')
       setExpiresInDays('0')
       setError(null)
       setGeneratedUrl(null)
+      setLinkToken(null)
     }
   }, [open, file])
 
@@ -51,15 +51,32 @@ export function PublicShareModal({ open, onClose, file }: PublicShareModalProps)
     }
 
     try {
-      const res = await apiClient.post<{ share_url: string }>(`/files/${file.id}/links`, {
-        access_tier: accessTier,
+      const res = await apiClient.post<{ share_url: string; link_token: string }>(`/files/${file.id}/links`, {
+        access_tier: 'VIEWER',
         password: password || undefined,
         expires_at: expiresAt,
       })
       setGeneratedUrl(res.data.share_url)
+      setLinkToken(res.data.link_token)
       push({ message: 'Public link generated.', variant: 'success' })
     } catch (err: any) {
       setError(err.response?.data?.error || 'Failed to generate public link')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleRevoke = async () => {
+    if (!linkToken) return
+    setLoading(true)
+    setError(null)
+    try {
+      await apiClient.delete(`/files/${file.id}/links/${encodeURIComponent(linkToken)}`)
+      setGeneratedUrl(null)
+      setLinkToken(null)
+      push({ message: 'Public link revoked.', variant: 'success' })
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'Failed to revoke public link')
     } finally {
       setLoading(false)
     }
@@ -86,19 +103,7 @@ export function PublicShareModal({ open, onClose, file }: PublicShareModalProps)
 
         {!generatedUrl ? (
           <form onSubmit={handleGenerate} className="space-y-4">
-            <div>
-              <label className="mb-1.5 block text-sm font-medium text-slate-700 dark:text-zinc-300">
-                Access Tier
-              </label>
-              <select
-                value={accessTier}
-                onChange={(e) => setAccessTier(e.target.value as any)}
-                className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 dark:border-zinc-700 dark:bg-[#15181e] dark:text-zinc-100 dark:focus:border-amber-500 dark:focus:ring-amber-500/50"
-              >
-                <option value="VIEWER">Viewer (Read-only)</option>
-                <option value="EDITOR">Editor (Can modify)</option>
-              </select>
-            </div>
+            <p className="text-sm text-slate-500 dark:text-zinc-400">Public links provide read-only access.</p>
 
             <div>
               <label className="mb-1.5 block text-sm font-medium text-slate-700 dark:text-zinc-300">
@@ -163,6 +168,11 @@ export function PublicShareModal({ open, onClose, file }: PublicShareModalProps)
             )}
 
             <div className="flex justify-end pt-2">
+              {linkToken && (
+                <Button type="button" variant="secondary" onClick={handleRevoke} disabled={loading}>
+                  {loading ? <Spinner /> : 'Revoke Link'}
+                </Button>
+              )}
               <Button type="button" variant="secondary" onClick={onClose}>
                 Done
               </Button>

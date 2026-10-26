@@ -2,6 +2,7 @@ package postgresrepo_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"testing"
 	"time"
@@ -9,6 +10,133 @@ import (
 	"go-drive-clone/internal/domain"
 	postgresrepo "go-drive-clone/internal/repository/postgres"
 )
+
+func TestGetByIDForUpdateSerializesWithDeletion(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	suffix := time.Now().UnixNano()
+	owner := &domain.User{Email: fmt.Sprintf("row-lock-owner-%d@example.com", suffix), PasswordHash: "hash", IsVerified: true}
+	if err := postgresrepo.NewUserRepository(db).Create(ctx, owner); err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	defer db.ExecContext(context.Background(), "DELETE FROM users WHERE id = $1", owner.ID)
+
+	file := &domain.File{UserID: owner.ID, Name: fmt.Sprintf("row-lock-file-%d.txt", suffix), Status: "ACTIVE"}
+	files := postgresrepo.NewFileRepository(db)
+	if err := files.Create(ctx, file); err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+	defer db.ExecContext(context.Background(), "DELETE FROM files WHERE id = $1", file.ID)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin lock transaction: %v", err)
+	}
+	defer tx.Rollback()
+	if _, err := files.WithTx(tx).GetByIDForUpdate(ctx, file.ID); err != nil {
+		t.Fatalf("lock file row: %v", err)
+	}
+
+	started := make(chan struct{})
+	updated := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := db.ExecContext(ctx, "UPDATE files SET deleted_at = NOW() WHERE id = $1", file.ID)
+		updated <- err
+	}()
+	<-started
+	select {
+	case err := <-updated:
+		t.Fatalf("concurrent deletion passed row lock before transaction commit: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit lock transaction: %v", err)
+	}
+	select {
+	case err := <-updated:
+		if err != nil {
+			t.Fatalf("deletion after lock release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("deletion remained blocked after lock transaction committed")
+	}
+	var deletedAt sql.NullTime
+	if err := db.QueryRowContext(ctx, "SELECT deleted_at FROM files WHERE id = $1", file.ID).Scan(&deletedAt); err != nil || !deletedAt.Valid {
+		t.Fatalf("expected deletion to commit after the lock: deleted=%v err=%v", deletedAt.Valid, err)
+	}
+}
+
+func TestPermissionRowForUpdateSerializesRoleChanges(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	freshSchema(t, db)
+	ctx := context.Background()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
+	suffix := time.Now().UnixNano()
+	owner := &domain.User{Email: fmt.Sprintf("role-lock-owner-%d@example.com", suffix), PasswordHash: "hash"}
+	grantee := &domain.User{Email: fmt.Sprintf("role-lock-grantee-%d@example.com", suffix), PasswordHash: "hash"}
+	for _, user := range []*domain.User{owner, grantee} {
+		if err := users.Create(ctx, user); err != nil {
+			t.Fatalf("create user: %v", err)
+		}
+	}
+	file := &domain.File{UserID: owner.ID, Name: fmt.Sprintf("role-lock-%d.txt", suffix), Status: "ACTIVE"}
+	if err := files.Create(ctx, file); err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+	if err := perms.GrantPermission(ctx, &domain.Permission{
+		FileID: file.ID, GranteeEmail: grantee.Email, Role: domain.RoleViewer,
+		Status: domain.PermissionStatusAccepted,
+	}); err != nil {
+		t.Fatalf("grant permission: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+	locked, err := perms.WithTx(tx).GetPermissionByFileAndGranteeForUpdate(ctx, file.ID, grantee.Email)
+	if err != nil || locked.Role != domain.RoleViewer {
+		t.Fatalf("lock grant: grant=%+v err=%v", locked, err)
+	}
+	started := make(chan struct{})
+	updated := make(chan error, 1)
+	go func() {
+		close(started)
+		updated <- perms.UpdatePermission(ctx, file.ID, grantee.Email, domain.RoleOwner)
+	}()
+	<-started
+	select {
+	case err := <-updated:
+		t.Fatalf("concurrent role change passed row lock before transaction commit: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit lock transaction: %v", err)
+	}
+	select {
+	case err := <-updated:
+		if err != nil {
+			t.Fatalf("role change after lock release: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("role change remained blocked after transaction committed")
+	}
+	grant, err := perms.GetPermissionByFileAndGranteeForUpdate(ctx, file.ID, grantee.Email)
+	if err != nil {
+		t.Fatalf("load changed grant: %v", err)
+	}
+	if grant.Role != domain.RoleOwner {
+		t.Fatalf("role = %q, want OWNER after waiting writer commits", grant.Role)
+	}
+}
 
 func TestShareInvitationsWorkflow(t *testing.T) {
 	db := openDB(t)
@@ -212,5 +340,77 @@ func TestShareInvitationsWorkflow(t *testing.T) {
 	}
 	if !childCollabMap[owner.ID] || !childCollabMap[recipient.ID] {
 		t.Errorf("expected both owner and recipient for child file via inherited folder perm, got %v", childCollabs)
+	}
+}
+
+func TestPermissionCheckShareLockSerializesWithRevoke(t *testing.T) {
+	db := openDB(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	suffix := time.Now().UnixNano()
+	users := postgresrepo.NewUserRepository(db)
+	files := postgresrepo.NewFileRepository(db)
+	perms := postgresrepo.NewPermissionRepository(db)
+	owner := &domain.User{Email: fmt.Sprintf("acl-lock-owner-%d@example.com", suffix), PasswordHash: "hash", IsVerified: true}
+	if err := users.Create(ctx, owner); err != nil {
+		t.Fatalf("create owner: %v", err)
+	}
+	defer db.ExecContext(context.Background(), "DELETE FROM users WHERE id = $1", owner.ID)
+
+	grantee := &domain.User{Email: fmt.Sprintf("acl-lock-grantee-%d@example.com", suffix), PasswordHash: "hash", IsVerified: true}
+	if err := users.Create(ctx, grantee); err != nil {
+		t.Fatalf("create grantee: %v", err)
+	}
+	defer db.ExecContext(context.Background(), "DELETE FROM users WHERE id = $1", grantee.ID)
+
+	file := &domain.File{UserID: owner.ID, Name: fmt.Sprintf("acl-lock-file-%d.txt", suffix), Status: "ACTIVE"}
+	if err := files.Create(ctx, file); err != nil {
+		t.Fatalf("create file: %v", err)
+	}
+	defer db.ExecContext(context.Background(), "DELETE FROM files WHERE id = $1", file.ID)
+	if err := perms.GrantPermission(ctx, &domain.Permission{
+		FileID: file.ID, GranteeEmail: grantee.Email, Role: domain.RoleEditor,
+		Status: domain.PermissionStatusAccepted,
+	}); err != nil {
+		t.Fatalf("grant permission: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin mutation transaction: %v", err)
+	}
+	defer tx.Rollback()
+	allowed, err := perms.WithTx(tx).CheckUserPermission(ctx, file.ID, grantee.Email, []string{domain.RoleEditor})
+	if err != nil || !allowed {
+		t.Fatalf("transactional permission check: allowed=%v err=%v", allowed, err)
+	}
+
+	started := make(chan struct{})
+	revoked := make(chan error, 1)
+	go func() {
+		close(started)
+		revoked <- perms.RevokePermission(ctx, file.ID, grantee.Email)
+	}()
+	<-started
+	select {
+	case err := <-revoked:
+		t.Fatalf("revoke passed permission row lock before mutation commit: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit mutation transaction: %v", err)
+	}
+	select {
+	case err := <-revoked:
+		if err != nil {
+			t.Fatalf("revoke after mutation commit: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("revoke remained blocked after mutation transaction committed")
+	}
+	allowed, err = perms.CheckUserPermission(ctx, file.ID, grantee.Email, []string{domain.RoleEditor})
+	if err != nil || allowed {
+		t.Fatalf("permission after revoke: allowed=%v err=%v", allowed, err)
 	}
 }

@@ -31,6 +31,19 @@ type fakeFileRepo struct {
 	insertedChunks map[string][]*domain.FileChunk
 }
 
+type fakeScanner struct {
+	clean bool
+	virus string
+	err   error
+}
+
+func (s fakeScanner) ScanStream(_ context.Context, r io.Reader) (bool, string, error) {
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return false, "", err
+	}
+	return s.clean, s.virus, s.err
+}
+
 func (f *fakeFileRepo) UpdateAIMetadata(ctx context.Context, id string, tags, summary *string, embedding []float32) error {
 	if f.updatedTags == nil {
 		f.updatedTags = make(map[string]*string)
@@ -49,6 +62,17 @@ func (f *fakeFileRepo) UpdateStatus(ctx context.Context, id string, status strin
 	}
 	f.updatedStatus[id] = status
 	return nil
+}
+
+func (f *fakeFileRepo) UpdateProcessingStatus(_ context.Context, id string, _ time.Time, status string) (bool, error) {
+	if _, ok := f.files[id]; !ok {
+		return false, nil
+	}
+	if f.updatedStatus == nil {
+		f.updatedStatus = make(map[string]string)
+	}
+	f.updatedStatus[id] = status
+	return true, nil
 }
 
 func (f *fakeFileRepo) InsertFileChunks(ctx context.Context, chunks []*domain.FileChunk) error {
@@ -98,9 +122,6 @@ func newMemStorage() *memStorage {
 	return &memStorage{objects: map[string][]byte{}}
 }
 
-func (m *memStorage) GenerateUploadURL(context.Context, string, time.Duration) (string, error) {
-	return "", nil
-}
 func (m *memStorage) PutObject(_ context.Context, key string, reader io.Reader, _ int64, _ string) error {
 	if m.putErr != nil {
 		return m.putErr
@@ -281,6 +302,7 @@ func TestProcessMessage_NonImageFileSkipped(t *testing.T) {
 		files:   &fakeFileRepo{files: map[string]*domain.File{"f1": {ID: "f1", Name: "report.pdf"}}},
 		blocks:  &fakeBlockRepo{},
 		storage: storage,
+		clamAV:  fakeScanner{clean: true},
 		log:     testLogger(),
 	}
 
@@ -304,6 +326,7 @@ func TestProcessMessage_GeneratesAndUploadsThumbnail(t *testing.T) {
 		files:   &fakeFileRepo{files: map[string]*domain.File{"f1": {ID: "f1", Name: "cat.png"}}},
 		blocks:  &fakeBlockRepo{hashes: map[string][]string{"f1": {"hash-abc"}}},
 		storage: storage,
+		clamAV:  fakeScanner{clean: true},
 		log:     testLogger(),
 	}
 
@@ -337,10 +360,11 @@ func TestProcessMessage_MultipleBlocksAssembledInOrder(t *testing.T) {
 	storage.objects["blocks/p2"] = parts[2]
 
 	proc := &FileProcessor{
-		files:  &fakeFileRepo{files: map[string]*domain.File{"f1": {ID: "f1", Name: "multi.png"}}},
-		blocks: &fakeBlockRepo{hashes: map[string][]string{"f1": {"p0", "p1", "p2"}}},
+		files:   &fakeFileRepo{files: map[string]*domain.File{"f1": {ID: "f1", Name: "multi.png"}}},
+		blocks:  &fakeBlockRepo{hashes: map[string][]string{"f1": {"p0", "p1", "p2"}}},
 		storage: storage,
-		log:    testLogger(),
+		clamAV:  fakeScanner{clean: true},
+		log:     testLogger(),
 	}
 
 	if err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "f1"}); err != nil {
@@ -371,11 +395,55 @@ func TestProcessMessage_BlockFetchError(t *testing.T) {
 		files:   &fakeFileRepo{files: map[string]*domain.File{"f1": {ID: "f1", Name: "pic.png"}}},
 		blocks:  &fakeBlockRepo{hashes: map[string][]string{"f1": {"nope"}}},
 		storage: storage,
+		clamAV:  fakeScanner{clean: true},
 		log:     testLogger(),
 	}
 	err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "f1"})
 	if err == nil {
 		t.Fatal("expected error when block fetch fails, got nil")
+	}
+}
+
+func TestProcessMessage_ScannerUnavailableKeepsFilePending(t *testing.T) {
+	f := &fakeFileRepo{files: map[string]*domain.File{"f1": {ID: "f1", Name: "notes.txt", Status: "PROCESSING"}}}
+	proc := &FileProcessor{files: f, blocks: &fakeBlockRepo{}, storage: newMemStorage(), log: testLogger()}
+	if err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "f1"}); err == nil {
+		t.Fatal("expected unavailable scanner to fail the job")
+	}
+	if got := f.updatedStatus["f1"]; got == "ACTIVE" {
+		t.Fatal("file became ACTIVE without a scanner")
+	}
+}
+
+func TestProcessMessage_ScanErrorKeepsFilePending(t *testing.T) {
+	storage := newMemStorage()
+	storage.objects["blocks/test"] = []byte("payload")
+	f := &fakeFileRepo{files: map[string]*domain.File{"f1": {ID: "f1", Name: "notes.txt", Status: "PROCESSING"}}}
+	proc := &FileProcessor{
+		files: f, blocks: &fakeBlockRepo{hashes: map[string][]string{"f1": {"test"}}}, storage: storage,
+		clamAV: fakeScanner{err: errors.New("scanner timeout")}, log: testLogger(),
+	}
+	if err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "f1"}); err == nil {
+		t.Fatal("expected scanner error to retry the job")
+	}
+	if got := f.updatedStatus["f1"]; got == "ACTIVE" || got == "QUARANTINED" {
+		t.Fatalf("scan error produced terminal status %q", got)
+	}
+}
+
+func TestProcessMessage_InfectedFileIsQuarantined(t *testing.T) {
+	storage := newMemStorage()
+	storage.objects["blocks/test"] = []byte("malware sample")
+	f := &fakeFileRepo{files: map[string]*domain.File{"f1": {ID: "f1", UserID: "u1", Name: "sample.txt", Status: "PROCESSING"}}}
+	proc := &FileProcessor{
+		files: f, blocks: &fakeBlockRepo{hashes: map[string][]string{"f1": {"test"}}},
+		storage: storage, clamAV: fakeScanner{clean: false, virus: "Test.Malware"}, log: testLogger(),
+	}
+	if err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "f1"}); err != nil {
+		t.Fatalf("ProcessMessage: %v", err)
+	}
+	if got := f.updatedStatus["f1"]; got != "QUARANTINED" {
+		t.Fatalf("status = %q, want QUARANTINED", got)
 	}
 }
 
@@ -399,11 +467,11 @@ func TestProcessMessage_LargeFileSkipsAssembly(t *testing.T) {
 	}
 
 	err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "large-1"})
-	if err != nil {
-		t.Fatalf("expected nil error for large file bypass, got: %v", err)
+	if err == nil {
+		t.Fatal("expected scanning to fail when blocks cannot be read")
 	}
-	if fakeFiles.updatedStatus["large-1"] != "ACTIVE" {
-		t.Fatalf("expected status to be set to ACTIVE, got: %s", fakeFiles.updatedStatus["large-1"])
+	if fakeFiles.updatedStatus["large-1"] == "ACTIVE" {
+		t.Fatal("file was activated without a successful scan")
 	}
 }
 
@@ -423,15 +491,16 @@ func TestProcessMessage_NonImageNonDocSkipsAssembly(t *testing.T) {
 		files:   fakeFiles,
 		blocks:  failingBlocks,
 		storage: newMemStorage(),
+		clamAV:  fakeScanner{clean: true},
 		log:     testLogger(),
 	}
 
 	err := proc.ProcessMessage(context.Background(), ThumbnailMessage{FileID: "zip-1"})
-	if err != nil {
-		t.Fatalf("expected nil error for non-processable file bypass, got: %v", err)
+	if err == nil {
+		t.Fatal("expected scanning to fail when blocks cannot be read")
 	}
-	if fakeFiles.updatedStatus["zip-1"] != "ACTIVE" {
-		t.Fatalf("expected status to be set to ACTIVE, got: %s", fakeFiles.updatedStatus["zip-1"])
+	if fakeFiles.updatedStatus["zip-1"] == "ACTIVE" {
+		t.Fatal("file was activated without a successful scan")
 	}
 }
 
@@ -477,6 +546,7 @@ func TestProcessMessage_DocumentWithAIClientGeneratesSummaryAndTags(t *testing.T
 		files:    fakeFiles,
 		blocks:   fakeBlocks,
 		storage:  storage,
+		clamAV:   fakeScanner{clean: true},
 		aiClient: mockAI,
 		log:      testLogger(),
 	}
@@ -526,6 +596,7 @@ func TestProcessMessage_MissingAIClientLeavesSummaryNull(t *testing.T) {
 		files:    fakeFiles,
 		blocks:   fakeBlocks,
 		storage:  storage,
+		clamAV:   fakeScanner{clean: true},
 		aiClient: nil,
 		log:      testLogger(),
 	}

@@ -351,7 +351,7 @@ export function useWebSocket({
       socketRef.current = null
       setStatus('DISCONNECTED')
     }
-  }, [url, token, enabled, retryTrigger, clearReconnectTimer])
+  }, [url, token, enabled, retryTrigger, clearReconnectTimer, pushToast])
 
   return { status, isCircuitBroken, retry }
 }

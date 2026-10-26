@@ -200,4 +200,3 @@ type FileChunk struct {
 	ChunkText  string
 	Embedding  []float32
 }
-

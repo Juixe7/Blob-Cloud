@@ -1,7 +1,7 @@
 import { type FormEvent, useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { apiClient } from '../lib/api'
-import { extractError } from '../context/AuthContext'
+import { extractError } from '../lib/errors'
 import { useToast } from '../components/Toast'
 import { Button } from '../components/ui/Button'
 import { Input } from '../components/ui/Input'

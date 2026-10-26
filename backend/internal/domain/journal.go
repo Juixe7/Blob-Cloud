@@ -7,13 +7,20 @@ import (
 
 // Journal action constants representing specific file mutations.
 const (
-	ActionFileCreated  = "FILE_CREATED"
-	ActionFileUpdated  = "FILE_UPDATED"
-	ActionFileRenamed  = "FILE_RENAMED"
-	ActionFileMoved    = "FILE_MOVED"
-	ActionFileTrashed  = "FILE_TRASHED"
-	ActionFileRestored = "FILE_RESTORED"
-	ActionFileDeleted  = "FILE_DELETED"
+	ActionFileCreated       = "FILE_CREATED"
+	ActionFileUpdated       = "FILE_UPDATED"
+	ActionFileRenamed       = "FILE_RENAMED"
+	ActionFileMoved         = "FILE_MOVED"
+	ActionFileTrashed       = "FILE_TRASHED"
+	ActionFileRestored      = "FILE_RESTORED"
+	ActionFileDeleted       = "FILE_DELETED"
+	ActionShareInvitation   = "SHARE_INVITATION"
+	ActionShareUpdated      = "SHARE_UPDATED"
+	ActionShareRevoked      = "SHARE_REVOKED"
+	ActionShareAccepted     = "SHARE_ACCEPTED"
+	ActionShareDeclined     = "SHARE_DECLINED"
+	ActionPublicLinkCreated = "PUBLIC_LINK_CREATED"
+	ActionPublicLinkRevoked = "PUBLIC_LINK_REVOKED"
 )
 
 // JournalEntry represents a single change entry in the monotonic append-only delta log.

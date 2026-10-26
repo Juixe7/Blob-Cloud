@@ -10,6 +10,7 @@ import {
 } from 'react'
 import axios from 'axios'
 import { apiClient } from '../lib/api'
+import { extractError } from '../lib/errors'
 import {
   clearTokens,
   decodeUser,
@@ -51,16 +52,6 @@ export interface AuthContextValue {
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined)
-
-/** Normalize an Axios error into a single readable string. */
-export function extractError(err: unknown, fallback: string): string {
-  if (axios.isAxiosError(err)) {
-    const data = err.response?.data as { error?: string; message?: string } | undefined
-    return data?.error || data?.message || err.message || fallback
-  }
-  if (err instanceof Error) return err.message
-  return fallback
-}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(() => getAccessToken())
