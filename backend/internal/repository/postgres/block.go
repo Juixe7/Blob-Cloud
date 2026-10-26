@@ -263,7 +263,11 @@ func (r *BlockRepository) AllBlockHashes(ctx context.Context) ([]string, error) 
 		SELECT DISTINCT b.sha256
 		FROM blocks b
 		WHERE EXISTS (SELECT 1 FROM file_blocks fb WHERE fb.block_id = b.id)
-		   OR EXISTS (SELECT 1 FROM file_versions fv WHERE b.sha256 = ANY(fv.chunk_hashes))
+		   OR EXISTS (
+				SELECT 1 FROM file_version_blocks fvb
+				JOIN blocks version_block ON version_block.id = fvb.block_id
+				WHERE version_block.sha256 = b.sha256
+			)
 		   OR EXISTS (SELECT 1 FROM session_blocks sb JOIN upload_sessions us ON us.id = sb.session_id
 		             WHERE sb.block_hash = b.sha256 AND us.status = 'INITIATED'
 	               AND us.updated_at > CURRENT_TIMESTAMP - ($1 * INTERVAL '1 second'))
@@ -369,7 +373,11 @@ func (r *BlockRepository) isBlockReferenced(ctx context.Context, hash string) (b
 	const q = `
 		SELECT EXISTS (
 		        SELECT 1 FROM file_blocks fb JOIN blocks b ON b.id = fb.block_id WHERE b.sha256 = $1
-		    ) OR EXISTS (SELECT 1 FROM file_versions fv WHERE $1 = ANY(fv.chunk_hashes))
+		    ) OR EXISTS (
+				SELECT 1 FROM file_version_blocks fvb
+				JOIN blocks version_block ON version_block.id = fvb.block_id
+				WHERE version_block.sha256 = $1
+			)
 		      OR EXISTS (
 				SELECT 1 FROM session_blocks sb
 				JOIN upload_sessions us ON us.id = sb.session_id

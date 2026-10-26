@@ -132,10 +132,10 @@ func (r *UserRepository) DeleteVerificationCode(ctx context.Context, id string) 
 // CreatePasswordResetToken inserts a new password reset token.
 func (r *UserRepository) CreatePasswordResetToken(ctx context.Context, userID, token string, expiresAt time.Time) error {
 	const q = `
-		INSERT INTO password_resets (user_id, token, expires_at)
+		INSERT INTO password_resets (user_id, token_hash, expires_at)
 		VALUES ($1, $2, $3)
 	`
-	_, err := r.db.ExecContext(ctx, q, userID, token, expiresAt)
+	_, err := r.db.ExecContext(ctx, q, userID, hashBearerToken(token), expiresAt)
 	if err != nil {
 		return fmt.Errorf("create password reset token: %w", err)
 	}
@@ -145,25 +145,26 @@ func (r *UserRepository) CreatePasswordResetToken(ctx context.Context, userID, t
 // ValidateResetToken checks if token exists, is not expired, and has not been used.
 func (r *UserRepository) ValidateResetToken(ctx context.Context, token string) (*domain.PasswordReset, error) {
 	const q = `
-		SELECT id, user_id, token, expires_at, used, created_at
+		SELECT id, user_id, expires_at, used, created_at
 		FROM password_resets
-		WHERE token = $1 AND expires_at > CURRENT_TIMESTAMP AND used = FALSE
+		WHERE token_hash = $1 AND expires_at > CURRENT_TIMESTAMP AND used = FALSE
 	`
 	var pr domain.PasswordReset
-	err := r.db.QueryRowContext(ctx, q, token).Scan(&pr.ID, &pr.UserID, &pr.Token, &pr.ExpiresAt, &pr.Used, &pr.CreatedAt)
+	err := r.db.QueryRowContext(ctx, q, hashBearerToken(token)).Scan(&pr.ID, &pr.UserID, &pr.ExpiresAt, &pr.Used, &pr.CreatedAt)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		return nil, fmt.Errorf("password reset token invalid or expired: %w", sql.ErrNoRows)
 	case err != nil:
 		return nil, fmt.Errorf("query password reset token: %w", err)
 	}
+	pr.Token = token
 	return &pr, nil
 }
 
 // MarkResetTokenUsed sets used = true for the given token.
 func (r *UserRepository) MarkResetTokenUsed(ctx context.Context, token string) error {
-	const q = `UPDATE password_resets SET used = TRUE WHERE token = $1`
-	_, err := r.db.ExecContext(ctx, q, token)
+	const q = `UPDATE password_resets SET used = TRUE WHERE token_hash = $1`
+	_, err := r.db.ExecContext(ctx, q, hashBearerToken(token))
 	if err != nil {
 		return fmt.Errorf("mark password reset token used: %w", err)
 	}
@@ -182,4 +183,3 @@ func (r *UserRepository) UpdatePassword(ctx context.Context, userID, hashedPassw
 	}
 	return nil
 }
-

@@ -21,15 +21,15 @@ func EscapeSQLLike(s string) string {
 	return s
 }
 
-const fileSelectColumns = `id, user_id, name, parent_id, path, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status`
+const fileSelectColumns = `id, user_id, name, parent_id, path, is_directory, size_bytes, created_at, updated_at, deleted_at, target_id, mime_type, target_id AS shortcut_target_id, is_encrypted, encryption_salt, tags, summary, status`
 
 const fileSelectColumnsWithTarget = `
 	f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory,
 	CASE WHEN t.id IS NOT NULL AND f.size_bytes = 0 THEN t.size_bytes ELSE f.size_bytes END AS size_bytes,
 	f.created_at, f.updated_at, f.deleted_at,
-	COALESCE(f.target_id, f.shortcut_target_id) AS target_id,
+	f.target_id,
 	f.mime_type,
-	COALESCE(f.shortcut_target_id, f.target_id) AS shortcut_target_id,
+	f.target_id AS shortcut_target_id,
 	COALESCE(t.is_encrypted, f.is_encrypted) AS is_encrypted,
 	COALESCE(t.encryption_salt, f.encryption_salt) AS encryption_salt,
 	COALESCE(t.tags, f.tags) AS tags,
@@ -65,6 +65,9 @@ func (r *FileRepository) Create(ctx context.Context, file *domain.File) error {
 	if file.ID == "" {
 		file.ID = uuid.New().String()
 	}
+	if file.Status == "" {
+		file.Status = "ACTIVE"
+	}
 
 	if file.Path == "" {
 		if file.ParentID == nil || *file.ParentID == "" {
@@ -79,13 +82,17 @@ func (r *FileRepository) Create(ctx context.Context, file *domain.File) error {
 		}
 	}
 
+	targetID := file.TargetID
+	if targetID == nil {
+		targetID = file.ShortcutTargetID
+	}
 	const q = `
-		INSERT INTO files (id, user_id, name, parent_id, path, is_directory, size_bytes, target_id, mime_type, shortcut_target_id, is_encrypted, encryption_salt, status)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		INSERT INTO files (id, user_id, name, parent_id, path, is_directory, size_bytes, target_id, mime_type, is_encrypted, encryption_salt, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING created_at, updated_at
 	`
 	row := r.db.QueryRowContext(ctx, q,
-		file.ID, file.UserID, file.Name, file.ParentID, file.Path, file.IsDirectory, file.SizeBytes, file.TargetID, file.MimeType, file.ShortcutTargetID, file.IsEncrypted, file.EncryptionSalt, file.Status)
+		file.ID, file.UserID, file.Name, file.ParentID, file.Path, file.IsDirectory, file.SizeBytes, targetID, file.MimeType, file.IsEncrypted, file.EncryptionSalt, file.Status)
 	if err := row.Scan(&file.CreatedAt, &file.UpdatedAt); err != nil {
 		return fmt.Errorf("insert file: %w", err)
 	}
@@ -97,7 +104,7 @@ func (r *FileRepository) GetByID(ctx context.Context, id string) (*domain.File, 
 	q := fmt.Sprintf(`
 		SELECT %s
 		FROM files f
-		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+		LEFT JOIN files t ON t.id = f.target_id AND t.deleted_at IS NULL
 		WHERE f.id = $1
 	`, fileSelectColumnsWithTarget)
 	var f domain.File
@@ -118,7 +125,7 @@ func (r *FileRepository) GetByIDForUpdate(ctx context.Context, id string) (*doma
 	q := fmt.Sprintf(`
 		SELECT %s
 		FROM files f
-		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+		LEFT JOIN files t ON t.id = f.target_id AND t.deleted_at IS NULL
 		WHERE f.id = $1
 		FOR UPDATE OF f
 	`, fileSelectColumnsWithTarget)
@@ -213,7 +220,7 @@ func (r *FileRepository) ListDirectory(ctx context.Context, userID string, paren
 		q := fmt.Sprintf(`
 			SELECT %s
 			FROM files f
-			LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+			LEFT JOIN files t ON t.id = f.target_id AND t.deleted_at IS NULL
 			WHERE f.user_id = $1 AND f.parent_id IS NULL AND f.deleted_at IS NULL
 			ORDER BY f.is_directory DESC, f.name ASC
 		`, fileSelectColumnsWithTarget)
@@ -222,7 +229,7 @@ func (r *FileRepository) ListDirectory(ctx context.Context, userID string, paren
 		q := fmt.Sprintf(`
 			SELECT %s
 			FROM files f
-			LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+			LEFT JOIN files t ON t.id = f.target_id AND t.deleted_at IS NULL
 			WHERE f.parent_id = $1
 			  AND (
 			    (SELECT deleted_at FROM files WHERE id = $1) IS NOT NULL
@@ -283,7 +290,7 @@ func (r *FileRepository) ListTrash(ctx context.Context, userID string) ([]*domai
 		       COALESCE(ast.total_size, 0) AS aggregate_size,
 		       COALESCE(ast.nested_item_count, 0) AS item_count,
 		       COALESCE((SELECT name FROM files WHERE id = dr.parent_id), 'My Drive') AS original_location,
-		       dr.target_id, dr.mime_type, dr.shortcut_target_id, dr.is_encrypted, dr.encryption_salt, dr.tags, dr.summary
+		       dr.target_id, dr.mime_type, dr.target_id AS shortcut_target_id, dr.is_encrypted, dr.encryption_salt, dr.tags, dr.summary
 		FROM deleted_roots dr
 		LEFT JOIN aggregated_stats ast ON dr.id = ast.root_id
 		ORDER BY dr.deleted_at DESC;
@@ -496,7 +503,7 @@ func (r *FileRepository) ListSharedWithUser(ctx context.Context, userEmail, user
 		       p.created_at, p.role,
 		       COALESCE(u_owner.email, ''), COALESCE(u_sender.email, u_owner.email, '')
 		FROM files f
-		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+		LEFT JOIN files t ON t.id = f.target_id AND t.deleted_at IS NULL
 		JOIN permissions p ON f.id = p.file_id
 		LEFT JOIN users u_owner ON f.user_id = u_owner.id
 		LEFT JOIN users u_sender ON p.invited_by = u_sender.id
@@ -883,7 +890,11 @@ func (r *FileRepository) findOrphanedHashes(ctx context.Context, hashes []string
 	}
 	sb.WriteString(`) 
 		AND NOT EXISTS (SELECT 1 FROM file_blocks fb WHERE fb.block_id = b.id) 
-		AND NOT EXISTS (SELECT 1 FROM file_versions fv WHERE b.sha256 = ANY(fv.chunk_hashes))
+		AND NOT EXISTS (
+			SELECT 1 FROM file_version_blocks fvb
+			JOIN blocks version_block ON version_block.id = fvb.block_id
+			WHERE version_block.sha256 = b.sha256
+		)
 		AND NOT EXISTS (
 			SELECT 1 FROM session_blocks sb 
 			JOIN upload_sessions us ON sb.session_id = us.id 
@@ -981,7 +992,7 @@ func (r *FileRepository) HasPublicLinkOrShortcutAccess(ctx context.Context, user
 					  SELECT 1 FROM files sc
 					  WHERE sc.user_id = $2
 					    AND sc.deleted_at IS NULL
-					    AND (sc.target_id = fh.id OR sc.shortcut_target_id = fh.id OR sc.target_id = $1 OR sc.shortcut_target_id = $1)
+					    AND (sc.target_id = fh.id OR sc.target_id = $1)
 				  ))
 			  )
 		)
@@ -1268,32 +1279,54 @@ func (r *FileRepository) BulkHardDelete(ctx context.Context, ids []string, userI
 	return totalDeleted, allOrphans, nil
 }
 
-// CreateFileVersion inserts a new file_versions record.
+// CreateFileVersion inserts a historical version and its ordered block links
+// atomically. Block hashes are resolved to the canonical blocks rows.
 func (r *FileRepository) CreateFileVersion(ctx context.Context, version *domain.FileVersion) error {
-	query := `
-		INSERT INTO file_versions (file_id, version_number, size_bytes, chunk_hashes)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, created_at
-	`
-	err := r.db.QueryRowContext(ctx, query,
-		version.FileID,
-		version.VersionNumber,
-		version.SizeBytes,
-		pq.Array(version.ChunkHashes),
-	).Scan(&version.ID, &version.CreatedAt)
-	if err != nil {
-		return fmt.Errorf("create file version: %w", err)
+	create := func(db DBTX) error {
+		if err := db.QueryRowContext(ctx, `
+			INSERT INTO file_versions (file_id, version_number, size_bytes)
+			VALUES ($1, $2, $3)
+			RETURNING id, created_at`, version.FileID, version.VersionNumber, version.SizeBytes,
+		).Scan(&version.ID, &version.CreatedAt); err != nil {
+			return fmt.Errorf("insert file version: %w", err)
+		}
+		for index, hash := range version.ChunkHashes {
+			result, err := db.ExecContext(ctx, `
+				INSERT INTO file_version_blocks (version_id, sequence_number, block_id)
+				SELECT $1, $2, id FROM blocks WHERE sha256 = $3`, version.ID, index, hash)
+			if err != nil {
+				return fmt.Errorf("link block %q to file version: %w", hash, err)
+			}
+			count, err := result.RowsAffected()
+			if err != nil || count != 1 {
+				return fmt.Errorf("link block %q to file version: block does not exist", hash)
+			}
+		}
+		return nil
 	}
-	return nil
+
+	if _, ok := r.db.(txCommitter); ok {
+		return create(r.db)
+	}
+	db, ok := r.db.(*sql.DB)
+	if !ok {
+		return fmt.Errorf("create file version: unsupported DBTX type %T", r.db)
+	}
+	return RunInTx(ctx, db, create)
 }
 
 // GetFileVersions returns all historical versions for a file ordered by version_number desc.
 func (r *FileRepository) GetFileVersions(ctx context.Context, fileID string) ([]*domain.FileVersion, error) {
 	query := `
-		SELECT id, file_id, version_number, size_bytes, chunk_hashes, created_at
-		FROM file_versions
-		WHERE file_id = $1
-		ORDER BY version_number DESC
+		SELECT fv.id, fv.file_id, fv.version_number, fv.size_bytes,
+			COALESCE(array_agg(b.sha256::text ORDER BY fvb.sequence_number)
+				FILTER (WHERE b.id IS NOT NULL), ARRAY[]::text[]), fv.created_at
+		FROM file_versions fv
+		LEFT JOIN file_version_blocks fvb ON fvb.version_id = fv.id
+		LEFT JOIN blocks b ON b.id = fvb.block_id
+		WHERE fv.file_id = $1
+		GROUP BY fv.id
+		ORDER BY fv.version_number DESC
 	`
 	rows, err := r.db.QueryContext(ctx, query, fileID)
 	if err != nil {
@@ -1317,9 +1350,14 @@ func (r *FileRepository) GetFileVersions(ctx context.Context, fileID string) ([]
 // GetFileVersion returns a specific version by ID.
 func (r *FileRepository) GetFileVersion(ctx context.Context, versionID string) (*domain.FileVersion, error) {
 	query := `
-		SELECT id, file_id, version_number, size_bytes, chunk_hashes, created_at
-		FROM file_versions
-		WHERE id = $1
+		SELECT fv.id, fv.file_id, fv.version_number, fv.size_bytes,
+			COALESCE(array_agg(b.sha256::text ORDER BY fvb.sequence_number)
+				FILTER (WHERE b.id IS NOT NULL), ARRAY[]::text[]), fv.created_at
+		FROM file_versions fv
+		LEFT JOIN file_version_blocks fvb ON fvb.version_id = fv.id
+		LEFT JOIN blocks b ON b.id = fvb.block_id
+		WHERE fv.id = $1
+		GROUP BY fv.id
 	`
 	v := &domain.FileVersion{}
 	var hashes pq.StringArray
@@ -1442,7 +1480,7 @@ func (r *FileRepository) GetRecentViews(ctx context.Context, userID string, limi
 	q := fmt.Sprintf(`
 		SELECT %s
 		FROM files f
-		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+		LEFT JOIN files t ON t.id = f.target_id AND t.deleted_at IS NULL
 		LEFT JOIN user_file_views v ON f.id = v.file_id AND v.user_id = $1
 		WHERE (f.user_id = $1 OR v.file_id IS NOT NULL) AND f.deleted_at IS NULL
 		ORDER BY GREATEST(f.created_at, f.updated_at, COALESCE(v.viewed_at, f.created_at)) DESC
@@ -1545,7 +1583,7 @@ func (r *FileRepository) SemanticSearchChunks(ctx context.Context, userID string
 		)
 		SELECT f.id, f.user_id, f.name, f.parent_id, f.path, f.is_directory, f.size_bytes, 
 			f.created_at, f.updated_at, f.deleted_at, f.target_id, f.mime_type, 
-			f.shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
+			f.target_id AS shortcut_target_id, f.is_encrypted, f.encryption_salt, f.tags, f.summary, f.status
 		FROM RankedFiles rf
 		JOIN files f ON f.id = rf.file_id
 		ORDER BY rf.min_distance ASC
@@ -1585,7 +1623,7 @@ func (r *FileRepository) HybridSearch(ctx context.Context, userID, userEmail, qu
 			WITH AccessibleFiles AS (
 				SELECT %s
 				FROM files f
-				LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+				LEFT JOIN files t ON t.id = f.target_id AND t.deleted_at IS NULL
 				WHERE f.deleted_at IS NULL AND (
 					f.user_id = $1 OR 
 					($2 != '' AND EXISTS (
@@ -1630,7 +1668,7 @@ func (r *FileRepository) HybridSearch(ctx context.Context, userID, userEmail, qu
 			)
 			SELECT af.id, af.user_id, af.name, af.parent_id, af.path, af.is_directory, af.size_bytes, 
 				af.created_at, af.updated_at, af.deleted_at, af.target_id, af.mime_type, 
-				af.shortcut_target_id, af.is_encrypted, af.encryption_salt, af.tags, af.summary, af.status
+				af.target_id AS shortcut_target_id, af.is_encrypted, af.encryption_salt, af.tags, af.summary, af.status
 			FROM CombinedScores cs
 			JOIN AccessibleFiles af ON af.id = cs.id
 			ORDER BY cs.total_rank DESC, af.updated_at DESC
@@ -1666,7 +1704,7 @@ func (r *FileRepository) keywordSearch(ctx context.Context, userID, userEmail, q
 	sqlQuery := fmt.Sprintf(`
 		SELECT %s
 		FROM files f
-		LEFT JOIN files t ON t.id = COALESCE(f.target_id, f.shortcut_target_id) AND t.deleted_at IS NULL
+		LEFT JOIN files t ON t.id = f.target_id AND t.deleted_at IS NULL
 		WHERE f.deleted_at IS NULL AND (
 			f.user_id = $1 OR 
 			($2 != '' AND EXISTS (

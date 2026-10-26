@@ -29,7 +29,7 @@ type File struct {
 	SharedAt         *time.Time `json:"shared_at,omitempty"`
 	TargetID         *string    `json:"target_id,omitempty"`
 	MimeType         string     `json:"mime_type,omitempty"`
-	ShortcutTargetID *string    `json:"shortcut_target_id,omitempty"`
+	ShortcutTargetID *string    `json:"shortcut_target_id,omitempty"` // compatibility alias of TargetID; one database column
 	Role             string     `json:"role,omitempty"`
 	IsEncrypted      bool       `json:"is_encrypted"`
 	EncryptionSalt   *string    `json:"encryption_salt,omitempty"`
@@ -41,6 +41,7 @@ type File struct {
 }
 
 // FileVersion represents a historical snapshot of a file's blocks and size.
+// ChunkHashes are assembled from the normalized file_version_blocks relation.
 type FileVersion struct {
 	ID            string    `json:"id"`
 	FileID        string    `json:"file_id"`

@@ -26,6 +26,22 @@ type migrationFile struct {
 // The version table is created if missing; each migration runs in its own
 // transaction so a partially-applied file is rolled back cleanly.
 func RunMigrations(ctx context.Context, db *sql.DB, log *slog.Logger) error {
+	// Multiple API replicas can start together during a deploy. Hold a
+	// connection-level advisory lock across discovery and application so they
+	// cannot race while creating the bookkeeping table or applying a baseline.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("get migration lock connection: %w", err)
+	}
+	defer conn.Close()
+	const migrationLockKey int64 = 728194003847281
+	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock($1)`, migrationLockKey); err != nil {
+		return fmt.Errorf("acquire migration lock: %w", err)
+	}
+	defer func() {
+		_, _ = conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockKey)
+	}()
+
 	if err := ensureSchemaMigrationsTable(ctx, db); err != nil {
 		return fmt.Errorf("ensure schema_migrations table: %w", err)
 	}

@@ -1,1 +1,0 @@
-ALTER TABLE session_blocks ADD COLUMN IF NOT EXISTS block_md5 VARCHAR(32);

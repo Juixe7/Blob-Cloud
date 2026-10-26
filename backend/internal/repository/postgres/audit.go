@@ -89,11 +89,15 @@ func (r *AuditRepository) ListFileHistory(ctx context.Context, fileID string, li
 	for rows.Next() {
 		var e audit.Entry
 		var action, resourceType string
+		var userID sql.NullString
 		if err := rows.Scan(
-			&e.ID, &e.UserID, &action, &resourceType,
+			&e.ID, &userID, &action, &resourceType,
 			&e.ResourceID, &e.Metadata, &e.ClientIP, &e.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan audit row: %w", err)
+		}
+		if userID.Valid {
+			e.UserID = userID.String
 		}
 		e.Action = audit.Action(action)
 		e.ResourceType = audit.ResourceType(resourceType)

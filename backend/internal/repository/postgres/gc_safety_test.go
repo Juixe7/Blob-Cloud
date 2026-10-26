@@ -2,6 +2,7 @@ package postgresrepo_test
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"log/slog"
 	"os"
@@ -23,6 +24,7 @@ func TestGCCandidateLockSerializesWithUploadSessionCreation(t *testing.T) {
 	ctx := context.Background()
 	repo := postgresrepo.NewBlockRepository(db)
 	sessions := postgresrepo.NewUploadSessionRepository(db)
+	ensureTestUser(t, db, "00000000-0000-0000-0000-000000000001")
 	hash := "gc-lock-race-hash"
 	deleting := make(chan struct{})
 	releaseDelete := make(chan struct{})
@@ -76,6 +78,7 @@ func TestGCLeavesActiveUploadBlockAndStagingObjectsAlone(t *testing.T) {
 	ctx := context.Background()
 	repo := postgresrepo.NewBlockRepository(db)
 	sessions := postgresrepo.NewUploadSessionRepository(db)
+	ensureTestUser(t, db, "00000000-0000-0000-0000-000000000002")
 	session := &domain.UploadSession{UserID: "00000000-0000-0000-0000-000000000002", Filename: "active.bin", TotalSize: 1, Status: domain.SessionStatusInitiated}
 	if err := sessions.CreateSession(ctx, session, []domain.SessionBlock{{BlockHash: "active-hash", SequenceNumber: 0, SizeBytes: 1}}); err != nil {
 		t.Fatal(err)
@@ -122,6 +125,7 @@ func TestGCLeavesActiveUploadBlockAndStagingObjectsAlone(t *testing.T) {
 	}
 
 	stale := &domain.UploadSession{UserID: "00000000-0000-0000-0000-000000000005", Filename: "stale.bin", TotalSize: 1, Status: domain.SessionStatusInitiated}
+	ensureTestUser(t, db, stale.UserID)
 	staleHash := "stale-session-hash"
 	if err := sessions.CreateSession(ctx, stale, []domain.SessionBlock{{BlockHash: staleHash, SequenceNumber: 0, SizeBytes: 1}}); err != nil {
 		t.Fatal(err)
@@ -199,12 +203,14 @@ func TestGCPostgresAndLocalStorageSafetyBoundaries(t *testing.T) {
 		t.Fatal(err)
 	}
 	active := &domain.UploadSession{UserID: "00000000-0000-0000-0000-000000000003", Filename: "active.bin", TotalSize: 1, Status: domain.SessionStatusInitiated}
+	ensureTestUser(t, db, active.UserID)
 	sessions := postgresrepo.NewUploadSessionRepository(db)
 	activeHash := strings.Repeat("b", 64)
 	if err := sessions.CreateSession(ctx, active, []domain.SessionBlock{{BlockHash: activeHash, SequenceNumber: 0, SizeBytes: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	terminal := &domain.UploadSession{UserID: "00000000-0000-0000-0000-000000000004", Filename: "done.bin", TotalSize: 1, Status: domain.SessionStatusInitiated}
+	ensureTestUser(t, db, terminal.UserID)
 	if err := sessions.CreateSession(ctx, terminal, []domain.SessionBlock{{BlockHash: "terminal-hash", SequenceNumber: 0, SizeBytes: 1}}); err != nil {
 		t.Fatal(err)
 	}
@@ -277,6 +283,13 @@ func TestGCPostgresAndLocalStorageSafetyBoundaries(t *testing.T) {
 	}
 	if orphanMetadataExists {
 		t.Fatal("live GC left metadata for the deleted orphan block")
+	}
+}
+
+func ensureTestUser(t *testing.T, db *sql.DB, id string) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'test')`, id, id+"@example.test"); err != nil {
+		t.Fatalf("insert upload-session fixture user %s: %v", id, err)
 	}
 }
 

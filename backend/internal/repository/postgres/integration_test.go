@@ -79,7 +79,11 @@ func TestMigrations_CreateAllTables(t *testing.T) {
 	freshSchema(t, db)
 
 	ctx := context.Background()
-	for _, tbl := range []string{"users", "files", "blocks", "file_blocks"} {
+	for _, tbl := range []string{
+		"users", "files", "blocks", "file_blocks", "upload_sessions",
+		"permissions", "file_versions", "file_version_blocks", "shareable_links",
+		"file_chunks", "audit_logs", "journal_entries", "file_processing_outbox",
+	} {
 		var exists bool
 		err := db.QueryRowContext(ctx,
 			`SELECT to_regclass($1) IS NOT NULL`, "public."+tbl).Scan(&exists)
@@ -89,6 +93,13 @@ func TestMigrations_CreateAllTables(t *testing.T) {
 		if !exists {
 			t.Errorf("expected table %s to exist", tbl)
 		}
+	}
+	var baselineCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version = '000001_baseline'`).Scan(&baselineCount); err != nil {
+		t.Fatalf("check baseline migration record: %v", err)
+	}
+	if baselineCount != 1 {
+		t.Fatalf("baseline migration record count = %d, want 1", baselineCount)
 	}
 }
 
@@ -852,8 +863,8 @@ func TestNestedFileAuthorizationRoleMatrix(t *testing.T) {
 		{"nested file", leaf.ID},
 	}
 	actors := []struct {
-		name       string
-		user       *domain.User
+		name        string
+		user        *domain.User
 		read, write bool
 	}{
 		{"owner", owner, true, true},
@@ -932,10 +943,10 @@ func TestShortcutAuthorizationUsesCurrentCanonicalTargetAccess(t *testing.T) {
 	if err := files.Create(ctx, cycleB); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, "UPDATE files SET target_id=$1, shortcut_target_id=$1 WHERE id=$2", cycleB.ID, cycleA.ID); err != nil {
+	if _, err := db.ExecContext(ctx, "UPDATE files SET target_id=$1 WHERE id=$2", cycleB.ID, cycleA.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(ctx, "UPDATE files SET target_id=$1, shortcut_target_id=$1 WHERE id=$2", cycleA.ID, cycleB.ID); err != nil {
+	if _, err := db.ExecContext(ctx, "UPDATE files SET target_id=$1 WHERE id=$2", cycleA.ID, cycleB.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := fileService.AuthoriseRead(ctx, viewer.ID, cycleA.ID); err == nil || !strings.Contains(err.Error(), "cycle") {
@@ -966,6 +977,13 @@ func TestPublicShortcutRequiresUnrevokedLinkInsideTransaction(t *testing.T) {
 	link := &domain.ShareableLink{FileID: target.ID, LinkToken: fmt.Sprintf("valid-link-%d", time.Now().UnixNano()), AccessTier: domain.RoleViewer}
 	if err := linkRepo.Create(ctx, link); err != nil {
 		t.Fatal(err)
+	}
+	var storedToken string
+	if err := db.QueryRowContext(ctx, `SELECT link_token_hash FROM shareable_links WHERE id = $1`, link.ID).Scan(&storedToken); err != nil {
+		t.Fatalf("read stored public-link token hash: %v", err)
+	}
+	if storedToken == link.LinkToken || len(storedToken) != 64 {
+		t.Fatalf("public-link token was not stored as a SHA-256 hash: %q", storedToken)
 	}
 	fileService := service.NewFileService(db, users, files, nil, perms, nil, slog.New(slog.NewTextHandler(io.Discard, nil))).WithJournal(postgresrepo.NewJournalRepository(db))
 	shortcut, err := fileService.CreateShortcutFromPublicLink(ctx, viewer.ID, target.ID, nil, link.LinkToken)
